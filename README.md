@@ -1,1 +1,0 @@
-# Future fast developability toolkit
