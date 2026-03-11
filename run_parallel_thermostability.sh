@@ -3,7 +3,7 @@
 # Usage: ./run_parallel_thermostability.sh STRUCTURES_DIR [num_jobs] [options]
 #
 # STRUCTURES_DIR: path to folder containing PDB files (e.g. ./garbinski2023 or ./GINKGO_structures).
-#   SASA, DSSP, propka and results are taken from/saved to same parent dir with suffixes _sasa, _dssp, _propka, _thermostability_results.
+#   SASA, DSSP, propka and results are taken from/saved to same parent dir with suffixes _sasa, _dssp, _propka, _results.
 #
 # Options (passed to calculate_thermostability.py):
 #   --average              Calculate only averages
@@ -36,7 +36,7 @@ BASE_NAME="$(basename "$STRUCTURES_DIR")"
 SASA_DIR="${PARENT_DIR}/${BASE_NAME}_sasa"
 DSSP_DIR="${PARENT_DIR}/${BASE_NAME}_dssp"
 PKA_DIR="${PARENT_DIR}/${BASE_NAME}_propka"
-OUTPUT_DIR="${PARENT_DIR}/${BASE_NAME}_thermostability_results"
+OUTPUT_DIR="${PARENT_DIR}/${BASE_NAME}_results"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 shift || true
@@ -137,13 +137,13 @@ if command -v parallel &> /dev/null; then
         # Determine output file extension based on format
         case "$OUTPUT_FORMAT" in
             json)
-                local output_file="${OUTPUT_DIR}/${basename}_thermostability.json"
+                local output_file="${OUTPUT_DIR}/${basename}.json"
                 ;;
             table)
-                local output_file="${OUTPUT_DIR}/${basename}_thermostability.txt"
+                local output_file="${OUTPUT_DIR}/${basename}.txt"
                 ;;
             *)
-                local output_file="${OUTPUT_DIR}/${basename}_thermostability.csv"
+                local output_file="${OUTPUT_DIR}/${basename}.csv"
                 ;;
         esac
         
@@ -261,11 +261,11 @@ def process_file(pdb_path):
     
     # Determine output file extension based on format
     if output_format == 'json':
-        output_file = Path(OUTPUT_DIR) / f"{basename}_thermostability.json"
+        output_file = Path(OUTPUT_DIR) / f"{basename}.json"
     elif output_format == 'table':
-        output_file = Path(OUTPUT_DIR) / f"{basename}_thermostability.txt"
+        output_file = Path(OUTPUT_DIR) / f"{basename}.txt"
     else:
-        output_file = Path(OUTPUT_DIR) / f"{basename}_thermostability.csv"
+        output_file = Path(OUTPUT_DIR) / f"{basename}.csv"
     
     # Build command
     cmd = [

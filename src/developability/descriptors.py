@@ -5,12 +5,13 @@ This module calculates developability determinants from antibody structures
 and SASA values. The first property is thermostability.
 """
 
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Set, Tuple
 import math
 import os
 from collections import defaultdict
 import numpy as np
 from scipy.spatial import cKDTree
+from scipy import optimize
 from sklearn.cluster import DBSCAN
 
 from utils.parsers import (
@@ -374,6 +375,257 @@ def is_residue_charged(
     
     # Not a charged residue type, return False
     return False
+
+
+def net_charge_from_pka(
+    pka_data: Dict[Tuple[str, int, str, str], float],
+    pH: float
+) -> Optional[float]:
+    """
+    Compute protein net charge at a given pH using PropKA per-residue pKa values.
+
+    Uses Henderson-Hasselbalch: ASP/GLU contribute -1/(1+10^(pKa-pH));
+    LYS/ARG contribute +1/(1+10^(pH-pKa)). Only residues present in pka_data
+    (PropKA output) are included.
+
+    Args:
+        pka_data: Dict mapping (residue_name, residue_number, chain, insertion_code) -> pKa (float).
+        pH: pH at which to compute net charge.
+
+    Returns:
+        Net charge (float), or None if pka_data is empty.
+    """
+    if not pka_data:
+        return None
+    net = 0.0
+    for key, pka in pka_data.items():
+        res_name = key[0]
+        if res_name in ("ASP", "GLU"):
+            # Fraction deprotonated (negative charge)
+            net -= 1.0 / (1.0 + np.power(10.0, pka - pH))
+        elif res_name in ("LYS", "ARG"):
+            # Fraction protonated (positive charge)
+            net += 1.0 / (1.0 + np.power(10.0, pH - pka))
+    return float(net)
+
+
+def pi_from_pka(
+    pka_data: Dict[Tuple[str, int, str, str], float]
+) -> Optional[float]:
+    """
+    Compute protein isoelectric point (pI) using PropKA per-residue pKa values.
+
+    Finds the pH at which net charge is zero by minimizing (net_charge(pH))^2
+    over pH in (0, 14), using scipy.optimize.minimize_scalar.
+
+    Args:
+        pka_data: Dict mapping (residue_name, residue_number, chain, insertion_code) -> pKa (float).
+
+    Returns:
+        pI (float), or None if pka_data is empty or optimization failed.
+    """
+    if not pka_data:
+        return None
+
+    def objective(pH: float) -> float:
+        q = net_charge_from_pka(pka_data, pH)
+        return (q * q) if q is not None else float("nan")
+
+    try:
+        result = optimize.minimize_scalar(objective, bounds=(0.0, 14.0), method="bounded")
+        if result.success:
+            return float(result.x)
+        return None
+    except Exception:
+        return None
+
+
+# ============================================================================
+# SCM (Surface Charge Metric) Score
+# ============================================================================
+# Main-chain atom names (side-chain = not in this set); match reference PROPERMAB.
+SCM_MAIN_CHAIN_ATOMS = frozenset({"CA", "HA", "N", "C", "O", "HN", "H"})
+
+
+def _residue_fractional_charge_at_pH(
+    residue_name: str,
+    pka_value: Optional[float],
+    pH: float
+) -> float:
+    """Fractional charge of a residue at pH (for SCM: ASP/GLU negative, LYS/ARG positive)."""
+    if pka_value is None:
+        return 0.0
+    if residue_name in ("ASP", "GLU"):
+        return -1.0 / (1.0 + np.power(10.0, pka_value - pH))
+    if residue_name in ("LYS", "ARG"):
+        return 1.0 / (1.0 + np.power(10.0, pH - pka_value))
+    return 0.0
+
+
+def scm_score_from_pka(
+    pdb_path: str,
+    sasa_path: str,
+    pka_data: Dict[Tuple[str, int, str, str], float],
+    pH: float,
+    d_cutoff: float = 10.0,
+    sasa_cutoff: float = 0.25,
+) -> Optional[float]:
+    """
+    SCM (Surface Charge Metric) score using PropKA charges and per-residue SASA.
+
+    SCM_atom,i = sum of partial charges of side-chain atoms that belong to an
+    exposed residue and are within distance R = d_cutoff (default 10 Å) of atom i.
+    SCM score = | Σ over all atoms i of ( SCM_atom,i × H(-SCM_atom,i) ) |
+    i.e. absolute value of the sum of negative SCM_atom,i (Heaviside H(-x) = 1 when x ≤ 0).
+
+    Uses residue-level SASA (exposed = total_side_rel > sasa_cutoff, default 10%).
+    Residue fractional charges at pH from PropKA are distributed equally over
+    side-chain atoms of that residue.
+
+    Args:
+        pdb_path: Path to PDB file.
+        sasa_path: Path to SASA file (per-residue total_side_rel, etc.).
+        pka_data: PropKA per-residue pKa dict (residue_key_4tuple -> pKa).
+        pH: pH for charge calculation.
+        d_cutoff: Distance cutoff in Å (default 10).
+        sasa_cutoff: Residue exposure threshold (fraction, default 0.25 = 25%).
+
+    Returns:
+        SCM score (float), or None if missing data or computation fails.
+    """
+    from utils.parsers import parse_sasa
+
+    atoms = parse_pdb(pdb_path)
+    if not atoms:
+        return None
+
+    try:
+        sasa_data = parse_sasa(sasa_path)
+    except Exception:
+        return None
+
+    def _get_pka(key_4: Tuple) -> Optional[float]:
+        return pka_data.get(key_4) or pka_data.get((key_4[0], key_4[1], key_4[2], ""))
+
+    try:
+        n = len(atoms)
+        coords = np.array([[a.x, a.y, a.z] for a in atoms], dtype=np.float64)
+
+        # Side-chain mask: atom name not in main-chain list
+        is_sidechain = np.array([a.name.strip() not in SCM_MAIN_CHAIN_ATOMS for a in atoms], dtype=bool)
+
+        # Residue key (3-tuple) for SASA lookup
+        def res_key_3(a: Atom) -> Tuple[str, int, str]:
+            return (a.residue_name, a.residue_number, a.chain)
+
+        # Residue exposed: total_side_rel > sasa_cutoff
+        residue_exposed = np.zeros(n, dtype=bool)
+        for i, a in enumerate(atoms):
+            key3 = res_key_3(a)
+            entry = sasa_data.get(key3)
+            if entry is not None and getattr(entry, "total_side_rel", 0) is not None:
+                residue_exposed[i] = entry.total_side_rel > sasa_cutoff
+
+        # Per-residue fractional charge at pH
+        residue_charge: Dict[Tuple[str, int, str, str], float] = {}
+        for a in atoms:
+            key4 = residue_key_from_atom(a)
+            if key4 not in residue_charge:
+                pka_val = _get_pka(key4)
+                residue_charge[key4] = _residue_fractional_charge_at_pH(a.residue_name, pka_val, pH)
+
+        # Per-atom charge: distribute residue charge equally over side-chain atoms
+        atom_charge = np.zeros(n, dtype=np.float64)
+        residue_sidechain_count: Dict[Tuple, int] = {}
+        for i, a in enumerate(atoms):
+            key4 = residue_key_from_atom(a)
+            if is_sidechain[i]:
+                residue_sidechain_count[key4] = residue_sidechain_count.get(key4, 0) + 1
+        for i, a in enumerate(atoms):
+            if is_sidechain[i]:
+                key4 = residue_key_from_atom(a)
+                count = residue_sidechain_count.get(key4, 1)
+                atom_charge[i] = residue_charge.get(key4, 0.0) / max(1, count)
+
+        # SCM_atom,i = sum of charge(j) for j side-chain, exposed, within d_cutoff of i
+        tree = cKDTree(coords)
+        scm_atom = np.zeros(n, dtype=np.float64)
+        for i in range(n):
+            indices = tree.query_ball_point(coords[i], d_cutoff)
+            for j in indices:
+                if i == j:
+                    continue
+                if not is_sidechain[j]:
+                    continue
+                if not residue_exposed[j]:
+                    continue
+                scm_atom[i] += atom_charge[j]
+
+        # SCM score = | sum of SCM_atom,i for i where SCM_atom,i < 0 |
+        neg_sum = np.sum(scm_atom[scm_atom < 0])
+        return float(np.abs(neg_sum))
+    except Exception:
+        return None
+
+
+def sum_total_side_rel_within_cutoff(
+    pdb_atoms: List[Atom],
+    sasa_output_data: Dict[Tuple[str, int, str], Dict[str, Optional[float]]],
+    cutoff: float = 5.0,
+) -> Dict[Tuple[str, int, str, str], float]:
+    """
+    For each residue, sum total_side_rel (relative side-chain ASA, %) of all residues
+    within cutoff Å (Cα–Cα distance). Includes the residue itself in the sum.
+
+    Args:
+        pdb_atoms: List of atoms from PDB.
+        sasa_output_data: Dict (residue_name, residue_number, chain) -> {'total_side_rel': float or None, ...}.
+        cutoff: Distance cutoff in Å (default 5.0).
+
+    Returns:
+        Dict mapping (residue_name, residue_number, chain, insertion_code) -> float (sum of total_side_rel in %).
+    """
+    # Unique residues with 4-tuple key and Cα position (or centroid)
+    residue_keys: List[Tuple[str, int, str, str]] = []
+    residue_coords: List[Tuple[float, float, float]] = []
+    residue_total_side_rel: List[float] = []
+
+    seen = set()
+    atoms_by_res: Dict[Tuple, List[Atom]] = {}
+    for atom in pdb_atoms:
+        key4 = residue_key_from_atom(atom)
+        if key4 not in seen:
+            seen.add(key4)
+            residue_keys.append(key4)
+        atoms_by_res.setdefault(key4, []).append(atom)
+
+    for key4 in residue_keys:
+        atoms_res = atoms_by_res[key4]
+        key3 = (key4[0], key4[1], key4[2])
+        sasa_entry = sasa_output_data.get(key3) or {}
+        val = sasa_entry.get("total_side_rel")
+        total_side_rel = float(val) if val is not None else 0.0
+        residue_total_side_rel.append(total_side_rel)
+
+        # Cα position or centroid
+        ca_atoms = [a for a in atoms_res if a.name.strip() == "CA"]
+        if ca_atoms:
+            a0 = ca_atoms[0]
+            residue_coords.append((a0.x, a0.y, a0.z))
+        else:
+            cx = sum(a.x for a in atoms_res) / len(atoms_res)
+            cy = sum(a.y for a in atoms_res) / len(atoms_res)
+            cz = sum(a.z for a in atoms_res) / len(atoms_res)
+            residue_coords.append((cx, cy, cz))
+
+    coords = np.array(residue_coords, dtype=np.float64)
+    total_side_rel_arr = np.array(residue_total_side_rel, dtype=np.float64)
+    tree = cKDTree(coords)
+    out: Dict[Tuple[str, int, str, str], float] = {}
+    for i, key4 in enumerate(residue_keys):
+        indices = tree.query_ball_point(coords[i], cutoff)
+        out[key4] = float(np.sum(total_side_rel_arr[indices]))
+    return out
 
 
 # ============================================================================
@@ -1687,6 +1939,81 @@ def calculate_global_hbond_density_average_unweighted(
         return 0.0
     
     return sum(residue_densities.values()) / len(residue_densities)
+
+
+def largest_hbond_component_size(pdb_path: str) -> int:
+    """
+    Size of the largest connected component of the H-bond network (geometry-based).
+
+    Uses the same H-bond detection as calculate_global_hbond_density_unweighted
+    (distance + angle criteria). Builds an undirected graph of residue pairs connected
+    by H-bonds, then returns the number of residues in the largest connected component.
+
+    Args:
+        pdb_path: Path to PDB structure file.
+
+    Returns:
+        Number of residues in the largest connected component (0 if no H-bonds).
+    """
+    atoms = parse_pdb(pdb_path)
+    donors = [atom for atom in atoms if is_donor(atom)]
+    acceptors = [atom for atom in atoms if is_acceptor(atom)]
+
+    if len(acceptors) == 0:
+        return 0
+
+    acceptor_coords = np.array([[a.x, a.y, a.z] for a in acceptors])
+    acceptor_tree = cKDTree(acceptor_coords)
+    backbone_base_cache: Dict[Tuple[str, int], Atom] = {}
+
+    edges: Set[frozenset] = set()
+    for donor in donors:
+        donor_coord = np.array([donor.x, donor.y, donor.z])
+        indices = acceptor_tree.query_ball_point(donor_coord, MAX_HBOND_DISTANCE)
+        for idx in indices:
+            acceptor = acceptors[idx]
+            if (donor.residue_name == acceptor.residue_name and
+                donor.residue_number == acceptor.residue_number and
+                donor.chain == acceptor.chain):
+                continue
+            if (is_backbone_atom(donor.name) and is_backbone_atom(acceptor.name) and
+                donor.chain == acceptor.chain):
+                res_sep = abs(donor.residue_number - acceptor.residue_number)
+                if res_sep < MIN_BACKBONE_SEPARATION:
+                    continue
+            if check_hydrogen_bond(donor, acceptor, atoms, backbone_base_cache):
+                donor_key = residue_key_from_atom(donor)
+                acceptor_key = residue_key_from_atom(acceptor)
+                edge = frozenset({donor_key, acceptor_key})
+                edges.add(edge)
+
+    if not edges:
+        return 0
+
+    # Union-Find to get connected components
+    parent: Dict[Tuple, Tuple] = {}
+
+    def find(x: Tuple) -> Tuple:
+        if x not in parent:
+            parent[x] = x
+        if parent[x] != x:
+            parent[x] = find(parent[x])
+        return parent[x]
+
+    def union(x: Tuple, y: Tuple) -> None:
+        px, py = find(x), find(y)
+        if px != py:
+            parent[px] = py
+
+    for edge in edges:
+        u, v = tuple(edge)
+        union(u, v)
+
+    root_count: Dict[Tuple, int] = defaultdict(int)
+    for node in parent:
+        root_count[find(node)] += 1
+
+    return max(root_count.values()) if root_count else 0
 
 
 # ============================================================================
