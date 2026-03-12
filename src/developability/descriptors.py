@@ -1,13 +1,10 @@
 """
-Thermostability descriptors for antibody structures.
-
-This module calculates developability determinants from antibody structures
-and SASA values. The first property is thermostability.
+This module calculates developability determinants.
 """
 
 from typing import Dict, List, Optional, Set, Tuple
-import math
 import os
+import math
 from collections import defaultdict
 import numpy as np
 from scipy.spatial import cKDTree
@@ -21,7 +18,6 @@ from utils.parsers import (
     residue_key_from_atom,
 )
 
-# Mapping from 1-letter to 3-letter amino acid codes
 AA_1_TO_3 = {
     'A': 'ALA', 'R': 'ARG', 'N': 'ASN', 'D': 'ASP', 'C': 'CYS',
     'Q': 'GLN', 'E': 'GLU', 'G': 'GLY', 'H': 'HIS', 'I': 'ILE',
@@ -30,13 +26,24 @@ AA_1_TO_3 = {
 }
 
 
-# Hydrogen bond donors (immutable set for performance)
-# Format: (atom_name, residue_name) where "ANY" means any residue
+POSITIVE_ATOMS = frozenset({
+    ("NH1", "ARG"),
+    ("NH2", "ARG"),
+    ("NZ", "LYS"),
+})
+
+
+NEGATIVE_ATOMS = frozenset({
+    ("OD1", "ASP"),
+    ("OD2", "ASP"),
+    ("OE1", "GLU"),
+    ("OE2", "GLU"),
+})
+
+AROMATIC_RESIDUES = frozenset({"PHE", "TYR", "TRP"})
+
 DONORS = frozenset({
-    # Backbone
-    ("N", "ANY"),   # backbone N–H (except Pro)
-    
-    # Side chains
+    ("N", "ANY"), # backbone N-H (except Pro)   
     ("NE2", "GLN"),
     ("ND2", "ASN"),
     ("NE", "ARG"),
@@ -50,12 +57,8 @@ DONORS = frozenset({
     ("OH", "TYR"),
 })
 
-# Hydrogen bond acceptors (immutable set for performance)
 ACCEPTORS = frozenset({
-    # Backbone
     ("O", "ANY"),  # backbone C=O
-    
-    # Side chains
     ("OE1", "GLN"),
     ("OE2", "GLU"),
     ("OD1", "ASN"),
@@ -67,65 +70,21 @@ ACCEPTORS = frozenset({
     ("OH", "TYR"),
 })
 
-# Maximum D-A distance for hydrogen bonds (Angstroms)
 MAX_HBOND_DISTANCE = 3.2
-
-# Minimum angle Base→Donor→Acceptor for hydrogen bonds (degrees)
-MIN_HBOND_ANGLE = 120.0
-
-# Minimum residue separation for backbone-backbone H-bonds (DSSP-style)
-MIN_BACKBONE_SEPARATION = 3
-
-# Minimum SASA threshold: values below 1% are clipped to 1% to give maximum weight
-# This ensures the most buried residues get maximum weight (1 / 0.01 = 100)
-MIN_SASA_THRESHOLD = 0.01  # 1% as a fraction (since we parse percentages and divide by 100)
-
-# Maximum weight per residue: cap total accumulated weight at 100
-# This prevents residues with multiple buried atoms (backbone + side-chain) from exceeding 100
-MAX_WEIGHT_PER_RESIDUE = 100.0
-
-# ============================================================================
-# Salt-Bridge Detection Constants
-# ============================================================================
-
-# Maximum distance for salt bridges (Angstroms)
 MAX_SALT_BRIDGE_DISTANCE = 4.0
 
-# Positively charged atoms (bases)
-# Format: (atom_name, residue_name)
-POSITIVE_CHARGED_ATOMS = frozenset({
-    ("NH1", "ARG"),
-    ("NH2", "ARG"),
-    ("NZ", "LYS"),
-    # HIS excluded by default (ambiguous protonation state)
-})
+# angle base -> donor -> acceptor
+MIN_HBOND_ANGLE = 120.0
 
-# Negatively charged atoms (acids)
-# Format: (atom_name, residue_name)
-NEGATIVE_CHARGED_ATOMS = frozenset({
-    ("OD1", "ASP"),
-    ("OD2", "ASP"),
-    ("OE1", "GLU"),
-    ("OE2", "GLU"),
-})
+MIN_BACKBONE_SEPARATION = 3
 
-# Aromatic residues
-AROMATIC_RESIDUES = frozenset({"PHE", "TYR", "TRP"})
-
+# values below 1% are clipped to 1%
+MIN_SASA_THRESHOLD = 0.01
 
 def is_donor(atom: Atom) -> bool:
-    """
-    Check if an atom can act as a hydrogen bond donor.
-    
-    Special cases:
-    - Proline backbone N is NOT a donor
-    - Amide N (Asn/Gln) is donor only, NOT acceptor
-    """
-    # Proline backbone N is NOT a donor
     if atom.name == "N" and atom.residue_name == "PRO":
         return False
     
-    # Check if atom matches donor criteria
     if (atom.name, atom.residue_name) in DONORS:
         return True
     if (atom.name, "ANY") in DONORS:
@@ -135,17 +94,10 @@ def is_donor(atom: Atom) -> bool:
 
 
 def is_acceptor(atom: Atom) -> bool:
-    """
-    Check if an atom can act as a hydrogen bond acceptor.
-    
-    Special cases:
-    - Amide N (Asn/Gln) is donor only, NOT acceptor
-    """
-    # Amide N (Asn/Gln) is NOT an acceptor
+    # amide N is not an acceptor
     if atom.name in ("ND2", "NE2") and atom.residue_name in ("ASN", "GLN"):
         return False
     
-    # Check if atom matches acceptor criteria
     if (atom.name, atom.residue_name) in ACCEPTORS:
         return True
     if (atom.name, "ANY") in ACCEPTORS:
@@ -292,17 +244,21 @@ def get_sasa_weight(atom: Atom, sasa_data: Dict[Tuple[str, int, str], SASAEntry]
     else:
         rel_sasa = sasa_entry.total_side_rel
     
-    # Note: rel_sasa is already a fraction (0-1), not a percentage
-    # parse_sasa() already divides percentages by 100.0
+    # Note: rel_sasa is already a fraction (0-1), not a percentage.
+    # parse_sasa() already divides percentages by 100.0.
     rel_sasa_fraction = rel_sasa
     
     if weighting == "negative_linear":
         clamped = min(max(rel_sasa_fraction, 0.0), 1.0)
         return 1.0 - clamped
     else:
+        # New default scheme:
+        #   1) Clip SASA below MIN_SASA_THRESHOLD (e.g. 0.01).
+        #   2) Multiply by 100.
+        # This yields per-atom weights in [1, 100].
         if rel_sasa_fraction < MIN_SASA_THRESHOLD:
             rel_sasa_fraction = MIN_SASA_THRESHOLD
-        return 1.0 / rel_sasa_fraction
+        return rel_sasa_fraction * 100.0
 
 
 def get_residue_sasa_weight(
@@ -321,17 +277,21 @@ def get_residue_sasa_weight(
     else:
         rel_sasa = sasa_entry.main_chain_rel
     
-    # Note: rel_sasa is already a fraction (0-1), not a percentage
-    # parse_sasa() already divides percentages by 100.0
+    # Note: rel_sasa is already a fraction (0-1), not a percentage.
+    # parse_sasa() already divides percentages by 100.0.
     rel_sasa_fraction = rel_sasa
     
     if weighting == "negative_linear":
         clamped = min(max(rel_sasa_fraction, 0.0), 1.0)
         return 1.0 - clamped
     else:
+        # New default scheme, matching get_sasa_weight():
+        #   1) Clip SASA below MIN_SASA_THRESHOLD (e.g. 0.01).
+        #   2) Multiply by 100.
+        # This yields per-residue weights in [1, 100].
         if rel_sasa_fraction < MIN_SASA_THRESHOLD:
             rel_sasa_fraction = MIN_SASA_THRESHOLD
-        return 1.0 / rel_sasa_fraction
+        return rel_sasa_fraction * 100.0
 
 
 # ============================================================================
@@ -647,7 +607,7 @@ def is_positively_charged(atom: Atom) -> bool:
     Returns:
         True if the atom is positively charged
     """
-    return (atom.name, atom.residue_name) in POSITIVE_CHARGED_ATOMS
+    return (atom.name, atom.residue_name) in POSITIVE_ATOMS
 
 
 def is_negatively_charged(atom: Atom) -> bool:
@@ -664,7 +624,7 @@ def is_negatively_charged(atom: Atom) -> bool:
     Returns:
         True if the atom is negatively charged
     """
-    return (atom.name, atom.residue_name) in NEGATIVE_CHARGED_ATOMS
+    return (atom.name, atom.residue_name) in NEGATIVE_ATOMS
 
 
 def detect_salt_bridges(
@@ -798,18 +758,15 @@ def calculate_salt_bridge_density(
     pH: float = 7.4
 ) -> Tuple[Dict[Tuple[str, int, str], float], Dict[Tuple[str, int, str], bool]]:
     """
-    Calculate salt bridge density per residue, weighted by inverse SASA.
+    Calculate salt bridge density per residue, using SASA-based weights.
     
-    Number of salt bridges per residue, weighted by INVERSE relative SASA:
-    - Weight = 1 / (total-side REL) if atom is in side chain
-    - Weight = 1 / (main-chain REL) if atom is in backbone
+    Number of salt bridges per residue, weighted by scaled relative SASA:
+    - Per-contact weight = 100 * max(REL, MIN_SASA_THRESHOLD)
+      where REL is total-side REL for side-chain atoms or main-chain REL for backbone atoms.
     
-    Note: Uses INVERSE SASA (1 / relative_ASA), not raw SASA. This means:
-    - Buried residues (low SASA) contribute HIGHER weights
-    - Exposed residues (high SASA) contribute LOWER weights
-    
-    The total weight per residue is capped at MAX_WEIGHT_PER_RESIDUE (100.0) to prevent
-    residues with multiple buried atoms from accumulating excessive weights.
+    SASA-derived weights are summed per residue and a square-root transform is then
+    applied to the final per-residue weights, introducing diminishing returns for
+    residues with many salt bridges.
     
     Args:
         pdb_path: Path to PDB structure file
@@ -827,7 +784,7 @@ def calculate_salt_bridge_density(
     """
     salt_bridges = detect_salt_bridges(pdb_path, sasa_path, weighting, pka_path, pH)
     
-    # Aggregate by residue with weight capping
+    # Aggregate by residue
     residue_weights = defaultdict(float)
     residue_inter_chain = defaultdict(bool)
     
@@ -836,22 +793,22 @@ def calculate_salt_bridge_density(
         is_inter_chain = (pos_key[2] != neg_key[2])
         
         # Each residue gets the weight based on its own atom's location
-        # Add weights and clamp to maximum per residue
-        residue_weights[pos_key] = min(
-            residue_weights[pos_key] + pos_weight,
-            MAX_WEIGHT_PER_RESIDUE
-        )
-        residue_weights[neg_key] = min(
-            residue_weights[neg_key] + neg_weight,
-            MAX_WEIGHT_PER_RESIDUE
-        )
+        # Add weights (no explicit cap; square-root transform at the end)
+        residue_weights[pos_key] += pos_weight
+        residue_weights[neg_key] += neg_weight
         
         # Mark residues as having inter-chain contacts if applicable
         if is_inter_chain:
             residue_inter_chain[pos_key] = True
             residue_inter_chain[neg_key] = True
     
-    return dict(residue_weights), dict(residue_inter_chain)
+    # Apply square-root transform to the final per-residue weights to reduce
+    # growth when multiple contacts contribute to the same residue.
+    sqrt_residue_weights = {
+        key: math.sqrt(weight) for key, weight in residue_weights.items()
+    }
+    
+    return sqrt_residue_weights, dict(residue_inter_chain)
 
 
 def calculate_salt_bridge_density_average(
@@ -1064,17 +1021,15 @@ def calculate_aromatic_density(
     weighting: str = "inverse"
 ) -> Dict[Tuple[str, int, str], float]:
     """
-    Calculate aromatic residue density per residue, weighted by inverse SASA.
+    Calculate aromatic residue density per residue, weighted by SASA.
     
-    For each Phe, Tyr, or Trp residue, counts it as 1 * inverse_SASA.
-    Weight = 1 / (total-side REL) since aromatic residues are side-chain residues.
+    For each Phe, Tyr, or Trp residue, counts it as 1 * scaled_SASA.
+    Weight = 100 * max(total-side REL, MIN_SASA_THRESHOLD) since aromatic residues
+    are side-chain residues.
     
-    Note: Uses INVERSE SASA (1 / relative_ASA), not raw SASA. This means:
-    - Buried residues (low SASA) contribute HIGHER weights
-    - Exposed residues (high SASA) contribute LOWER weights
-    
-    The total weight per residue is capped at MAX_WEIGHT_PER_RESIDUE (100.0) to prevent
-    residues from accumulating excessive weights.
+    SASA-derived weights are combined per residue and a square-root transform is
+    applied to the final per-residue weights to keep the metric bounded while
+    preserving relative differences.
     
     Args:
         pdb_path: Path to PDB structure file
@@ -1091,7 +1046,7 @@ def calculate_aromatic_density(
     
     # Track aromatic residues and their weights
     # Key: (residue_name, residue_number, chain)
-    # Value: weight (1 * inverse_SASA)
+    # Value: weight (1 * scaled_SASA)
     aromatic_weights = {}
     
     # Find all aromatic residues
@@ -1108,13 +1063,19 @@ def calculate_aromatic_density(
             seen_residues.add(residue_key)
             
             # Get SASA weight for this residue (use side-chain SASA)
-            weight = get_residue_sasa_weight(residue_key, sasa_data, use_side_chain=True, weighting=weighting)
+            weight = get_residue_sasa_weight(
+                residue_key, sasa_data, use_side_chain=True, weighting=weighting
+            )
             
-            # Each aromatic residue contributes 1 * inverse_SASA
-            # Cap at maximum per residue
-            aromatic_weights[residue_key] = min(weight, MAX_WEIGHT_PER_RESIDUE)
+            # Each aromatic residue contributes 1 * scaled_SASA.
+            aromatic_weights[residue_key] = weight
     
-    return aromatic_weights
+    # Apply square-root transform to the final per-residue weights.
+    sqrt_aromatic_weights = {
+        key: math.sqrt(weight) for key, weight in aromatic_weights.items()
+    }
+    
+    return sqrt_aromatic_weights
 
 
 def calculate_aromatic_density_average(
@@ -1696,20 +1657,16 @@ def calculate_global_hbond_density(
     """
     Calculate global hydrogen bond density per residue.
     
-    Number of hydrogen bonds per residue, weighted by INVERSE relative SASA:
-    - Weight = 1 / (total-side REL) if atom is in side chain
-    - Weight = 1 / (main-chain REL) if atom is in backbone
-    
-    Note: Uses INVERSE SASA (1 / relative_ASA), not raw SASA. This means:
-    - Buried residues (low SASA) contribute HIGHER weights
-    - Exposed residues (high SASA) contribute LOWER weights
+    Number of hydrogen bonds per residue, weighted by scaled relative SASA:
+    - Per-contact weight = 100 * max(REL, MIN_SASA_THRESHOLD)
+      where REL is total-side REL for side-chain atoms or main-chain REL for backbone atoms.
     
     Each hydrogen bond is counted once and contributes to both residues involved.
     All H-bonds between a residue pair are accumulated (no limit per pair).
     
-    The total weight per residue is capped at MAX_WEIGHT_PER_RESIDUE (100.0) to prevent
-    residues with multiple buried atoms (e.g., both backbone and side-chain) from
-    accumulating excessive weights.
+    A square-root transform is applied to the final per-residue weights to introduce
+    diminishing returns with increasing numbers of bonds, so residues with many
+    contacts do not dominate the metric.
     
     Uses scipy's cKDTree for efficient O(N log N) neighbor search instead of O(N²).
     KD-tree correctly uses [x, y, z] coordinates for spatial queries.
@@ -1792,15 +1749,9 @@ def calculate_global_hbond_density(
                 donor_key = residue_key_from_atom(donor)
                 acceptor_key = residue_key_from_atom(acceptor)
                 
-                # Add weights and clamp to maximum per residue
-                residue_hbonds[donor_key] = min(
-                    residue_hbonds[donor_key] + donor_weight,
-                    MAX_WEIGHT_PER_RESIDUE
-                )
-                residue_hbonds[acceptor_key] = min(
-                    residue_hbonds[acceptor_key] + acceptor_weight,
-                    MAX_WEIGHT_PER_RESIDUE
-                )
+                # Add weights (no explicit cap; square-root transform at the end)
+                residue_hbonds[donor_key] += donor_weight
+                residue_hbonds[acceptor_key] += acceptor_weight
                 
                 # Mark residues as having inter-chain contacts if applicable
                 if is_inter_chain:
@@ -1811,7 +1762,13 @@ def calculate_global_hbond_density(
                 residue_hbond_count[donor_key] += 1
                 residue_hbond_count[acceptor_key] += 1
     
-    return dict(residue_hbonds), dict(residue_inter_chain), dict(residue_hbond_count)
+    # Apply square-root transform to the final per-residue weights to control
+    # growth when multiple bonds contribute to the same residue.
+    sqrt_residue_hbonds = {
+        key: math.sqrt(weight) for key, weight in residue_hbonds.items()
+    }
+    
+    return sqrt_residue_hbonds, dict(residue_inter_chain), dict(residue_hbond_count)
 
 
 def calculate_global_hbond_density_average(
@@ -2208,13 +2165,13 @@ def calculate_hbond_energy_density_dssp_backbone_only(
     Calculate hydrogen bond energy density per residue using DSSP data (backbone only).
     
     Detects H-bonds from DSSP file (N-H-->O and O-->H-N columns) and weights them
-    by INVERSE main-chain relative SASA. This is for backbone/main-chain H-bonds only
+    by scaled main-chain relative SASA. This is for backbone/main-chain H-bonds only
     since DSSP primarily reports backbone H-bonds.
     
     Weighting:
-    - Weight = 1 / (main-chain REL) for each residue
-    - SASA values below 1% are clipped to 1% (minimum weight = 1 / 0.01 = 100)
-    - No maximum cap per residue (unlike regular H-bond density)
+    - Per-residue weight = 100 * max(main-chain REL, MIN_SASA_THRESHOLD)
+    - No maximum cap per residue (unlike regular H-bond density); instead, a
+      square-root transform is applied at the end.
     
     Each H-bond is counted for both residues involved (donor and acceptor),
     weighted by each residue's own main-chain SASA.
@@ -2259,7 +2216,9 @@ def calculate_hbond_energy_density_dssp_backbone_only(
         dssp_seq_num = pdb_to_dssp_seq[residue_key]
         
         # Get weight for this residue (main-chain only)
-        residue_weight = get_residue_sasa_weight(residue_key, sasa_data, use_side_chain=False, weighting=weighting)
+        residue_weight = get_residue_sasa_weight(
+            residue_key, sasa_data, use_side_chain=False, weighting=weighting
+        )
         
         # If residue has no SASA data, skip it
         if residue_weight == 0.0:
@@ -2282,14 +2241,17 @@ def calculate_hbond_energy_density_dssp_backbone_only(
             is_inter_chain = (residue_key[2] != target_residue_key[2])
             
             # Get weight for target residue (main-chain only)
-            target_weight = get_residue_sasa_weight(target_residue_key, sasa_data, use_side_chain=False, weighting=weighting)
+            target_weight = get_residue_sasa_weight(
+                target_residue_key, sasa_data, use_side_chain=False, weighting=weighting
+            )
             
             # If target residue has no SASA data, skip it
             if target_weight == 0.0:
                 continue
             
-            # Add weights to both residues (each bond contributes to both)
-            # No maximum cap for DSSP-based H-bond energy density
+            # Add weights to both residues (each bond contributes to both).
+            # No maximum cap for DSSP-based H-bond energy density; we instead
+            # apply a square-root transform at the end.
             residue_hbonds[residue_key] += residue_weight
             residue_hbonds[target_residue_key] += target_weight
             
@@ -2298,7 +2260,12 @@ def calculate_hbond_energy_density_dssp_backbone_only(
                 residue_inter_chain[residue_key] = True
                 residue_inter_chain[target_residue_key] = True
     
-    return dict(residue_hbonds), dict(residue_inter_chain)
+    # Apply square-root transform to the final per-residue weights.
+    sqrt_residue_hbonds = {
+        key: math.sqrt(weight) for key, weight in residue_hbonds.items()
+    }
+    
+    return sqrt_residue_hbonds, dict(residue_inter_chain)
 
 
 def calculate_hbond_energy_density_dssp_backbone_only_average(
