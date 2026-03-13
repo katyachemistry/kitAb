@@ -11,7 +11,6 @@
 #   --salt-bridges-only    Calculate only salt bridges
 #   --aromatic-only        Calculate only aromatic residues
 #   --wcn-only             Calculate only Weighted Contact Number (WCN, no SASA needed)
-#   --unweighted           Use unweighted calculations (no SASA needed)
 #   --weighting {inverse|negative_linear}  Weighting strategy (default: inverse)
 #   --format {table|csv|json}  Output format (default: csv)
 #   --pka-file <path>      Path to pKa file (optional, will auto-detect if not provided)
@@ -19,7 +18,6 @@
 #
 # Examples:
 #   ./run_parallel_thermostability.sh ./garbinski2023 8
-#   ./run_parallel_thermostability.sh ./GINKGO_structures 8 --unweighted
 #   ./run_parallel_thermostability.sh ./garbinski2023 --hbonds-only --format json
 
 set -e
@@ -44,18 +42,12 @@ shift || true
 # Parse arguments
 NUM_JOBS=""
 EXTRA_ARGS=()
-USE_UNWEIGHTED=false
 OUTPUT_FORMAT="csv"
 WEIGHTING="inverse"
 PH_VALUE="7.4"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --unweighted)
-            USE_UNWEIGHTED=true
-            EXTRA_ARGS+=("$1")
-            shift
-            ;;
         --average|--hbonds-only|--salt-bridges-only|--aromatic-only|--wcn-only)
             EXTRA_ARGS+=("$1")
             shift
@@ -84,7 +76,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1" >&2
-            echo "Usage: $0 STRUCTURES_DIR [num_jobs] [--average] [--hbonds-only] [--salt-bridges-only] [--aromatic-only] [--wcn-only] [--unweighted] [--weighting {inverse|negative_linear}] [--format {table|csv|json}] [--pka-file <path>] [--pH <value>]" >&2
+            echo "Usage: $0 STRUCTURES_DIR [num_jobs] [--average] [--hbonds-only] [--salt-bridges-only] [--aromatic-only] [--wcn-only] [--weighting {inverse|negative_linear}] [--format {table|csv|json}] [--pka-file <path>] [--pH <value>]" >&2
             exit 1
             ;;
     esac
@@ -113,10 +105,7 @@ echo "  pKa:        $PKA_DIR"
 echo "  Output:     $OUTPUT_DIR"
 echo "  Parallel jobs: $NUM_JOBS"
 echo "  Output format: $OUTPUT_FORMAT"
-echo "  Unweighted: $USE_UNWEIGHTED"
-if [ "$USE_UNWEIGHTED" = false ]; then
-    echo "  Weighting: $WEIGHTING"
-fi
+echo "  Weighting: $WEIGHTING"
 if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then
     echo "  Extra options: ${EXTRA_ARGS[*]}"
 fi
@@ -162,12 +151,11 @@ if command -v parallel &> /dev/null; then
             fi
         done
         
-        # Add SASA file when needed for calculations or for output columns (so all runs have identical CSV columns)
+        # Add SASA file when needed (required unless --wcn-only)
         if [ "$has_wcn_only" = false ]; then
             if [ -f "$sasa_file" ]; then
                 cmd+=("$sasa_file")
-            elif [ "$USE_UNWEIGHTED" = false ]; then
-                # Weighted run requires SASA; fail if missing
+            else
                 echo "✗ $basename (SASA file not found)"
                 return
             fi
@@ -218,7 +206,7 @@ if command -v parallel &> /dev/null; then
     }
     
     export -f process_file
-    export SASA_DIR DSSP_DIR PKA_DIR OUTPUT_DIR SCRIPT_DIR USE_UNWEIGHTED OUTPUT_FORMAT WEIGHTING PH_VALUE EXTRA_ARGS_STR
+    export SASA_DIR DSSP_DIR PKA_DIR OUTPUT_DIR SCRIPT_DIR OUTPUT_FORMAT WEIGHTING PH_VALUE EXTRA_ARGS_STR
     
     # Find all PDB files and process in parallel
     find "$STRUCTURES_DIR" -name "*.pdb" -type f | \
@@ -242,7 +230,6 @@ SCRIPT_DIR = os.environ.get("SCRIPT_DIR", ".")
 
 # Get configuration from environment
 num_jobs = int(os.environ.get('NUM_JOBS', cpu_count()))
-use_unweighted = os.environ.get('USE_UNWEIGHTED', 'false').lower() == 'true'
 output_format = os.environ.get('OUTPUT_FORMAT', 'csv')
 weighting = os.environ.get('WEIGHTING', 'inverse')
 ph_value = os.environ.get('PH_VALUE', '7.4')
@@ -274,16 +261,12 @@ def process_file(pdb_path):
         str(pdb_file)
     ]
     
-    # Add SASA file if not using unweighted and not using WCN-only
-    # WCN doesn't require SASA file
-    if not use_unweighted:
-        # Check if --wcn-only is in extra args
-        has_wcn_only = '--wcn-only' in extra_args
-        
-        if not has_wcn_only:
-            if not sasa_file.exists():
-                return f"✗ {basename} (SASA file not found)"
-            cmd.append(str(sasa_file))
+    # Add SASA file unless --wcn-only (SASA required for all other calculations)
+    has_wcn_only = '--wcn-only' in extra_args
+    if not has_wcn_only:
+        if not sasa_file.exists():
+            return f"✗ {basename} (SASA file not found)"
+        cmd.append(str(sasa_file))
     
     # Add DSSP file if it exists
     if dssp_file.exists():
@@ -327,9 +310,7 @@ if __name__ == "__main__":
     print(f"Found {len(pdb_files)} PDB files")
     print(f"Using {num_jobs} parallel jobs")
     print(f"Output format: {output_format}")
-    print(f"Unweighted: {use_unweighted}")
-    if not use_unweighted:
-        print(f"Weighting: {weighting}")
+    print(f"Weighting: {weighting}")
     print(f"pH: {ph_value}")
     if extra_args:
         print(f"Extra options: {' '.join(extra_args)}")
