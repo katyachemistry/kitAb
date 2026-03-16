@@ -2,10 +2,11 @@
 This module calculates developability determinants.
 """
 
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 import os
 import math
 from collections import defaultdict
+import re
 import numpy as np
 from scipy.spatial import cKDTree
 from scipy import optimize
@@ -24,7 +25,6 @@ from utils.parsers import (
     is_backbone_atom,
     parse_pka,
     get_pka_file_path,
-    CHARGED_RESIDUE_TYPES,
     residue_key_from_atom,
 )
 
@@ -48,7 +48,13 @@ NEGATIVE_ATOMS = frozenset({
     ("OE2", "GLU"),
 })
 
+# Residue type sets for residue category density (and related helpers)
 AROMATIC_RESIDUES = frozenset({"PHE", "TYR", "TRP"})
+HYDROPHOBIC_RESIDUES = frozenset({"ALA", "VAL", "LEU", "ILE", "MET", "PHE", "TRP", "PRO"})
+POLAR_RESIDUES = frozenset({"SER", "THR", "ASN", "GLN", "TYR", "CYS", "GLU", "ASP", "LYS", "ARG", "HIS"})
+NEGATIVE_CHARGED_RESIDUES = frozenset({"ASP", "GLU"})
+POSITIVE_CHARGED_RESIDUES = frozenset({"LYS", "ARG", "HIS"})
+CHARGED_RESIDUES = NEGATIVE_CHARGED_RESIDUES | POSITIVE_CHARGED_RESIDUES  # all charged (same as CHARGED_RESIDUE_TYPES from parsers)
 
 DONORS_ANY = frozenset({"N"})
 DONOR_EXCLUDED = frozenset({("N", "PRO")})
@@ -90,8 +96,10 @@ MIN_HBOND_ANGLE = 120.0
 
 MIN_BACKBONE_SEPARATION = 3
 
-# values below 1% are clipped to 1%
-MIN_SASA_THRESHOLD = 0.01
+# Generic terminal pKa constants used when estimating net charge / pI.
+# For antibody VH+VL this corresponds to 2 N-termini and 2 C-termini.
+NTERM_PKA = 8.0
+CTERM_PKA = 3.1
 
 _ATOM_LOOKUP_CACHE: Dict[int, Dict[Tuple[str, int, str], Atom]] = {}
 
@@ -116,6 +124,12 @@ _INTER_CHAIN_INTERFACE_CACHE: Dict[str, Set[Tuple[str, int, str, str]]] = {}
 # cache residue_key (4-tuple) -> "CDR1"|"CDR2"|"CDR3"|"framework" per atoms list
 _RESIDUE_REGION_CACHE: Dict[int, Dict[Tuple[str, int, str, str], str]] = {}
 
+# cache: pdb abs path -> sequence per chain (list of 3-letter codes)
+_PDB_SEQUENCE_CACHE: Dict[str, Dict[str, List[str]]] = {}
+
+# cache: pdb abs path -> set of unique residue keys (4-tuples)
+_PDB_RESIDUE_KEYS_CACHE: Dict[str, Set[Tuple[str, int, str, str]]] = {}
+
 # CDR regions by original residue number (inclusive). Framework = everything else.
 # Residues with insertion codes (e.g. 111A) use the numeric part only (111 in 105-117 -> CDR3).
 CDR1_RANGE = (27, 38)
@@ -123,16 +137,16 @@ CDR2_RANGE = (56, 65)
 CDR3_RANGE = (105, 117)
 
 
-def get_residue_region(residue_number: int, insertion_code: str = "") -> str:
+def get_residue_region(residue_number: int) -> str:
     """
-    Classify a residue by original residue number as CDR1, CDR2, CDR3, or framework.
+    Classify a residue by original PDB residue number (integer part) as CDR1, CDR2, CDR3, or framework.
 
-    Uses only the numeric residue number (insertion codes are ignored for classification).
-    E.g. residue 111A is CDR3 because 111 is in 105-117.
+    Uses only the numeric residue number; insertion codes (e.g. 111A) are irrelevant — the integer
+    part is what matters (e.g. 111 → CDR3). PDB/parsers store residue_number as int and
+    insertion_code separately.
 
     Args:
         residue_number: PDB residue number (integer part only).
-        insertion_code: Optional insertion code (e.g. "A"); not used for classification.
 
     Returns:
         "CDR1", "CDR2", "CDR3", or "framework".
@@ -171,7 +185,7 @@ def get_residue_region_map(atoms: List[Atom]) -> Dict[Tuple[str, int, str, str],
         if key in seen:
             continue
         seen.add(key)
-        out[key] = get_residue_region(atom.residue_number, getattr(atom, "insertion_code", "") or "")
+        out[key] = get_residue_region(atom.residue_number)
 
     _RESIDUE_REGION_CACHE[atoms_id] = out
     return out
@@ -199,13 +213,13 @@ def _compute_inter_chain_interface_from_by_chain(
     cutoff = INTER_CHAIN_INTERFACE_CUTOFF
     for i, c1 in enumerate(chains):
         for c2 in chains[i + 1 :]:
+            coords1 = np.array([[a.x, a.y, a.z] for a in by_chain[c1]], dtype=np.float64)
             coords2 = np.array([[a.x, a.y, a.z] for a in by_chain[c2]], dtype=np.float64)
+            tree1 = cKDTree(coords1)
             tree2 = cKDTree(coords2)
             for a in by_chain[c1]:
                 if tree2.query_ball_point([a.x, a.y, a.z], cutoff):
                     interface.add(residue_key_from_atom(a))
-            coords1 = np.array([[a.x, a.y, a.z] for a in by_chain[c1]], dtype=np.float64)
-            tree1 = cKDTree(coords1)
             for a in by_chain[c2]:
                 if tree1.query_ball_point([a.x, a.y, a.z], cutoff):
                     interface.add(residue_key_from_atom(a))
@@ -363,7 +377,7 @@ def get_donor_base_atom(
     atom_lookup = _ATOM_LOOKUP_CACHE[atoms_id]
     
     # Backbone N: base is C from previous residue in sequence order
-    if donor.name == "N" and is_backbone_atom(donor.name):
+    if donor.name == "N":
         seq_index = _get_residue_seq_index(atoms)
         donor_res_key = residue_key_from_atom(donor)
         donor_idx = seq_index.get(donor_res_key)
@@ -479,8 +493,9 @@ def check_hydrogen_bond(
     
     return angle >= MIN_HBOND_ANGLE
 
+# CHECK FROM HERE
 
-def get_sasa_weight(atom: Atom, sasa_data: Dict[Tuple[str, int, str, str], SASAEntry], weighting: str = "inverse") -> float:
+def get_sasa_weight(atom: Atom, sasa_data: Dict[Tuple[str, int, str, str], SASAEntry]) -> float:
     key = residue_key_from_atom(atom)
     if key not in sasa_data:
         return 0.0
@@ -492,24 +507,14 @@ def get_sasa_weight(atom: Atom, sasa_data: Dict[Tuple[str, int, str, str], SASAE
     else:
         rel_sasa = sasa_entry.total_side_rel
     
-    # Note: rel_sasa is already a fraction (0-1), not a percentage.
-    # parse_sasa() already divides percentages by 100.0.
-    rel_sasa_fraction = rel_sasa
-    
-    # Default scheme:
-    #   1) Clip SASA below MIN_SASA_THRESHOLD (e.g. 0.01).
-    #   2) Multiply by 100.
-    # This yields per-atom weights in [1, 100].
-    if rel_sasa_fraction < MIN_SASA_THRESHOLD:
-        rel_sasa_fraction = MIN_SASA_THRESHOLD
-    return rel_sasa_fraction * 100.0
+    # rel_sasa is a fraction (0-1). Scale to [0, 100].
+    return rel_sasa * 100.0
 
 
 def get_residue_sasa_weight(
     residue_key: Tuple[str, int, str, str],
     sasa_data: Dict[Tuple[str, int, str, str], SASAEntry],
     use_side_chain: bool = True,
-    weighting: str = "inverse"
 ) -> float:
     if residue_key not in sasa_data:
         return 0.0
@@ -521,60 +526,8 @@ def get_residue_sasa_weight(
     else:
         rel_sasa = sasa_entry.main_chain_rel
     
-    # Note: rel_sasa is already a fraction (0-1), not a percentage.
-    # parse_sasa() already divides percentages by 100.0.
-    rel_sasa_fraction = rel_sasa
-    
-    # Default scheme, matching get_sasa_weight():
-    #   1) Clip SASA below MIN_SASA_THRESHOLD (e.g. 0.01).
-    #   2) Multiply by 100.
-    # This yields per-residue weights in [1, 100].
-    if rel_sasa_fraction < MIN_SASA_THRESHOLD:
-        rel_sasa_fraction = MIN_SASA_THRESHOLD
-    return rel_sasa_fraction * 100.0
-
-
-# ============================================================================
-# Charge State Functions
-# ============================================================================
-
-def is_residue_charged(
-    residue_name: str,
-    pka_value: Optional[float],
-    pH: float
-) -> bool:
-    """
-    Determine if a residue is charged at a given pH based on its pKa value.
-    
-    Rules:
-    - ASP/GLU: charged (deprotonated, negative) when pKa < pH
-    - LYS/ARG: charged (protonated, positive) when pKa > pH
-    
-    If pKa is None (residue not in pKa file), returns True (conservative default:
-    assume charged).
-    
-    Args:
-        residue_name: 3-letter residue code (ASP, GLU, LYS, ARG)
-        pka_value: pKa value from pKa file, or None if not found
-        pH: pH value to check charge state at
-        
-    Returns:
-        True if residue is charged at given pH, False otherwise
-    """
-    # If pKa not available, assume charged (conservative default)
-    if pka_value is None:
-        return True
-    
-    # Check charge state based on residue type
-    if residue_name in ("ASP", "GLU"):
-        # Acidic: charged (deprotonated, negative) when pKa < pH
-        return pka_value < pH
-    elif residue_name in ("LYS", "ARG", "HIS"):
-        # Basic: charged (protonated, positive) when pKa > pH
-        return pka_value > pH
-    
-    # Not a charged residue type, return False
-    return False
+    # rel_sasa is a fraction (0-1). Scale to [0, 100].
+    return rel_sasa * 100.0
 
 
 def net_charge_from_pka(
@@ -606,6 +559,17 @@ def net_charge_from_pka(
         elif res_name in ("LYS", "ARG", "HIS"):
             # Fraction protonated (positive charge)
             net += 1.0 / (1.0 + np.power(10.0, pH - pka))
+
+    # Add generic N- and C-terminus contributions per polypeptide chain.
+    # Each distinct chain in pka_data is assumed to have one N-terminus and one C-terminus.
+    chains = {key[2] for key in pka_data.keys()}
+    n_chains = len(chains)
+    if n_chains > 0:
+        # N-terminus: positive charge contribution
+        net += n_chains * (1.0 / (1.0 + np.power(10.0, pH - NTERM_PKA)))
+        # C-terminus: negative charge contribution
+        net -= n_chains * (1.0 / (1.0 + np.power(10.0, CTERM_PKA - pH)))
+
     return float(net)
 
 
@@ -744,19 +708,21 @@ def scm_score_from_pka(
                 count = residue_sidechain_count.get(key4, 1)
                 atom_charge[i] = residue_charge.get(key4, 0.0) / max(1, count)
 
-        # SCM_atom,i = sum of charge(j) for j side-chain, exposed, within d_cutoff of i
+        # SCM_atom,i = sum of charge(j) for j side-chain, exposed, within d_cutoff of i.
+        # Only exposed residues are considered as centers i for the SCM score.
+        # Use a precomputed validity mask and pairwise neighbor enumeration for efficiency.
         tree = cKDTree(coords)
         scm_atom = np.zeros(n, dtype=np.float64)
-        for i in range(n):
-            indices = tree.query_ball_point(coords[i], d_cutoff)
-            for j in indices:
-                if i == j:
-                    continue
-                if not is_sidechain[j]:
-                    continue
-                if not residue_exposed[j]:
-                    continue
+        valid = is_sidechain & residue_exposed
+        # query_pairs returns each unordered pair (i, j) once; accumulate contributions
+        # symmetrically while respecting exposed-center and side-chain/exposed-source rules.
+        for i, j in tree.query_pairs(d_cutoff):
+            if i == j:
+                continue
+            if residue_exposed[i] and valid[j]:
                 scm_atom[i] += atom_charge[j]
+            if residue_exposed[j] and valid[i]:
+                scm_atom[j] += atom_charge[i]
 
         # SCM score = | sum of SCM_atom,i for i where SCM_atom,i < 0 |
         neg_sum = np.sum(scm_atom[scm_atom < 0])
@@ -780,12 +746,16 @@ def sum_total_side_rel_within_cutoff(
 
     seen = set()
     atoms_by_res: Dict[Tuple, List[Atom]] = {}
+    ca_by_res: Dict[Tuple, Tuple[float, float, float]] = {}
     for atom in pdb_atoms:
         key4 = residue_key_from_atom(atom)
         if key4 not in seen:
             seen.add(key4)
             residue_keys.append(key4)
-        atoms_by_res.setdefault(key4, []).append(atom)
+            atoms_by_res[key4] = []
+        atoms_by_res[key4].append(atom)
+        if atom.name.strip() == "CA":
+            ca_by_res[key4] = (atom.x, atom.y, atom.z)
 
     for key4 in residue_keys:
         atoms_res = atoms_by_res[key4]
@@ -794,11 +764,10 @@ def sum_total_side_rel_within_cutoff(
         total_side_rel = float(val) if val is not None else 0.0
         residue_total_side_rel.append(total_side_rel)
 
-        # Cα position or centroid
-        ca_atoms = [a for a in atoms_res if a.name.strip() == "CA"]
-        if ca_atoms:
-            a0 = ca_atoms[0]
-            residue_coords.append((a0.x, a0.y, a0.z))
+        # Cα position if present, otherwise centroid
+        ca_coord = ca_by_res.get(key4)
+        if ca_coord is not None:
+            residue_coords.append(ca_coord)
         else:
             cx = sum(a.x for a in atoms_res) / len(atoms_res)
             cy = sum(a.y for a in atoms_res) / len(atoms_res)
@@ -899,15 +868,24 @@ def _find_salt_bridge_contacts(
     if len(negative_atoms) == 0 or len(positive_atoms) == 0:
         return {}
 
-    # Precompute which residues are charged at the given pH, using PropKA pKa
-    # values (or treating missing pKa as charged, via is_residue_charged).
+    # Precompute which residues are charged at the given pH, using the same
+    # Henderson–Hasselbalch rules as net_charge_from_pka and the same
+    # missing-pKa conventions (ASP/GLU/LYS/ARG charged, HIS uncharged).
     charged_residues: Dict[Tuple[str, int, str, str], bool] = {}
     for atom in atoms:
         key4 = residue_key_from_atom(atom)
         if key4 in charged_residues:
             continue
         pka_val = pka_data.get(key4)
-        charged_residues[key4] = is_residue_charged(atom.residue_name, pka_val, pH)
+        res_name = atom.residue_name
+        if pka_val is None:
+            charged_residues[key4] = res_name in ("ASP", "GLU", "LYS", "ARG")
+        elif res_name in ("ASP", "GLU"):
+            charged_residues[key4] = pka_val < pH
+        elif res_name in ("LYS", "ARG", "HIS"):
+            charged_residues[key4] = pka_val > pH
+        else:
+            charged_residues[key4] = False
 
     # Build KD-tree for negative atoms for efficient neighbor search
     negative_coords = np.array([[a.x, a.y, a.z] for a in negative_atoms])
@@ -920,7 +898,7 @@ def _find_salt_bridge_contacts(
     ] = {}
 
     for pos_atom in positive_atoms:
-        pos_coord = np.array([pos_atom.x, pos_atom.y, pos_atom.z])
+        pos_coord = (pos_atom.x, pos_atom.y, pos_atom.z)
         pos_key = residue_key_from_atom(pos_atom)
 
         # Check if positive residue is charged at given pH
@@ -942,11 +920,6 @@ def _find_salt_bridge_contacts(
             if pos_key == neg_key:
                 continue
 
-            # Check distance (already filtered by KD-tree, but verify)
-            dist = distance(pos_atom, neg_atom)
-            if dist > MAX_SALT_BRIDGE_DISTANCE:
-                continue
-
             pair = (pos_key, neg_key)
             contacts_by_pair.setdefault(pair, []).append((pos_atom, neg_atom))
 
@@ -956,10 +929,9 @@ def _find_salt_bridge_contacts(
 def detect_salt_bridges(
     pdb_path: str,
     sasa_path: str,
-    weighting: str = "inverse",
     pka_path: Optional[str] = None,
     pH: float = 7.4
-) -> Dict[Tuple[Tuple[str, int, str], Tuple[str, int, str]], Tuple[float, float]]:
+) -> Dict[Tuple[Tuple[str, int, str, str], Tuple[str, int, str, str]], Tuple[float, float]]:
     """
     Detect salt bridges between residue pairs with SASA weighting.
 
@@ -979,7 +951,6 @@ def detect_salt_bridges(
     Args:
         pdb_path: Path to PDB structure file
         sasa_path: Path to SASA file
-        weighting: Weighting strategy (currently only "inverse" is supported)
         pka_path: Optional path to pKa file. If None, will try to auto-detect from pdb_path.
         pH: pH value for charge state determination (default: 7.4)
 
@@ -987,7 +958,7 @@ def detect_salt_bridges(
         Dictionary mapping ((pos_res_name, pos_res_num, pos_chain, pos_ins),
                             (neg_res_name, neg_res_num, neg_chain, neg_ins))
         -> (pos_weight, neg_weight)
-        where weights are the maximum inverse SASA weights from any atom-atom contact in the pair.
+        where weights are the maximum SASA-based weights from any atom-atom contact in the pair.
         Keys are ordered such that the positive residue comes first.
     """
     atoms = _get_atoms_for_path(pdb_path)
@@ -1010,7 +981,7 @@ def detect_salt_bridges(
         cached = atom_sasa_weight.get(key)
         if cached is not None:
             return cached
-        w = get_sasa_weight(atom, sasa_data, weighting)
+        w = get_sasa_weight(atom, sasa_data)
         atom_sasa_weight[key] = w
         return w
 
@@ -1042,7 +1013,6 @@ def detect_salt_bridges(
 def calculate_salt_bridge_density(
     pdb_path: str,
     sasa_path: str,
-    weighting: str = "inverse",
     pka_path: Optional[str] = None,
     pH: float = 7.4
 ) -> Tuple[Dict[Tuple[str, int, str, str], float], Dict[Tuple[str, int, str, str], bool]]:
@@ -1050,8 +1020,8 @@ def calculate_salt_bridge_density(
     Calculate salt bridge density per residue, using SASA-based weights.
     
     Number of salt bridges per residue, weighted by scaled relative SASA:
-    - Per-contact weight = 100 * max(REL, MIN_SASA_THRESHOLD)
-      where REL is total-side REL for side-chain atoms or main-chain REL for backbone atoms.
+    - Per-contact weight = 100 * REL, where REL is total-side REL for side-chain
+      atoms or main-chain REL for backbone atoms.
     
     SASA-derived weights are summed per residue and a square-root transform is then
     applied to the final per-residue weights, introducing diminishing returns for
@@ -1060,22 +1030,22 @@ def calculate_salt_bridge_density(
     Args:
         pdb_path: Path to PDB structure file
         sasa_path: Path to SASA file
-        weighting: Weighting strategy (currently only "inverse" is supported)
         pka_path: Optional path to pKa file. If None, will try to auto-detect from pdb_path.
         pH: pH value for charge state determination (default: 7.4)
         
     Returns:
         Tuple of:
         1. Dictionary mapping (residue_name, residue_number, chain) -> weighted salt bridge density
-           (weighted by inverse SASA, capped at 100.0 per residue)
         2. Dictionary mapping (residue_name, residue_number, chain) -> bool indicating
            if residue has any inter-chain contacts
     """
-    salt_bridges = detect_salt_bridges(pdb_path, sasa_path, weighting, pka_path, pH)
+    salt_bridges = detect_salt_bridges(pdb_path, sasa_path, pka_path, pH)
     
-    # Aggregate by residue
+    # Aggregate by residue (raw weights, no sqrt here; callers can apply their
+    # own transforms). Only residues that participate in at least one salt
+    # bridge appear in the output dicts.
     residue_weights = defaultdict(float)
-    residue_inter_chain = defaultdict(bool)
+    residue_inter_chain: Dict[Tuple[str, int, str, str], bool] = {}
     
     for (pos_key, neg_key), (pos_weight, neg_weight) in salt_bridges.items():
         # Check if this is an inter-chain contact
@@ -1091,45 +1061,210 @@ def calculate_salt_bridge_density(
             residue_inter_chain[pos_key] = True
             residue_inter_chain[neg_key] = True
     
-    # Apply square-root transform to the final per-residue weights to reduce
-    # growth when multiple contacts contribute to the same residue.
-    sqrt_residue_weights = {
-        key: math.sqrt(weight) for key, weight in residue_weights.items()
-    }
-    
-    return sqrt_residue_weights, dict(residue_inter_chain)
+    return dict(residue_weights), residue_inter_chain
+
+
+# Type alias for salt bridge result: (pos_key, neg_key) -> (pos_weight, neg_weight)
+_SaltBridgesDict = Dict[
+    Tuple[Tuple[str, int, str, str], Tuple[str, int, str, str]],
+    Tuple[float, float],
+]
 
 
 def calculate_salt_bridge_density_average(
     pdb_path: str,
     sasa_path: str,
-    weighting: str = "inverse",
     pka_path: Optional[str] = None,
-    pH: float = 7.4
+    pH: float = 7.4,
+    *,
+    residues_for_density: Optional[Iterable[Tuple[str, int, str, str]]] = None,
+    weighted: bool = True,
+    residues_for_average: Optional[Iterable[Tuple[str, int, str, str]]] = None,
+    salt_bridges: Optional[_SaltBridgesDict] = None,
 ) -> float:
     """
-    Calculate average salt bridge density across all residues.
-    
+    Calculate average salt bridge density with configurable numerator and denominator.
+
+    A single pass over salt bridge data computes both SASA-weighted sums and raw
+    counts per residue, so weighted and unweighted averages are efficient.
+
+    To avoid recomputing salt bridges when calling this function multiple times
+    (e.g. for different residue sets or weighted vs unweighted), compute once
+    and pass the result: salt_bridges = detect_salt_bridges(...), then pass
+    salt_bridges=salt_bridges into each call.
+
+    Examples:
+        - Average (SASA-weighted) salt bridge density of CDR residues over all residues:
+          calculate_salt_bridge_density_average(pdb, sasa, residues_for_density=cdr_residues)
+        - Average unweighted salt bridge count of CDR residues over CDR residues only:
+          calculate_salt_bridge_density_average(pdb, sasa, residues_for_density=cdr_residues,
+                                                weighted=False, residues_for_average=cdr_residues)
+        - Multiple averages without recomputing salt bridges:
+          sb = detect_salt_bridges(pdb, sasa, pka_path, pH)
+          avg1 = calculate_salt_bridge_density_average(pdb, sasa, ..., salt_bridges=sb, ...)
+          avg2 = calculate_salt_bridge_density_average(pdb, sasa, ..., salt_bridges=sb, ...)
+
+    Args:
+        pdb_path: Path to PDB structure file (used when salt_bridges is None, and for
+            denominator when residues_for_average is None).
+        sasa_path: Path to SASA file (used only when salt_bridges is None).
+        pka_path: Optional path to pKa file (used only when salt_bridges is None).
+        pH: pH value for charge state (used only when salt_bridges is None).
+        residues_for_density: If provided, only these residues contribute to the numerator.
+            Residue keys are 4-tuples (residue_name, residue_number, chain, insertion_code).
+            If None, all residues that have salt bridge density are included.
+        weighted: If True, use SASA-weighted density (with sqrt transform). If False,
+            use raw count of salt bridges per residue.
+        residues_for_average: Residues over which to average (denominator). If provided,
+            denominator is len(set(residues_for_average)). If None, denominator is total
+            number of unique residues in the PDB.
+        salt_bridges: Optional pre-computed result from detect_salt_bridges(). When
+            provided, salt bridge detection is skipped (pdb_path is still used for
+            denominator when residues_for_average is None).
+
+    Returns:
+        Sum of (density or count) over residues_for_density, divided by denominator.
+        Returns 0.0 if denominator is 0 or there are no salt bridges.
+    """
+    if salt_bridges is None:
+        salt_bridges = detect_salt_bridges(pdb_path, sasa_path, pka_path, pH)
+    if not salt_bridges:
+        return 0.0
+
+    residue_weights_raw: Dict[Tuple[str, int, str, str], float] = defaultdict(float)
+    residue_counts: Dict[Tuple[str, int, str, str], int] = defaultdict(int)
+    for (pos_key, neg_key), (pos_w, neg_w) in salt_bridges.items():
+        residue_weights_raw[pos_key] += pos_w
+        residue_weights_raw[neg_key] += neg_w
+        residue_counts[pos_key] += 1
+        residue_counts[neg_key] += 1
+
+    density_set: Optional[Set[Tuple[str, int, str, str]]] = (
+        set(residues_for_density) if residues_for_density is not None else None
+    )
+    if residues_for_average is not None:
+        average_over_set = set(residues_for_average)
+        denom = len(average_over_set)
+    else:
+        denom = _count_unique_residues_in_pdb(pdb_path)
+
+    if denom == 0:
+        return 0.0
+
+    keys_to_sum = (
+        residue_weights_raw.keys()
+        if density_set is None
+        else (set(residue_weights_raw.keys()) & density_set)
+    )
+    if weighted:
+        total = sum(math.sqrt(residue_weights_raw[k]) for k in keys_to_sum)
+    else:
+        total = sum(residue_counts[k] for k in keys_to_sum)
+
+    return total / float(denom)
+
+
+# ============================================================================
+# Sequence motif count
+# ============================================================================
+
+def _parse_motif(motif: str) -> List[str]:
+    """
+    Parse a motif string into a list of 3-letter residue codes.
+
+    Examples: "Asp-Gly" -> ["ASP", "GLY"], "Trp-Pro-Trp" -> ["TRP", "PRO", "TRP"],
+    "Lys" -> ["LYS"]. Accepts 1-letter (e.g. K) or 3-letter (e.g. Lys, LYS) codes.
+    """
+    parts = [p.strip() for p in motif.split("-") if p.strip()]
+    if not parts:
+        raise ValueError(f"Invalid motif: {motif!r}")
+    result: List[str] = []
+    for p in parts:
+        u = p.upper()
+        if len(u) == 1:
+            three = AA_1_TO_3.get(u)
+            if three is None:
+                raise ValueError(f"Unknown 1-letter code in motif: {p!r}")
+            result.append(three)
+        elif len(u) == 3:
+            result.append(u)
+        else:
+            raise ValueError(f"Residue in motif must be 1- or 3-letter: {p!r}")
+    return result
+
+
+def _get_sequence_per_chain(pdb_path: str) -> Dict[str, List[str]]:
+    """
+    Return ordered residue sequence (3-letter codes) per chain.
+    Residues are sorted by residue number then insertion code.
+    """
+    abs_path = os.path.abspath(pdb_path)
+    cached = _PDB_SEQUENCE_CACHE.get(abs_path)
+    if cached is not None:
+        return cached
+
+    atoms = _get_atoms_for_path(pdb_path)
+    if not atoms:
+        _PDB_SEQUENCE_CACHE[abs_path] = {}
+        return {}
+    chain_to_keys: Dict[str, List[Tuple[str, int, str, str]]] = {}
+    for atom in atoms:
+        key = residue_key_from_atom(atom)
+        chain = key[2]
+        keys = chain_to_keys.setdefault(chain, [])
+        # Avoid duplicates while preserving insertion-order per chain
+        if not keys or keys[-1] != key:
+            keys.append(key)
+    out: Dict[str, List[str]] = {}
+    for chain, keys in chain_to_keys.items():
+        sorted_keys = sorted(keys, key=lambda k: (k[1], k[3]))
+        out[chain] = [k[0] for k in sorted_keys]
+
+    _PDB_SEQUENCE_CACHE[abs_path] = out
+    return out
+
+
+def _count_motif_in_sequence(sequence: List[str], motif_list: List[str]) -> int:
+    """Count non-overlapping occurrences of motif_list in sequence (sliding window)."""
+    n = len(motif_list)
+    if n == 0 or len(sequence) < n:
+        return 0
+    count = 0
+    i = 0
+    while i <= len(sequence) - n:
+        if sequence[i : i + n] == motif_list:
+            count += 1
+            i += n
+        else:
+            i += 1
+    return count
+
+
+def sequence_motif_count(pdb_path: str, motif: str) -> int:
+    """
+    Count how many times a sequence motif appears in the structure's chains.
+
+    The motif is given as a string with residues separated by "-", e.g. "Asp-Gly",
+    "Trp-Pro-Trp", or "Lys". Each residue can be 1-letter (K) or 3-letter (Lys, LYS).
+    Counts are summed over all chains; each chain is treated as a separate sequence.
+    Overlapping occurrences are not double-counted (non-overlapping match).
+
     Args:
         pdb_path: Path to PDB structure file
-        sasa_path: Path to SASA file
-        weighting: Weighting strategy (currently only "inverse" is supported)
-        pka_path: Optional path to pKa file. If None, will try to auto-detect from pdb_path.
-        pH: pH value for charge state determination (default: 7.4)
-        
+        motif: Motif string, e.g. "Asp-Gly", "Trp-Pro-Trp", "Lys"
+
     Returns:
-        Average weighted salt bridge density per residue
+        Total number of times the motif appears across all chains
+
+    Raises:
+        ValueError: If motif is empty or contains an unknown residue code
     """
-    residue_densities, _ = calculate_salt_bridge_density(pdb_path, sasa_path, weighting, pka_path, pH)
-    
-    if len(residue_densities) == 0:
-        return 0.0
-    
-    total_residues = _count_unique_residues_in_pdb(pdb_path)
-    if total_residues == 0:
-        return 0.0
-    
-    return sum(residue_densities.values()) / float(total_residues)
+    motif_list = _parse_motif(motif)
+    chains_to_sequence = _get_sequence_per_chain(pdb_path)
+    total = 0
+    for sequence in chains_to_sequence.values():
+        total += _count_motif_in_sequence(sequence, motif_list)
+    return total
 
 
 # ============================================================================
@@ -1149,17 +1284,75 @@ def is_aromatic_residue(residue_name: str) -> bool:
     return residue_name in AROMATIC_RESIDUES
 
 
+def get_residue_keys_by_type(
+    pdb_path: str,
+    residue_types: Iterable[str],
+) -> Set[Tuple[str, int, str, str]]:
+    """
+    Return the set of residue keys in the structure whose residue name is in residue_types.
+
+    residue_types: e.g. AROMATIC_RESIDUES, HYDROPHOBIC_RESIDUES, POLAR_RESIDUES, CHARGED_RESIDUES.
+    """
+    types_set = frozenset(residue_types)
+    abs_path = os.path.abspath(pdb_path)
+    # Cache unique residue keys per PDB for reuse across many descriptors.
+    residue_keys = _PDB_RESIDUE_KEYS_CACHE.get(abs_path)
+    if residue_keys is None:
+        atoms = _get_atoms_for_path(pdb_path)
+        if not atoms:
+            _PDB_RESIDUE_KEYS_CACHE[abs_path] = set()
+            return set()
+        seen: Set[Tuple[str, int, str, str]] = set()
+        residue_keys = set()
+        for atom in atoms:
+            key4 = residue_key_from_atom(atom)
+            if key4 not in seen:
+                seen.add(key4)
+                residue_keys.add(key4)
+        _PDB_RESIDUE_KEYS_CACHE[abs_path] = residue_keys
+
+    return {k for k in residue_keys if k[0] in types_set}
+
+
+def get_aromatic_residue_keys(pdb_path: str) -> Set[Tuple[str, int, str, str]]:
+    """Residue keys for all Phe, Tyr, and Trp in the structure."""
+    return get_residue_keys_by_type(pdb_path, AROMATIC_RESIDUES)
+
+
+def get_hydrophobic_residue_keys(pdb_path: str) -> Set[Tuple[str, int, str, str]]:
+    """Residue keys for all hydrophobic residues (ALA, VAL, LEU, ILE, MET, PHE, TRP, PRO, GLY)."""
+    return get_residue_keys_by_type(pdb_path, HYDROPHOBIC_RESIDUES)
+
+
+def get_polar_residue_keys(pdb_path: str) -> Set[Tuple[str, int, str, str]]:
+    """Residue keys for all polar residues (SER, THR, ASN, GLN, TYR, CYS, GLU, ASP, LYS, ARG, HIS)."""
+    return get_residue_keys_by_type(pdb_path, POLAR_RESIDUES)
+
+
+def get_charged_residue_keys(pdb_path: str) -> Set[Tuple[str, int, str, str]]:
+    """Residue keys for all charged residue types (ASP, GLU, LYS, ARG, HIS)."""
+    return get_residue_keys_by_type(pdb_path, CHARGED_RESIDUES)
+
+
+def get_negative_charged_residue_keys(pdb_path: str) -> Set[Tuple[str, int, str, str]]:
+    """Residue keys for negative charged types (ASP, GLU)."""
+    return get_residue_keys_by_type(pdb_path, NEGATIVE_CHARGED_RESIDUES)
+
+
+def get_positive_charged_residue_keys(pdb_path: str) -> Set[Tuple[str, int, str, str]]:
+    """Residue keys for positive charged types (LYS, ARG, HIS)."""
+    return get_residue_keys_by_type(pdb_path, POSITIVE_CHARGED_RESIDUES)
+
+
 def calculate_aromatic_density(
     pdb_path: str,
     sasa_path: str,
-    weighting: str = "inverse"
 ) -> Dict[Tuple[str, int, str, str], float]:
     """
     Calculate aromatic residue density per residue, weighted by SASA.
     
     For each Phe, Tyr, or Trp residue, counts it as 1 * scaled_SASA.
-    Weight = 100 * max(total-side REL, MIN_SASA_THRESHOLD) since aromatic residues
-    are side-chain residues.
+    Weight = 100 * total-side REL (aromatic residues are side-chain).
     
     SASA-derived weights are combined per residue and a square-root transform is
     applied to the final per-residue weights to keep the metric bounded while
@@ -1170,62 +1363,130 @@ def calculate_aromatic_density(
         sasa_path: Path to SASA file
         
     Returns:
-        Dictionary mapping (residue_name, residue_number, chain) -> weighted aromatic density
-        (weighted by inverse SASA, capped at 100.0 per residue)
-        Only includes Phe, Tyr, and Trp residues
+        Dictionary mapping (residue_name, residue_number, chain) -> weighted aromatic density.
+        Only includes Phe, Tyr, and Trp residues.
     """
     # Parse files
-    atoms = _get_atoms_for_path(pdb_path)
     sasa_data = parse_sasa(sasa_path)
     
+    # Use precomputed aromatic residue keys and compute weights directly.
+    aromatic_keys = get_aromatic_residue_keys(pdb_path)
     aromatic_weights: Dict[Tuple[str, int, str, str], float] = {}
-    residue_map: Dict[Tuple[str, int, str, str], str] = {}
-    for atom in atoms:
-        key4 = residue_key_from_atom(atom)
-        if key4 not in residue_map:
-            residue_map[key4] = atom.residue_name
-
-    for key4, res_name in residue_map.items():
-        if not is_aromatic_residue(res_name):
-            continue
-        weight = get_residue_sasa_weight(
-            key4, sasa_data, use_side_chain=True, weighting=weighting
-        )
+    for key4 in aromatic_keys:
+        weight = get_residue_sasa_weight(key4, sasa_data, use_side_chain=True)
         aromatic_weights[key4] = weight
     
-    # Apply square-root transform to the final per-residue weights.
-    sqrt_aromatic_weights = {
-        key: math.sqrt(weight) for key, weight in aromatic_weights.items()
-    }
+    # Apply square-root transform to the final per-residue weights in place.
+    for key in list(aromatic_weights.keys()):
+        aromatic_weights[key] = math.sqrt(aromatic_weights[key])
     
-    return sqrt_aromatic_weights
+    return aromatic_weights
 
 
-def calculate_aromatic_density_average(
+# Type alias for residue category density cache: residue_key -> raw SASA weight (0-100)
+_ResidueDensityRawDict = Dict[Tuple[str, int, str, str], float]
+
+
+def compute_residue_density_raw(
     pdb_path: str,
     sasa_path: str,
-    weighting: str = "inverse"
+) -> _ResidueDensityRawDict:
+    """
+    Compute per-residue raw SASA weight for all residues in the structure. No sqrt.
+
+    Uses side-chain relative SASA. Use this to cache density data when calling
+    calculate_residue_category_density_average multiple times with different
+    residue categories or weighted vs unweighted.
+    """
+    atoms = _get_atoms_for_path(pdb_path)
+    if not atoms:
+        return {}
+    sasa_data = parse_sasa(sasa_path)
+    residue_keys = {residue_key_from_atom(a) for a in atoms}
+
+    weights: _ResidueDensityRawDict = {}
+    for key4 in residue_keys:
+        weight = get_residue_sasa_weight(key4, sasa_data, use_side_chain=True)
+        weights[key4] = weight
+    return weights
+
+
+def calculate_residue_category_density_average(
+    pdb_path: str,
+    sasa_path: str,
+    *,
+    residue_category: Optional[Iterable[Tuple[str, int, str, str]]] = None,
+    weighted: bool = True,
+    residues_for_average: Optional[Iterable[Tuple[str, int, str, str]]] = None,
+    density_raw: Optional[_ResidueDensityRawDict] = None,
 ) -> float:
     """
-    Calculate average aromatic residue density across all residues.
-    
+    Calculate average density for a category of residues with configurable denominator.
+
+    The category is any list/set of residue keys (e.g. polar, aromatic, inter-chain,
+    CDR, or "exposed only") determined elsewhere and passed in. Density can be
+    SASA-weighted or raw count; the average can be over total residues or over
+    the category itself.
+
+    Examples:
+        - Density of polar residues (only exposed), averaged over total residue count:
+          calculate_residue_category_density_average(pdb, sasa, residue_category=polar_exposed_keys)
+        - Density of aromatic inter-chain residues, averaged over their count:
+          calculate_residue_category_density_average(pdb, sasa,
+              residue_category=aromatic_inter_chain_keys,
+              weighted=False, residues_for_average=aromatic_inter_chain_keys)
+        - Multiple averages without recomputing:
+          raw = compute_residue_density_raw(pdb, sasa)
+          avg1 = calculate_residue_category_density_average(pdb, sasa, density_raw=raw, ...)
+          avg2 = calculate_residue_category_density_average(pdb, sasa, density_raw=raw, ...)
+
     Args:
-        pdb_path: Path to PDB structure file
-        sasa_path: Path to SASA file
-        
+        pdb_path: Path to PDB structure file (used when density_raw is None, and for
+            denominator when residues_for_average is None).
+        sasa_path: Path to SASA file (used only when density_raw is None).
+        residue_category: Residue keys to include in the numerator (the "category").
+            Residue keys are 4-tuples (residue_name, residue_number, chain, insertion_code).
+            If None, all residues present in density_raw are included.
+        weighted: If True, use SASA-weighted density (with sqrt transform). If False,
+            use raw count (1 per residue in the category).
+        residues_for_average: Residues over which to average (denominator). If provided,
+            denominator is len(set(residues_for_average)). If None, denominator is total
+            number of unique residues in the PDB.
+        density_raw: Optional pre-computed result from compute_residue_density_raw().
+            When provided, PDB/SASA are not loaded again (pdb_path still used for
+            denominator when residues_for_average is None).
+
     Returns:
-        Average weighted aromatic density per residue (only counting Phe, Tyr, Trp)
+        Sum of (density or count) over residue_category, divided by denominator.
+        Returns 0.0 if denominator is 0 or no residues in category.
     """
-    residue_densities = calculate_aromatic_density(pdb_path, sasa_path, weighting)
-    
-    if len(residue_densities) == 0:
+    if density_raw is None:
+        density_raw = compute_residue_density_raw(pdb_path, sasa_path)
+    if not density_raw:
         return 0.0
-    
-    total_residues = _count_unique_residues_in_pdb(pdb_path)
-    if total_residues == 0:
+
+    category_set: Optional[Set[Tuple[str, int, str, str]]] = (
+        set(residue_category) if residue_category is not None else None
+    )
+    if residues_for_average is not None:
+        denom = len(set(residues_for_average))
+    else:
+        denom = _count_unique_residues_in_pdb(pdb_path)
+
+    if denom == 0:
         return 0.0
-    
-    return sum(residue_densities.values()) / float(total_residues)
+
+    keys_to_sum = (
+        density_raw.keys()
+        if category_set is None
+        else [k for k in density_raw.keys() if k in category_set]
+    )
+    if weighted:
+        total = sum(math.sqrt(density_raw[k]) for k in keys_to_sum)
+    else:
+        total = float(len(list(keys_to_sum)))
+
+    return total / float(denom)
 
 
 # ============================================================================
@@ -1233,89 +1494,104 @@ def calculate_aromatic_density_average(
 # ============================================================================
 
 def calculate_weighted_contact_number(
-    pdb_path: str
+    pdb_path: str,
+    *,
+    residue_category: Optional[Iterable[Tuple[str, int, str, str]]] = None,
 ) -> Dict[Tuple[str, int, str, str], float]:
     """
-    Calculate Weighted Contact Number (WCN) per residue.
-    
-    For a residue i, the weighted contact number is defined as the inverse-distance-weighted
-    sum over all other residues j:
-    
-    WCN_i = Σ(j≠i) 1/(r_ij^2)
-    
-    where:
-    - r_ij is the Euclidean distance between Cα atoms of residues i and j
-    - The exponent 2 reflects the empirical decay of interaction influence with distance
-    
+    Calculate Weighted Contact Number (WCN) per residue (distance-weighted: 1/r²).
+
+    WCN_i = Σ(j≠i) 1/(r_ij²), where r_ij is Cα–Cα distance. Always computed over
+    all residues in the structure; if residue_category is provided, only those
+    keys are returned (e.g. polar, aromatic).
+
     Args:
         pdb_path: Path to PDB structure file
-        
+        residue_category: If provided, return WCN only for these residue keys.
+
     Returns:
-        Dictionary mapping (residue_name, residue_number, chain) -> WCN value (float)
+        Dictionary mapping residue_key -> WCN value (float)
     """
-    # Parse structure file
     atoms = _get_atoms_for_path(pdb_path)
-    
-    # Extract Cα atoms only
     ca_atoms = [atom for atom in atoms if atom.name == "CA"]
-    
     if len(ca_atoms) == 0:
         return {}
-    
-    # Build mapping from residue key to Cα atom
-    ca_dict = {}
+
+    ca_dict: Dict[Tuple[str, int, str, str], Atom] = {}
     for atom in ca_atoms:
         residue_key = residue_key_from_atom(atom)
-        ca_dict[residue_key] = atom
-    
-    wcn_values: Dict[Tuple[str, int, str, str], float] = {}
-    
-    # Convert to numpy arrays for efficient distance calculation
+        # Keep the first Cα encountered for each residue key to avoid
+        # overwriting with alternative locations if present.
+        if residue_key not in ca_dict:
+            ca_dict[residue_key] = atom
+
     residue_keys = list(ca_dict.keys())
-    ca_coords = np.array([[ca_dict[key].x, ca_dict[key].y, ca_dict[key].z] 
-                          for key in residue_keys])
-    
-    # Fully vectorized pairwise distance matrix (O(N^2) memory and time)
-    diff = ca_coords[:, None, :] - ca_coords[None, :, :]  # (N, N, 3)
-    dist_sq = np.sum(diff ** 2, axis=2)                   # (N, N)
-    
-    # Avoid self-terms by setting diagonal to inf (so 1/inf -> 0)
+    ca_coords = np.array([
+        [ca_dict[key].x, ca_dict[key].y, ca_dict[key].z] for key in residue_keys
+    ])
+    diff = ca_coords[:, None, :] - ca_coords[None, :, :]
+    dist_sq = np.sum(diff ** 2, axis=2)
     np.fill_diagonal(dist_sq, np.inf)
-    
     with np.errstate(divide="ignore"):
-        inv_dist_sq = 1.0 / dist_sq  # (N, N), zeros on diagonal
-    
-    # Sum over columns for each row i to get WCN_i
-    wcn_array = np.sum(inv_dist_sq, axis=1)  # (N,)
-    
+        inv_dist_sq = 1.0 / dist_sq
+    wcn_array = np.sum(inv_dist_sq, axis=1)
+
+    wcn_values: Dict[Tuple[str, int, str, str], float] = {}
     for key, wcn in zip(residue_keys, wcn_array):
         wcn_values[key] = float(wcn)
-    
+
+    if residue_category is not None:
+        category_set = set(residue_category)
+        wcn_values = {k: v for k, v in wcn_values.items() if k in category_set}
     return wcn_values
 
 
 def calculate_weighted_contact_number_average(
-    pdb_path: str
+    pdb_path: str,
+    *,
+    residues_for_density: Optional[Iterable[Tuple[str, int, str, str]]] = None,
+    residues_for_average: Optional[Iterable[Tuple[str, int, str, str]]] = None,
+    wcn_values: Optional[Dict[Tuple[str, int, str, str], float]] = None,
 ) -> float:
     """
-    Calculate average Weighted Contact Number (WCN) across all residues.
-    
-    Args:
-        pdb_path: Path to PDB structure file
-        
-    Returns:
-        Average WCN value per residue
+    Average Weighted Contact Number (WCN) with configurable numerator and denominator.
+
+    Same interface as other density averages: residues_for_density (which residues
+    to sum), residues_for_average (denominator), and optional wcn_values (cache from
+    calculate_weighted_contact_number to avoid recomputing).
+
+    Examples:
+        - Average WCN of polar residues over all residues:
+          calculate_weighted_contact_number_average(pdb, residues_for_density=get_polar_residue_keys(pdb))
+        - Average WCN of CDR residues over CDR only:
+          calculate_weighted_contact_number_average(pdb, residues_for_density=cdr, residues_for_average=cdr)
+        - Multiple averages with one WCN computation:
+          wcn = calculate_weighted_contact_number(pdb)
+          a = calculate_weighted_contact_number_average(pdb, wcn_values=wcn, residues_for_density=polar_keys)
+          b = calculate_weighted_contact_number_average(pdb, wcn_values=wcn, residues_for_density=cdr_keys)
     """
-    wcn_values = calculate_weighted_contact_number(pdb_path)
-    
-    if len(wcn_values) == 0:
+    if wcn_values is None:
+        wcn_values = calculate_weighted_contact_number(pdb_path)
+    if not wcn_values:
         return 0.0
-    
-    total_residues = _count_unique_residues_in_pdb(pdb_path)
-    if total_residues == 0:
+
+    density_set: Optional[Set[Tuple[str, int, str, str]]] = (
+        set(residues_for_density) if residues_for_density is not None else None
+    )
+    if residues_for_average is not None:
+        denom = len(set(residues_for_average))
+    else:
+        denom = _count_unique_residues_in_pdb(pdb_path)
+    if denom == 0:
         return 0.0
-    
-    return sum(wcn_values.values()) / float(total_residues)
+
+    keys_to_sum = (
+        wcn_values.keys()
+        if density_set is None
+        else [k for k in wcn_values.keys() if k in density_set]
+    )
+    total = sum(wcn_values[k] for k in keys_to_sum)
+    return total / float(denom)
 
 
 # ============================================================================
@@ -1360,9 +1636,7 @@ def parse_dssp(
         # No header found or file missing, return empty dict
         return dssp_data
 
-    # Precompile H-bond regex once (used for every residue line)
-    import re
-
+    # Precompiled H-bond regex (module-level import of re)
     hbond_pattern = re.compile(r"(-?\d+),\s*(-?\d+\.?\d*)")
 
     # Parse data lines (starting after header)
@@ -1400,12 +1674,8 @@ def parse_dssp(
             # Convert to 3-letter code
             residue_name = AA_1_TO_3[aa_1letter]
 
-            # STRUCTURE: starts at column 16, first character is secondary structure
-            if len(line) < 17:
-                secondary_structure = " "
-            else:
-                structure_str = line[16:24].strip()
-                secondary_structure = structure_str[0] if structure_str else " "
+            # STRUCTURE: first character at column 16 (0-based index 16)
+            secondary_structure = line[16] if len(line) > 16 else " "
 
             # H-bond columns: use regex to find all "residue,energy" patterns
             # H-bonds appear after ACC column (around position 40+)
@@ -1496,11 +1766,6 @@ def _parse_hbond_energy(hbond_str: str) -> Optional[float]:
 # C-alpha DBSCAN clustering by residue group (charge / hydrophobic / polar)
 # ============================================================================
 
-# Residue groups for clustering (C-alpha 3D coordinates)
-HYDROPHOBIC_RESIDUES = frozenset({"ALA", "VAL", "LEU", "ILE", "MET", "PHE", "TRP", "PRO"}) 
-POLAR_RESIDUES = frozenset({"SER", "THR", "ASN", "GLN", "TYR", "CYS", "GLU", "ASP", "LYS", "ARG", "HIS"})
-
-
 def compute_residue_cluster_labels(
     atoms: List[Atom],
     pka_data: Dict[Tuple[str, int, str, str], float],
@@ -1552,13 +1817,22 @@ def compute_residue_cluster_labels(
     for key, xyz in ca_by_res.items():
         res_name = key[0]
         pka_val = get_pka(key)
-        # First, assign to charged groups if PropKA says the residue is charged.
-        if res_name in ("ASP", "GLU") and is_residue_charged(res_name, pka_val, pH):
-            neg_keys.append(key)
-            neg_coords.append(xyz)
-        elif res_name in ("ARG", "LYS", "HIS") and is_residue_charged(res_name, pka_val, pH):
-            pos_keys.append(key)
-            pos_coords.append(xyz)
+        # First, assign to charged groups if PropKA says the residue is charged,
+        # using the same charge rules as net_charge_from_pka and the same
+        # missing-pKa conventions.
+        if res_name in ("ASP", "GLU"):
+            if pka_val is None or pka_val < pH:
+                neg_keys.append(key)
+                neg_coords.append(xyz)
+        elif res_name in ("ARG", "LYS", "HIS"):
+            if pka_val is None:
+                # Treat ARG/LYS as charged when pKa missing; HIS as uncharged.
+                if res_name in ("ARG", "LYS"):
+                    pos_keys.append(key)
+                    pos_coords.append(xyz)
+            elif pka_val > pH:
+                pos_keys.append(key)
+                pos_coords.append(xyz)
         # Uncharged residues fall through to hydrophobic / polar grouping.
         elif res_name in HYDROPHOBIC_RESIDUES:
             hydro_keys.append(key)
@@ -1662,7 +1936,9 @@ def _enumerate_hbonds(pdb_path: str) -> List[Tuple[Atom, Atom]]:
     acceptor_keys = [residue_key_from_atom(a) for a in acceptors]
     acceptor_tree = cKDTree(acceptor_coords)
     backbone_base_cache: Dict[Tuple[str, int], Atom] = {}
+    backbone_base_vec_cache: Dict[Tuple[str, int, str, str], np.ndarray] = {}
     sidechain_base_cache: Dict[int, Optional[Atom]] = {}
+    sidechain_base_vec_cache: Dict[int, np.ndarray] = {}
 
     pairs: List[Tuple[Atom, Atom]] = []
 
@@ -1680,11 +1956,14 @@ def _enumerate_hbonds(pdb_path: str) -> List[Tuple[Atom, Atom]]:
             precomputed_base = get_donor_base_atom(donor, atoms, backbone_base_cache)
             if precomputed_base is None:
                 continue
-            precomputed_base_vec = np.array([
-                precomputed_base.x - donor.x,
-                precomputed_base.y - donor.y,
-                precomputed_base.z - donor.z,
-            ])
+            precomputed_base_vec = backbone_base_vec_cache.get(donor_res_key)
+            if precomputed_base_vec is None:
+                precomputed_base_vec = np.array([
+                    precomputed_base.x - donor.x,
+                    precomputed_base.y - donor.y,
+                    precomputed_base.z - donor.z,
+                ])
+                backbone_base_vec_cache[donor_res_key] = precomputed_base_vec
 
         if is_backbone_donor:
             valid_indices = []
@@ -1736,7 +2015,10 @@ def _enumerate_hbonds(pdb_path: str) -> List[Tuple[Atom, Atom]]:
                 sidechain_base_cache[donor_id] = base
             if base is None:
                 continue
-            base_vec = np.array([base.x - donor.x, base.y - donor.y, base.z - donor.z])
+            base_vec = sidechain_base_vec_cache.get(donor_id)
+            if base_vec is None:
+                base_vec = np.array([base.x - donor.x, base.y - donor.y, base.z - donor.z])
+                sidechain_base_vec_cache[donor_id] = base_vec
 
             for idx in indices:
                 acceptor = acceptors[idx]
@@ -1770,17 +2052,64 @@ def _enumerate_hbonds(pdb_path: str) -> List[Tuple[Atom, Atom]]:
 # Acceptor residue gets acceptor_weight (based on acceptor atom's SASA)
 # We don't skip residues — we ensure each donor-acceptor pair is only evaluated once in the nested loop.
 # So a single bond adds to both residues, but with different weights. No double-counting of the same bond for the same residue.
+
+# Type alias for H-bond density cache: (residue_weights_raw, residue_counts)
+_HbondDensityRaw = Tuple[
+    Dict[Tuple[str, int, str, str], float],
+    Dict[Tuple[str, int, str, str], int],
+]
+
+
+def _aggregate_hbond_pairs_to_raw(
+    pairs: List[Tuple[Atom, Atom]],
+    sasa_data: Dict[Tuple[str, int, str, str], SASAEntry],
+) -> Tuple[
+    Dict[Tuple[str, int, str, str], float],
+    Dict[Tuple[str, int, str, str], int],
+    Dict[Tuple[str, int, str, str], bool],
+]:
+    """Aggregate H-bond pairs into per-residue raw weights, counts, and inter-chain flags."""
+    atom_sasa_weight: Dict[int, float] = {}
+
+    def get_cached_sasa_weight(atom: Atom) -> float:
+        key = id(atom)
+        cached = atom_sasa_weight.get(key)
+        if cached is not None:
+            return cached
+        w = get_sasa_weight(atom, sasa_data)
+        atom_sasa_weight[key] = w
+        return w
+
+    residue_weights_raw: Dict[Tuple[str, int, str, str], float] = defaultdict(float)
+    residue_counts: Dict[Tuple[str, int, str, str], int] = defaultdict(int)
+    residue_inter_chain: Dict[Tuple[str, int, str, str], bool] = defaultdict(bool)
+
+    for donor, acceptor in pairs:
+        donor_key = residue_key_from_atom(donor)
+        acceptor_key = residue_key_from_atom(acceptor)
+        donor_weight = get_cached_sasa_weight(donor)
+        acceptor_weight = get_cached_sasa_weight(acceptor)
+        residue_weights_raw[donor_key] += donor_weight
+        residue_weights_raw[acceptor_key] += acceptor_weight
+        residue_counts[donor_key] += 1
+        residue_counts[acceptor_key] += 1
+        if donor.chain != acceptor.chain:
+            residue_inter_chain[donor_key] = True
+            residue_inter_chain[acceptor_key] = True
+
+    return dict(residue_weights_raw), dict(residue_counts), dict(residue_inter_chain)
+
+
 def calculate_global_hbond_density(
     pdb_path: str,
     sasa_path: str,
-    weighting: str = "inverse"
 ) -> Tuple[Dict[Tuple[str, int, str, str], float], Dict[Tuple[str, int, str, str], bool], Dict[Tuple[str, int, str, str], int]]:
     """
     Calculate global hydrogen bond density per residue.
     
     Number of hydrogen bonds per residue, weighted by scaled relative SASA:
-    - Per-contact weight = 100 * max(REL, MIN_SASA_THRESHOLD)
-      where REL is total-side REL for side-chain atoms or main-chain REL for backbone atoms.
+    - Per-contact weight = 100 * REL, where REL is total-side REL for side-chain
+      atoms or main-chain REL for backbone atoms.
     
     Each hydrogen bond is counted once and contributes to both residues involved.
     All H-bonds between a residue pair are accumulated (no limit per pair).
@@ -1795,12 +2124,10 @@ def calculate_global_hbond_density(
     Args:
         pdb_path: Path to PDB structure file
         sasa_path: Path to SASA file
-        weighting: Weighting strategy (currently only "inverse" is supported)
         
     Returns:
         Tuple of:
         1. Dictionary mapping (residue_name, residue_number, chain) -> weighted HB density
-           (weighted by inverse SASA, capped at 100.0 per residue)
         2. Dictionary mapping (residue_name, residue_number, chain) -> bool indicating
            if residue has any inter-chain contacts
         3. Dictionary mapping (residue_name, residue_number, chain) -> number of H-bonds
@@ -1808,71 +2135,102 @@ def calculate_global_hbond_density(
     pairs = _enumerate_hbonds(pdb_path)
     if not pairs:
         return {}, {}, {}
-
     sasa_data = parse_sasa(sasa_path)
+    weights_raw, counts, inter_chain = _aggregate_hbond_pairs_to_raw(pairs, sasa_data)
+    sqrt_residue_hbonds = {key: math.sqrt(w) for key, w in weights_raw.items()}
+    return sqrt_residue_hbonds, inter_chain, counts
 
-    # Cache SASA-derived weights per atom (by id) to avoid recomputing for atoms
-    # that participate in many H-bonds.
-    atom_sasa_weight: Dict[int, float] = {}
 
-    def get_cached_sasa_weight(atom: Atom) -> float:
-        key = id(atom)
-        cached = atom_sasa_weight.get(key)
-        if cached is not None:
-            return cached
-        w = get_sasa_weight(atom, sasa_data, weighting)
-        atom_sasa_weight[key] = w
-        return w
+def compute_hbond_density_raw(
+    pdb_path: str,
+    sasa_path: str,
+) -> _HbondDensityRaw:
+    """
+    Compute per-residue raw SASA-weighted sums and H-bond counts. No sqrt.
 
-    residue_hbonds = defaultdict(float)
-    residue_inter_chain = defaultdict(bool)
-    residue_hbond_count = defaultdict(int)
-
-    for donor, acceptor in pairs:
-        donor_key = residue_key_from_atom(donor)
-        acceptor_key = residue_key_from_atom(acceptor)
-        donor_weight = get_cached_sasa_weight(donor)
-        acceptor_weight = get_cached_sasa_weight(acceptor)
-        residue_hbonds[donor_key] += donor_weight
-        residue_hbonds[acceptor_key] += acceptor_weight
-        if donor.chain != acceptor.chain:
-            residue_inter_chain[donor_key] = True
-            residue_inter_chain[acceptor_key] = True
-        residue_hbond_count[donor_key] += 1
-        residue_hbond_count[acceptor_key] += 1
-
-    sqrt_residue_hbonds = {
-        key: math.sqrt(weight) for key, weight in residue_hbonds.items()
-    }
-    return sqrt_residue_hbonds, dict(residue_inter_chain), dict(residue_hbond_count)
+    Use this to cache H-bond density data when calling
+    calculate_global_hbond_density_average multiple times with different
+    residue sets or weighted vs unweighted.
+    """
+    pairs = _enumerate_hbonds(pdb_path)
+    if not pairs:
+        return {}, {}
+    sasa_data = parse_sasa(sasa_path)
+    weights_raw, counts, _ = _aggregate_hbond_pairs_to_raw(pairs, sasa_data)
+    return weights_raw, counts
 
 
 def calculate_global_hbond_density_average(
     pdb_path: str,
     sasa_path: str,
-    weighting: str = "inverse"
+    *,
+    residues_for_density: Optional[Iterable[Tuple[str, int, str, str]]] = None,
+    weighted: bool = True,
+    residues_for_average: Optional[Iterable[Tuple[str, int, str, str]]] = None,
+    hbond_density_raw: Optional[_HbondDensityRaw] = None,
 ) -> float:
     """
-    Calculate average global hydrogen bond density across all residues.
-    
+    Calculate average H-bond density with configurable numerator and denominator.
+
+    Same interface as salt bridge density average: optional residues_for_density
+    (which residues contribute to the sum), weighted (SASA-weighted vs raw count),
+    residues_for_average (denominator), and hbond_density_raw (pre-computed cache
+    from compute_hbond_density_raw() to avoid recomputing when calling multiple times).
+
+    Examples:
+        - Average (SASA-weighted) H-bond density of CDR residues over all residues:
+          calculate_global_hbond_density_average(pdb, sasa, residues_for_density=cdr_residues)
+        - Average unweighted H-bond count over CDR residues only:
+          calculate_global_hbond_density_average(pdb, sasa, residues_for_density=cdr_residues,
+                                                 weighted=False, residues_for_average=cdr_residues)
+        - Multiple averages without recomputing:
+          raw = compute_hbond_density_raw(pdb, sasa)
+          avg1 = calculate_global_hbond_density_average(pdb, sasa, hbond_density_raw=raw, ...)
+          avg2 = calculate_global_hbond_density_average(pdb, sasa, hbond_density_raw=raw, ...)
+
     Args:
-        pdb_path: Path to PDB structure file
-        sasa_path: Path to SASA file
-        weighting: Weighting strategy (currently only "inverse" is supported)
-        
+        pdb_path: Path to PDB structure file (used when hbond_density_raw is None, and for
+            denominator when residues_for_average is None).
+        sasa_path: Path to SASA file (used only when hbond_density_raw is None).
+        residues_for_density: If provided, only these residues contribute to the numerator.
+        weighted: If True, use SASA-weighted density (with sqrt transform). If False, use raw count.
+        residues_for_average: Residues over which to average (denominator). If None, total PDB residues.
+        hbond_density_raw: Optional (weights_raw, counts) from compute_hbond_density_raw().
+
     Returns:
-        Average weighted hydrogen bond density per residue
+        Sum of (density or count) over residues_for_density, divided by denominator.
     """
-    residue_densities, _, _ = calculate_global_hbond_density(pdb_path, sasa_path, weighting)
-    
-    if len(residue_densities) == 0:
+    if hbond_density_raw is None:
+        hbond_density_raw = compute_hbond_density_raw(pdb_path, sasa_path)
+    weights_raw, counts = hbond_density_raw
+    if not weights_raw:
         return 0.0
-    
-    total_residues = _count_unique_residues_in_pdb(pdb_path)
-    if total_residues == 0:
+
+    density_set: Optional[Set[Tuple[str, int, str, str]]] = (
+        set(residues_for_density) if residues_for_density is not None else None
+    )
+    if residues_for_average is not None:
+        denom = len(set(residues_for_average))
+    else:
+        denom = _count_unique_residues_in_pdb(pdb_path)
+
+    if denom == 0:
         return 0.0
-    
-    return sum(residue_densities.values()) / float(total_residues)
+
+    keys_to_sum = (
+        weights_raw.keys()
+        if density_set is None
+        else [k for k in weights_raw.keys() if k in density_set]
+    )
+    if weighted:
+        # Precompute sqrt-transformed weights once per call to avoid repeated
+        # sqrt when multiple averages are taken over the same raw data.
+        sqrt_cache = {k: math.sqrt(w) for k, w in weights_raw.items()}
+        total = sum(sqrt_cache[k] for k in keys_to_sum)
+    else:
+        total = sum(counts[k] for k in keys_to_sum)
+
+    return total / float(denom)
 
 
 def largest_hbond_component_size(pdb_path: str) -> int:
@@ -2078,142 +2436,156 @@ def parse_dssp_hbonds(
     return hbond_data, dssp_seq_to_pdb
 
 
+# Type alias for DSSP H-bond energy density cache: (residue_weights_raw, residue_counts)
+# Weights are SASA * |energy| per bond; counts are number of backbone H-bonds per residue.
+_DsspHbondEnergyDensityRaw = Tuple[
+    Dict[Tuple[str, int, str, str], float],
+    Dict[Tuple[str, int, str, str], int],
+]
+
+
+def _aggregate_dssp_hbond_energy_to_raw(
+    dssp_hbonds: Dict[Tuple[str, int, str, str], List[Tuple[int, float]]],
+    dssp_seq_to_pdb: Dict[int, Tuple[str, int, str, str]],
+    pdb_to_dssp_seq: Dict[Tuple[str, int, str, str], int],
+    sasa_data: Dict[Tuple[str, int, str, str], SASAEntry],
+) -> Tuple[
+    Dict[Tuple[str, int, str, str], float],
+    Dict[Tuple[str, int, str, str], int],
+    Dict[Tuple[str, int, str, str], bool],
+]:
+    """Aggregate DSSP H-bond (offset, energy) data into per-residue raw weights (SASA*|energy|), counts, and inter-chain flags."""
+    residue_weights_raw: Dict[Tuple[str, int, str, str], float] = defaultdict(float)
+    residue_counts: Dict[Tuple[str, int, str, str], int] = defaultdict(int)
+    residue_inter_chain: Dict[Tuple[str, int, str, str], bool] = defaultdict(bool)
+
+    for residue_key, hbond_pairs in dssp_hbonds.items():
+        if residue_key not in pdb_to_dssp_seq:
+            continue
+        dssp_seq_num = pdb_to_dssp_seq[residue_key]
+        residue_weight = get_residue_sasa_weight(
+            residue_key, sasa_data, use_side_chain=False
+        )
+        if residue_weight == 0.0:
+            continue
+
+        for residue_offset, energy in hbond_pairs:
+            target_dssp_seq = dssp_seq_num + residue_offset
+            if target_dssp_seq not in dssp_seq_to_pdb:
+                continue
+            target_residue_key = dssp_seq_to_pdb[target_dssp_seq]
+            is_inter_chain = (residue_key[2] != target_residue_key[2])
+            target_weight = get_residue_sasa_weight(
+                target_residue_key, sasa_data, use_side_chain=False
+            )
+            if target_weight == 0.0:
+                continue
+            energy_scale = abs(energy)
+            if energy_scale == 0.0:
+                continue
+
+            residue_weights_raw[residue_key] += residue_weight * energy_scale
+            residue_weights_raw[target_residue_key] += target_weight * energy_scale
+            residue_counts[residue_key] += 1
+            residue_counts[target_residue_key] += 1
+            if is_inter_chain:
+                residue_inter_chain[residue_key] = True
+                residue_inter_chain[target_residue_key] = True
+
+    return dict(residue_weights_raw), dict(residue_counts), dict(residue_inter_chain)
+
+
 def calculate_hbond_energy_density_dssp_backbone_only(
     pdb_path: str,
     sasa_path: str,
     dssp_path: str,
-    weighting: str = "inverse"
 ) -> Tuple[Dict[Tuple[str, int, str, str], float], Dict[Tuple[str, int, str, str], bool]]:
     """
     Calculate hydrogen bond energy density per residue using DSSP data (backbone only).
 
     Residue keys are 4-tuples (residue_name, residue_number, chain, insertion_code).
-
-    Detects H-bonds from DSSP file (N-H-->O and O-->H-N columns) and weights them
-    by scaled main-chain relative SASA and the magnitude of the DSSP H-bond energy.
-    This is for backbone/main-chain H-bonds only since DSSP primarily reports
-    backbone H-bonds.
+    H-bonds are from DSSP (N-H-->O and O-->H-N; backbone only, no N in Pro).
+    Each bond is weighted by main-chain SASA and by the magnitude of the DSSP H-bond energy.
 
     Args:
         pdb_path: Path to PDB structure file (for residue mapping)
         sasa_path: Path to SASA file (for main-chain REL values)
         dssp_path: Path to DSSP file (for H-bond detection)
-        weighting: Weighting strategy (currently only "inverse" is supported)
 
     Returns:
         Tuple of:
-        1. Dictionary mapping (residue_name, residue_number, chain, insertion_code) -> weighted HB density
-        2. Dictionary mapping same key -> bool indicating if residue has any inter-chain contacts
+        1. Dictionary mapping residue_key -> weighted HB energy density (sqrt applied)
+        2. Dictionary mapping residue_key -> bool indicating if residue has any inter-chain contacts
     """
     atoms = _get_atoms_for_path(pdb_path)
     sasa_data = parse_sasa(sasa_path)
     dssp_hbonds, dssp_seq_to_pdb = parse_dssp_hbonds(dssp_path, atoms)
+    pdb_to_dssp_seq = {pdb_key: dssp_seq for dssp_seq, pdb_key in dssp_seq_to_pdb.items()}
 
-    pdb_to_dssp_seq: Dict[Tuple[str, int, str, str], int] = {}
-    for dssp_seq, pdb_key in dssp_seq_to_pdb.items():
-        pdb_to_dssp_seq[pdb_key] = dssp_seq
-    
-    # Track weighted hydrogen bonds per residue
-    # Key: (residue_name, residue_number, chain)
-    # Value: sum of weighted hydrogen bonds
-    residue_hbonds = defaultdict(float)
-    residue_inter_chain = defaultdict(bool)
-    
-    # Process each residue's H-bonds from DSSP
-    for residue_key, hbond_pairs in dssp_hbonds.items():
-        # Get sequential DSSP number for this residue
-        if residue_key not in pdb_to_dssp_seq:
-            # Residue not in DSSP mapping, skip
-            continue
-        
-        dssp_seq_num = pdb_to_dssp_seq[residue_key]
-        
-        # Get weight for this residue (main-chain only)
-        residue_weight = get_residue_sasa_weight(
-            residue_key, sasa_data, use_side_chain=False, weighting=weighting
-        )
-        
-        # If residue has no SASA data, skip it
-        if residue_weight == 0.0:
-            continue
-        
-        # Process each H-bond pair (residue_offset, energy)
-        # Offset is relative to sequential DSSP number, not PDB residue number
-        for residue_offset, energy in hbond_pairs:
-            # Calculate target sequential DSSP number
-            target_dssp_seq = dssp_seq_num + residue_offset
-            
-            # Find target residue key using sequential DSSP number
-            if target_dssp_seq not in dssp_seq_to_pdb:
-                # Target residue not found, skip this bond
-                continue
-            
-            target_residue_key = dssp_seq_to_pdb[target_dssp_seq]
-            
-            # Check if this is an inter-chain contact
-            is_inter_chain = (residue_key[2] != target_residue_key[2])
-            
-            # Get weight for target residue (main-chain only)
-            target_weight = get_residue_sasa_weight(
-                target_residue_key, sasa_data, use_side_chain=False, weighting=weighting
-            )
-            
-            # If target residue has no SASA data, skip it
-            if target_weight == 0.0:
-                continue
-            
-            # Scale contributions by the magnitude of DSSP H-bond energy.
-            energy_scale = abs(energy)
-            if energy_scale == 0.0:
-                continue
-            
-            # Add weights to both residues (each bond contributes to both).
-            # No maximum cap for DSSP-based H-bond energy density; we instead
-            # apply a square-root transform at the end.
-            residue_hbonds[residue_key] += residue_weight * energy_scale
-            residue_hbonds[target_residue_key] += target_weight * energy_scale
-            
-            # Mark residues as having inter-chain contacts if applicable
-            if is_inter_chain:
-                residue_inter_chain[residue_key] = True
-                residue_inter_chain[target_residue_key] = True
-    
-    # Apply square-root transform to the final per-residue weights.
-    sqrt_residue_hbonds = {
-        key: math.sqrt(weight) for key, weight in residue_hbonds.items()
-    }
-    
-    return sqrt_residue_hbonds, dict(residue_inter_chain)
+    weights_raw, _, inter_chain = _aggregate_dssp_hbond_energy_to_raw(
+        dssp_hbonds, dssp_seq_to_pdb, pdb_to_dssp_seq, sasa_data
+    )
+    sqrt_residue_hbonds = {key: math.sqrt(w) for key, w in weights_raw.items()}
+    return sqrt_residue_hbonds, inter_chain
+
+
+def compute_dssp_hbond_energy_density_raw(
+    pdb_path: str,
+    sasa_path: str,
+    dssp_path: str,
+) -> _DsspHbondEnergyDensityRaw:
+    """
+    Compute per-residue raw (SASA * |energy|) sums and backbone H-bond counts from DSSP. No sqrt.
+
+    Use this to cache DSSP H-bond energy density when calling
+    calculate_hbond_energy_density_dssp_backbone_only_average multiple times.
+    """
+    atoms = _get_atoms_for_path(pdb_path)
+    sasa_data = parse_sasa(sasa_path)
+    dssp_hbonds, dssp_seq_to_pdb = parse_dssp_hbonds(dssp_path, atoms)
+    pdb_to_dssp_seq = {pdb_key: dssp_seq for dssp_seq, pdb_key in dssp_seq_to_pdb.items()}
+    weights_raw, counts, _ = _aggregate_dssp_hbond_energy_to_raw(
+        dssp_hbonds, dssp_seq_to_pdb, pdb_to_dssp_seq, sasa_data
+    )
+    return weights_raw, counts
 
 
 def calculate_hbond_energy_density_dssp_backbone_only_average(
     pdb_path: str,
     sasa_path: str,
     dssp_path: str,
-    weighting: str = "inverse"
+    *,
+    residues_for_density: Optional[Iterable[Tuple[str, int, str, str]]] = None,
+    weighted: bool = True,
+    residues_for_average: Optional[Iterable[Tuple[str, int, str, str]]] = None,
+    dssp_hbond_energy_density_raw: Optional[_DsspHbondEnergyDensityRaw] = None,
 ) -> float:
     """
-    Calculate average hydrogen bond energy density using DSSP data (backbone only).
-    
-    Args:
-        pdb_path: Path to PDB structure file
-        sasa_path: Path to SASA file
-        dssp_path: Path to DSSP file
-        weighting: Weighting strategy (currently only "inverse" is supported)
-        
-    Returns:
-        Average weighted hydrogen bond density per residue
+    Average DSSP backbone H-bond energy density with configurable numerator and denominator.
+
+    Same interface as salt bridge / global H-bond: residues_for_density (which residues
+    to sum), weighted (SASA * |energy| with sqrt vs raw count), residues_for_average
+    (denominator), and dssp_hbond_energy_density_raw (cache from
+    compute_dssp_hbond_energy_density_raw()).
+    DSSP provides backbone H-bonds only (no N in Pro).
     """
-    residue_densities, _ = calculate_hbond_energy_density_dssp_backbone_only(
-        pdb_path, sasa_path, dssp_path, weighting
-    )
-    
-    if len(residue_densities) == 0:
+    if dssp_hbond_energy_density_raw is None:
+        dssp_hbond_energy_density_raw = compute_dssp_hbond_energy_density_raw(
+            pdb_path, sasa_path, dssp_path
+        )
+    weights_raw, counts = dssp_hbond_energy_density_raw
+    if not weights_raw:
         return 0.0
-    
-    total_residues = _count_unique_residues_in_pdb(pdb_path)
-    if total_residues == 0:
+
+    density_set = set(residues_for_density) if residues_for_density is not None else None
+    denom = len(set(residues_for_average)) if residues_for_average is not None else _count_unique_residues_in_pdb(pdb_path)
+    if denom == 0:
         return 0.0
-    
-    return sum(residue_densities.values()) / float(total_residues)
+
+    keys_to_sum = set(weights_raw.keys()) if density_set is None else (set(weights_raw.keys()) & density_set)
+    if weighted:
+        total = sum(math.sqrt(weights_raw[k]) for k in keys_to_sum)
+    else:
+        total = sum(counts.get(k, 0) for k in keys_to_sum)
+    return total / float(denom)
 
