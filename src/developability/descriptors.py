@@ -476,6 +476,7 @@ def calculate_residue_category_density_average(
     *,
     residue_category: Optional[Iterable[ResKey4]] = None,
     weighted: bool = True,
+    sqrt_weights: bool = True,
     residues_for_average: Optional[Iterable[ResKey4]] = None,
     density_raw: Optional[ResidueDensityRawDict] = None,
 ) -> float:
@@ -499,7 +500,7 @@ def calculate_residue_category_density_average(
             residues_for_average=residues_for_average,
             denom_total_residues=total_res,
             weighted=True,
-            sqrt_weights=True,
+            sqrt_weights=sqrt_weights,
         )
     return average_over_residues(
         weights_raw=density_raw,
@@ -627,6 +628,7 @@ def calculate_salt_bridge_density_average(
     *,
     residues_for_density: Optional[Iterable[Tuple[str, int, str, str]]] = None,
     weighted: bool = True,
+    sqrt_weights: bool = True,
     residues_for_average: Optional[Iterable[Tuple[str, int, str, str]]] = None,
     salt_bridges: Optional[_SaltBridgesDict] = None,
 ) -> float:
@@ -634,7 +636,8 @@ def calculate_salt_bridge_density_average(
     if salt_bridges is None:
         salt_bridges = detect_salt_bridges(pdb_path, sasa_path, pka_path, pH)
     if not salt_bridges:
-        return {}, {}, {}, {}
+        # Keep return type consistent (scalar) so JSON output stays stable.
+        return 0.0
 
     residue_weights_raw: Dict[Tuple[str, int, str, str], float] = defaultdict(float)
     residue_counts: Dict[Tuple[str, int, str, str], int] = defaultdict(int)
@@ -656,7 +659,7 @@ def calculate_salt_bridge_density_average(
         residues_for_average=residues_for_average,
         denom_total_residues=_count_residues_in_pdb(pdb_path),
         weighted=weighted,
-        sqrt_weights=True,
+        sqrt_weights=sqrt_weights,
     )
 
 # near the `_PDB_SEQUENCE_CACHE` definition in descriptors.py
@@ -1623,6 +1626,7 @@ def calculate_global_hbond_density_average(
     residues_for_density: Optional[Iterable[Tuple[str, int, str, str]]] = None,
     weighted: bool = True,
     residues_for_average: Optional[Iterable[Tuple[str, int, str, str]]] = None,
+    sqrt_weights: bool = True,
     weights_raw: Optional[Dict[Tuple[str, int, str, str], float]] = None,
     counts: Optional[Dict[Tuple[str, int, str, str], int]] = None,
 ) -> float:
@@ -1639,7 +1643,7 @@ def calculate_global_hbond_density_average(
         residues_for_average=residues_for_average,
         denom_total_residues=_count_residues_in_pdb(pdb_path),
         weighted=weighted,
-        sqrt_weights=True,
+        sqrt_weights=sqrt_weights,
     )
 
 
@@ -1773,6 +1777,7 @@ def calculate_hbond_energy_density_dssp_backbone_only_average(
     residues_for_density: Optional[Iterable[Tuple[str, int, str, str]]] = None,
     weighted: bool = True,
     residues_for_average: Optional[Iterable[Tuple[str, int, str, str]]] = None,
+    sqrt_weights: bool = True,
     dssp_hbond_energy_density_raw: Optional[_DsspHbondEnergyDensityRaw] = None,
 ) -> float:
 
@@ -1802,7 +1807,7 @@ def calculate_hbond_energy_density_dssp_backbone_only_average(
         residues_for_average=residues_for_average,
         denom_total_residues=_count_residues_in_pdb(pdb_path),
         weighted=weighted,
-        sqrt_weights=True,
+        sqrt_weights=sqrt_weights,
     )
 
 

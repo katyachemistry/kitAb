@@ -151,14 +151,6 @@ def main():
         help='Output file path (default: print to stdout)'
     )
     
-    parser.add_argument(
-        '--format',
-        type=str,
-        choices=['json', 'csv'],
-        default='json',
-        help='Output format for aggregated descriptors (default: json). Ignored if --per-residue is used.'
-    )
-
     args = parser.parse_args()
     
     if args.sasa_file:
@@ -189,31 +181,6 @@ def main():
             if dssp_data:
                 print(f"Parsed DSSP data for {len(dssp_data)} residues", file=sys.stderr)
     
-    # sasa_output_data = {}
-    # sasa_residue_data = {}
-    # if args.sasa_file:
-    #     if not Path(args.sasa_file).exists():
-    #         print(
-    #             f"Warning: SASA file not found: {args.sasa_file}. "
-    #             f"Continuing without SASA output data.",
-    #             file=sys.stderr,
-    #         )
-    #     else:
-    #         try:
-    #             ctx_sasa = StructureContext(args.pdb_file, sasa_path=args.sasa_file)
-    #             sasa_output_data = ctx_sasa.sasa_output
-    #             sasa_residue_data = ctx_sasa.sasa_residue
-    #             if sasa_output_data:
-    #                 print(
-    #                     f"Parsed SASA output data for {len(sasa_output_data)} residues",
-    #                     file=sys.stderr,
-    #                 )
-    #         except Exception as e:
-    #             print(
-    #                 f"Warning: failed to parse SASA output data from {args.sasa_file}: {e}. "
-    #                 f"Continuing without SASA output data.",
-    #                 file=sys.stderr,
-    #             )
     
     try:
             
@@ -326,7 +293,12 @@ def main():
                 salt_bridge_residues.add(neg_key)
 
         avg_salt = calculate_salt_bridge_density_average(
-            args.pdb_file, args.sasa_file, args.pka_file, args.pH, salt_bridges=salt_bridges
+            args.pdb_file,
+            args.sasa_file,
+            args.pka_file,
+            args.pH,
+            salt_bridges=salt_bridges,
+            sqrt_weights=False,
         )
 
         avg_salt_cdr = calculate_salt_bridge_density_average(
@@ -337,6 +309,7 @@ def main():
             residues_for_density=cdr_keys,
             residues_for_average=cdr_keys,
             salt_bridges=salt_bridges,
+            sqrt_weights=False,
         )
 
         avg_salt_exposed_over_all = calculate_salt_bridge_density_average(
@@ -347,6 +320,7 @@ def main():
             residues_for_density=exposed_keys,
             salt_bridges=salt_bridges,
             # residues_for_average=exposed_keys,
+            sqrt_weights=False,
         )
 
         avg_salt_beta_over_all = calculate_salt_bridge_density_average(
@@ -357,6 +331,7 @@ def main():
             residues_for_density=beta_keys,
             salt_bridges=salt_bridges,
             # residues_for_average=beta_keys,
+            sqrt_weights=False,
         )
 
         avg_salt_interface = calculate_salt_bridge_density_average(
@@ -367,6 +342,7 @@ def main():
                             residues_for_density=interface_keys,
                             residues_for_average=interface_keys,
                             salt_bridges=salt_bridges,
+                            sqrt_weights=False,
                         )
 
         avg_hbond_energy = None
@@ -375,12 +351,19 @@ def main():
         avg_hbond_energy_dssp_unweighted = None
         avg_hbond_energy_dssp_unweighted_buried_over_all = None
         avg_hbond_energy_dssp_unweighted_beta_over_all = None
+        # Explicit "DSSP-weighted" (SASA * |energy|) aliases for clarity in JSON output.
+        # These are equivalent to the existing `avg_hbond_energy_*` values below and will
+        # be NaN/None if SASA is missing or fails to parse.
+        avg_hbond_energy_dssp_weighted = None
+        avg_hbond_energy_dssp_weighted_buried_over_all = None
+        avg_hbond_energy_dssp_weighted_beta_over_all = None
         avg_hbond_energy = calculate_hbond_energy_density_dssp_backbone_only_average(
             args.pdb_file,
             args.sasa_file,
             args.dssp_file,
             residues_for_density=None,
             residues_for_average=None,
+            sqrt_weights=False,
         )
 
         avg_hbond_energy_buried_over_all = calculate_hbond_energy_density_dssp_backbone_only_average(
@@ -389,6 +372,7 @@ def main():
             args.dssp_file,
             residues_for_density=buried_keys,
             residues_for_average=None,
+            sqrt_weights=False,
         )
 
         avg_hbond_energy_beta_over_all = (
@@ -398,10 +382,16 @@ def main():
                 args.dssp_file,
                 residues_for_density=beta_keys,
                 residues_for_average=None,
+                sqrt_weights=False,
             )
             if beta_keys
             else None
         )
+
+        # Alias weighted DSSP+SASA energy density metrics under explicit names.
+        avg_hbond_energy_dssp_weighted = avg_hbond_energy
+        avg_hbond_energy_dssp_weighted_buried_over_all = avg_hbond_energy_buried_over_all
+        avg_hbond_energy_dssp_weighted_beta_over_all = avg_hbond_energy_beta_over_all
 
         # DSSP-only (no SASA) H-bond energy metric so missing SASA doesn't erase DSSP signal.
         avg_hbond_energy_dssp_unweighted = calculate_hbond_energy_dssp_backbone_only_unweighted_average(
@@ -432,12 +422,14 @@ def main():
             args.pdb_file,
             args.sasa_file,
             residue_category=aromatic_keys,
+            sqrt_weights=False,
         )
 
         avg_hydrophobic = calculate_residue_category_density_average(
             args.pdb_file,
             args.sasa_file,
             residue_category=hydrophobic_keys,
+            sqrt_weights=False,
         )
 
         # Buried-only aromatic / hydrophobic, averaged over all residues
@@ -448,12 +440,14 @@ def main():
             args.sasa_file,
             residue_category=aromatic_buried_keys,
             residues_for_average=None,
+            sqrt_weights=False,
         ) if aromatic_buried_keys else None
         avg_hydrophobic_buried_over_all = calculate_residue_category_density_average(
             args.pdb_file,
             args.sasa_file,
             residue_category=hydrophobic_buried_keys,
             residues_for_average=None,
+            sqrt_weights=False,
         ) if hydrophobic_buried_keys else None
 
         aromatic_cdr_keys = aromatic_keys & cdr_keys
@@ -463,6 +457,7 @@ def main():
             args.sasa_file,
             residue_category=aromatic_cdr_keys,
             residues_for_average=aromatic_cdr_keys,
+            sqrt_weights=False,
         ) if aromatic_cdr_keys else None
 
         avg_hydrophobic_cdr_over_cdr = calculate_residue_category_density_average(
@@ -470,22 +465,26 @@ def main():
             args.sasa_file,
             residue_category=hydrophobic_cdr_keys,
             residues_for_average=hydrophobic_cdr_keys,
+            sqrt_weights=False,
         ) if hydrophobic_cdr_keys else None
 
         avg_polar = calculate_residue_category_density_average(
             args.pdb_file,
             args.sasa_file,
             residue_category=polar_keys,
+            sqrt_weights=False,
         )
         avg_negative = calculate_residue_category_density_average(
             args.pdb_file,
             args.sasa_file,
             residue_category=negative_keys,
+            sqrt_weights=False,
         )
         avg_positive = calculate_residue_category_density_average(
             args.pdb_file,
             args.sasa_file,
             residue_category=positive_keys,
+            sqrt_weights=False,
         )
 
         polar_cdr_keys = polar_keys & cdr_keys
@@ -496,18 +495,21 @@ def main():
             args.sasa_file,
             residue_category=polar_cdr_keys,
             residues_for_average=polar_cdr_keys,
+            sqrt_weights=False,
         ) if polar_cdr_keys else None
         avg_negative_cdr_over_cdr = calculate_residue_category_density_average(
             args.pdb_file,
             args.sasa_file,
             residue_category=negative_cdr_keys,
             residues_for_average=negative_cdr_keys,
+            sqrt_weights=False,
         ) if negative_cdr_keys else None
         avg_positive_cdr_over_cdr = calculate_residue_category_density_average(
             args.pdb_file,
             args.sasa_file,
             residue_category=positive_cdr_keys,
             residues_for_average=positive_cdr_keys,
+            sqrt_weights=False,
         ) if positive_cdr_keys else None
 
         avg_wcn = calculate_weighted_contact_number_average(args.pdb_file)
@@ -594,9 +596,33 @@ def main():
         _n_res = _count_residues_in_pdb(args.pdb_file)
         mean_hbond_degree = (2.0 * number_of_hbonds / _n_res) if _n_res > 0 else None
 
-        avg_hbond = calculate_global_hbond_density_average(args.pdb_file, args.sasa_file, weights_raw=weights_raw, counts=counts, residues_for_density=None, residues_for_average=None)
-        avg_hbond_cdr = calculate_global_hbond_density_average(args.pdb_file, args.sasa_file, weights_raw=weights_raw, counts=counts, residues_for_density=cdr_keys, residues_for_average=cdr_keys)
-        avg_hbond_buried_over_all = calculate_global_hbond_density_average(args.pdb_file, args.sasa_file, weights_raw=weights_raw, counts=counts, residues_for_density=buried_keys, residues_for_average=None)
+        avg_hbond = calculate_global_hbond_density_average(
+            args.pdb_file,
+            args.sasa_file,
+            weights_raw=weights_raw,
+            counts=counts,
+            residues_for_density=None,
+            residues_for_average=None,
+            sqrt_weights=False,
+        )
+        avg_hbond_cdr = calculate_global_hbond_density_average(
+            args.pdb_file,
+            args.sasa_file,
+            weights_raw=weights_raw,
+            counts=counts,
+            residues_for_density=cdr_keys,
+            residues_for_average=cdr_keys,
+            sqrt_weights=False,
+        )
+        avg_hbond_buried_over_all = calculate_global_hbond_density_average(
+            args.pdb_file,
+            args.sasa_file,
+            weights_raw=weights_raw,
+            counts=counts,
+            residues_for_density=buried_keys,
+            residues_for_average=None,
+            sqrt_weights=False,
+        )
 
         avg_hbond_beta_over_all = calculate_global_hbond_density_average(
             args.pdb_file,
@@ -605,6 +631,7 @@ def main():
             counts=counts,
             residues_for_density=beta_keys,
             residues_for_average=None,
+            sqrt_weights=False,
         )
 
         avg_hbond_inter_chain = calculate_global_hbond_density_average(
@@ -614,6 +641,7 @@ def main():
             counts=counts,
             residues_for_density=interface_keys,
             residues_for_average=interface_keys,
+            sqrt_weights=False,
         )
 
         # Inter-chain buried SASA (structure-level)
@@ -696,6 +724,31 @@ def main():
             total_side_rel_sums[f"{name}_buried_total_side_rel_sum"] = _tsr_sum(buried_keys, res_set)
             total_side_rel_sums[f"{name}_exposed_total_side_rel_sum"] = _tsr_sum(exposed_keys, res_set)
             total_side_rel_sums[f"{name}_inter_chain_total_side_rel_sum"] = _tsr_sum(interface_keys, res_set)
+
+        def _safe_ratio(numer: Optional[float], denom: Optional[float]) -> Optional[float]:
+            if numer is None or denom is None:
+                return None
+            denom_f = float(denom)
+            if denom_f == 0.0 or (denom_f != denom_f):
+                return None
+            numer_f = float(numer)
+            if numer_f != numer_f:
+                return None
+            return numer_f / denom_f
+
+        ratio_avg_hydrophobic_to_negative_positive_polar_all = _safe_ratio(
+            avg_hydrophobic,
+            None
+            if (avg_negative is None or avg_positive is None or avg_polar is None)
+            else (float(avg_negative) + float(avg_positive) + float(avg_polar)),
+        )
+
+        ratio_hydrophobic_exposed_total_side_rel_sum_to_polar_negative_positive_exposed_total_side_rel_sum = _safe_ratio(
+            float(total_side_rel_sums.get("hydrophobic_exposed_total_side_rel_sum", 0.0)),
+            float(total_side_rel_sums.get("polar_exposed_total_side_rel_sum", 0.0))
+            + float(total_side_rel_sums.get("negative_exposed_total_side_rel_sum", 0.0))
+            + float(total_side_rel_sums.get("positive_exposed_total_side_rel_sum", 0.0)),
+        )
 
         # Convenience: inter-chain-only SASA-weighted sums by residue type
         inter_chain_total_side_rel_sums = {
@@ -843,6 +896,9 @@ def main():
                     "avg_hbond_energy_all": avg_hbond_energy,
                     "avg_hbond_energy_buried_over_all": avg_hbond_energy_buried_over_all,
                     "avg_hbond_energy_beta_over_all": avg_hbond_energy_beta_over_all,
+                    "avg_hbond_energy_dssp_weighted_all": avg_hbond_energy_dssp_weighted,
+                    "avg_hbond_energy_dssp_weighted_buried_over_all": avg_hbond_energy_dssp_weighted_buried_over_all,
+                    "avg_hbond_energy_dssp_weighted_beta_over_all": avg_hbond_energy_dssp_weighted_beta_over_all,
                     "avg_hbond_energy_dssp_unweighted_all": avg_hbond_energy_dssp_unweighted,
                     "avg_hbond_energy_dssp_unweighted_buried_over_all": avg_hbond_energy_dssp_unweighted_buried_over_all,
                     "avg_hbond_energy_dssp_unweighted_beta_over_all": avg_hbond_energy_dssp_unweighted_beta_over_all,
@@ -851,6 +907,7 @@ def main():
                 "density_metrics": {
                     "avg_aromatic_all": avg_aromatic,
                     "avg_hydrophobic_all": avg_hydrophobic,
+                    "ratio_avg_hydrophobic_to_negative_positive_polar_all": ratio_avg_hydrophobic_to_negative_positive_polar_all,
                     "avg_aromatic_buried_over_all": avg_aromatic_buried_over_all,
                     "avg_hydrophobic_buried_over_all": avg_hydrophobic_buried_over_all,
                     "avg_aromatic_cdr_over_cdr": avg_aromatic_cdr_over_cdr,
@@ -918,7 +975,10 @@ def main():
                     "fraction_negative_buried": fraction_negative_buried,
                     "fraction_positive_buried": fraction_positive_buried,
                 },
-                "total_side_rel_sums": total_side_rel_sums,
+                "total_side_rel_sums": {
+                    **total_side_rel_sums,
+                    "ratio_hydrophobic_exposed_total_side_rel_sum_to_polar_negative_positive_exposed_total_side_rel_sum": ratio_hydrophobic_exposed_total_side_rel_sum_to_polar_negative_positive_exposed_total_side_rel_sum,
+                },
                 "inter_chain_total_side_rel_sums": inter_chain_total_side_rel_sums,
                 "other_sasa_metrics": {
                     "total_asa": total_asa,
@@ -1100,24 +1160,12 @@ def main():
                 return obj
 
         aggregated_clean = _sanitize_for_json(aggregated)
-        if args.format == "csv":
-            # Flatten nested dicts into a single-row CSV table.
-            df = pd.json_normalize(aggregated_clean)
-            # Round float columns for stable output.
-            df = df.round(3)
-            if args.output:
-                df.to_csv(args.output, index=False)
-                print(f"Results written to {args.output}")
-            else:
-                # Print CSV to stdout.
-                df.to_csv(sys.stdout, index=False)
+        # JSON output (only supported format).
+        if args.output:
+            Path(args.output).write_text(json.dumps(aggregated_clean, indent=2))
+            print(f"Results written to {args.output}")
         else:
-            # JSON output (default).
-            if args.output:
-                Path(args.output).write_text(json.dumps(aggregated_clean, indent=2))
-                print(f"Results written to {args.output}")
-            else:
-                print(json.dumps(aggregated_clean, indent=2))
+            print(json.dumps(aggregated_clean, indent=2))
 
     
     except Exception as e:
