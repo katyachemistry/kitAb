@@ -1,5 +1,5 @@
 
-from typing import Dict, List, Optional, Set, Tuple, Iterable
+from typing import Dict, List, Optional, Set, Tuple, Iterable, TypeVar
 import os
 import logging
 
@@ -16,14 +16,103 @@ from utils.parsers import (
     SASAEntry,
     residue_key_from_atom,
 )
+from utils.chemistry import get_standard_residue_pka
 
 logger = logging.getLogger(__name__)
 
 # residue_name, residue_number, chain_id, insertion_code
 ResKey4 = Tuple[str, int, str, str]
 
+T = TypeVar("T")
+
 
 class StructureContext:
+
+    def _warn_missing_coverage(
+        self,
+        present_keys: Set[ResKey4],
+        *,
+        label: str,
+        source_path: Optional[str] = None,
+    ) -> None:
+        """
+        Warn when per-residue data does not cover residues in the parsed structure.
+
+        This is intentionally conservative: downstream descriptors often treat missing
+        residues as 0.0, which can silently bias results if coverage failures occur.
+        """
+        try:
+            residue_keys = self.residue_keys
+        except Exception:
+            return
+        if not residue_keys:
+            return
+
+        missing = residue_keys - present_keys
+        if not missing:
+            return
+
+        # Chain-level severity: disjoint chain sets strongly suggests a chain-ID mismatch.
+        struct_chains = {k[2] for k in residue_keys}
+        present_chains = {k[2] for k in present_keys}
+        disjoint_chains = struct_chains.isdisjoint(present_chains)
+
+        # Missing counts by chain (helps differentiate "one chain missing" vs scattered gaps).
+        missing_by_chain: Dict[str, int] = {}
+        for k in missing:
+            missing_by_chain[k[2]] = missing_by_chain.get(k[2], 0) + 1
+        missing_chain_summary = ", ".join(
+            f"{chain}:{n}" for chain, n in sorted(missing_by_chain.items(), key=lambda x: (-x[1], x[0]))
+        )
+
+        example_missing = list(missing)[:5]
+        logger.warning(
+            "%s missing for %d of %d residues in %r%s (present chains=%r, structure chains=%r%s); "
+            "missing by chain: %s; examples of missing keys: %r",
+            label,
+            len(missing),
+            len(residue_keys),
+            self._pdb_path,
+            f" (source={source_path!r})" if source_path else "",
+            sorted(present_chains),
+            sorted(struct_chains),
+            ", DISJOINT CHAIN SETS -> likely chain-id mismatch" if disjoint_chains else "",
+            missing_chain_summary,
+            example_missing,
+        )
+
+    def _filter_to_structure_residues(
+        self,
+        data: Dict[ResKey4, T],
+        *,
+        label: str,
+        source_path: Optional[str] = None,
+    ) -> Dict[ResKey4, T]:
+        """
+        Enforce a single canonical "key space": residues present in the parsed structure
+        (after any `allowed_chains` filtering).
+        """
+        if not data:
+            return data
+        try:
+            residue_keys = self.residue_keys
+        except Exception:
+            return data
+
+        filtered = {k: v for k, v in data.items() if k in residue_keys}
+        dropped = len(data) - len(filtered)
+        if dropped > 0:
+            example_dropped = [k for k in data.keys() if k not in residue_keys][:5]
+            logger.warning(
+                "%s contained %d residue keys not present in parsed structure for %r%s; "
+                "examples of dropped keys: %r",
+                label,
+                dropped,
+                self._pdb_path,
+                f" (source={source_path!r})" if source_path else "",
+                example_dropped,
+            )
+        return filtered
 
     def __init__(
         self,
@@ -38,10 +127,10 @@ class StructureContext:
         self._sasa_path = sasa_path
         self._pka_path = pka_path
         self._dssp_path = dssp_path
+        self.parse_errors: Dict[str, str] = {}
 
         self._atoms: Optional[List[Atom]] = None
         self._residue_keys: Optional[Set[ResKey4]] = None
-        self._seq_index: Optional[Dict[ResKey4, int]] = None
         self._ca_coords: Optional[Dict[ResKey4, Tuple[float, float, float]]] = None
         self._sasa_residue: Optional[Dict[ResKey4, SASAEntry]] = None
         self._sasa_output: Optional[Dict[ResKey4, Dict[str, Optional[float]]]] = None
@@ -64,13 +153,12 @@ class StructureContext:
     @property
     def residue_keys(self) -> Set[ResKey4]:
         if self._residue_keys is None:
-            seen: Set[ResKey4] = set()
             keys: Set[ResKey4] = set()
             for atom in self.atoms:
                 key4 = residue_key_from_atom(atom)
-                if key4 not in seen:
-                    seen.add(key4)
-                    keys.add(key4)
+                if key4 in keys:
+                    continue
+                keys.add(key4)
             if not keys:
                 raise ValueError(
                     f"No residues found in structure at {self._pdb_path!r} "
@@ -89,6 +177,22 @@ class StructureContext:
                 key = residue_key_from_atom(atom)
                 if key not in ca_by_res:
                     ca_by_res[key] = (atom.x, atom.y, atom.z)
+            try:
+                residue_keys = self.residue_keys
+            except Exception:
+                residue_keys = set()
+            if residue_keys:
+                missing = residue_keys - set(ca_by_res.keys())
+                if missing:
+                    example_missing = list(missing)[:5]
+                    logger.warning(
+                        "CA coordinates missing for %d of %d residues in %r; "
+                        "downstream geometric descriptors may be biased. Examples: %r",
+                        len(missing),
+                        len(residue_keys),
+                        self._pdb_path,
+                        example_missing,
+                    )
             self._ca_coords = ca_by_res
         return self._ca_coords
 
@@ -105,27 +209,24 @@ class StructureContext:
                             f"SASA file {self._sasa_path!r} parsed but "
                             f"contained no per-residue records."
                         )
-                    try:
-                        residue_keys = self.residue_keys
-                    except Exception:
-                        residue_keys = set()
+                    data = self._filter_to_structure_residues(
+                        data, label="SASA", source_path=self._sasa_path
+                    )
 
-                    if residue_keys:
-                        sasa_keys = set(data.keys())
-                        if sasa_keys and len(sasa_keys) < len(residue_keys):
-                            missing = residue_keys - sasa_keys
-                            example_missing = list(missing)[:5]
-                            logger.warning(
-                                "SASA missing for %d of %d residues in %r; "
-                                "examples of missing keys: %r",
-                                len(missing),
-                                len(residue_keys),
-                                self._pdb_path,
-                                example_missing,
-                            )
+                    self._warn_missing_coverage(
+                        set(data.keys()), label="SASA", source_path=self._sasa_path
+                    )
 
                     self._sasa_residue = data
-                except Exception:
+                except Exception as e:
+                    self.parse_errors["sasa"] = f"{type(e).__name__}: {e}"
+                    logger.warning(
+                        "Failed to parse SASA file %r for structure %r: %s. "
+                        "Proceeding without SASA data.",
+                        self._sasa_path,
+                        self._pdb_path,
+                        e,
+                    )
                     self._sasa_residue = {}
         return self._sasa_residue
 
@@ -164,9 +265,72 @@ class StructureContext:
             if pka_path is None:
                 pka_path = get_pka_file_path(self._pdb_path)
             if pka_path and os.path.exists(pka_path):
-                self._pka_residue = parse_pka(pka_path, self.atoms)
+                # Parse both raw and structure-filtered to detect systematic key mismatches.
+                raw = parse_pka(pka_path, None)
+                filtered = parse_pka(pka_path, self.atoms)
+                filtered = self._filter_to_structure_residues(
+                    filtered, label="pKa", source_path=pka_path
+                )
+
+                if raw and not filtered:
+                    raw_chains = sorted({k[2] for k in raw.keys()})
+                    struct_chains = sorted({k[2] for k in self.residue_keys})
+                    example_raw = list(raw.keys())[:5]
+                    logger.warning(
+                        "pKa file %r contained %d residue records but none matched the parsed structure for %r "
+                        "(raw chains=%r, structure chains=%r). Example raw keys: %r",
+                        pka_path,
+                        len(raw),
+                        self._pdb_path,
+                        raw_chains,
+                        struct_chains,
+                        example_raw,
+                    )
+                elif raw:
+                    dropped = len(raw) - len(filtered)
+                    if dropped > 0:
+                        example_dropped = [k for k in raw.keys() if k not in filtered][:5]
+                        logger.warning(
+                            "pKa file %r had %d of %d residue records that did not match the parsed structure for %r; "
+                            "examples of dropped keys: %r",
+                            pka_path,
+                            dropped,
+                            len(raw),
+                            self._pdb_path,
+                            example_dropped,
+                        )
+
+                # Fill any missing titratable residues with standard pKa values so
+                # charge-based descriptors (net charge, pI, clustering, etc.) remain
+                # well-defined even when PropKa output has incomplete coverage.
+                if filtered is None:
+                    filtered = {}
+                filled = dict(filtered)
+                try:
+                    residue_keys = self.residue_keys
+                except Exception:
+                    residue_keys = set()
+                for key in residue_keys:
+                    if key in filled:
+                        continue
+                    std = get_standard_residue_pka(key[0])
+                    if std is not None:
+                        filled[key] = float(std)
+
+                self._pka_residue = filled
             else:
-                self._pka_residue = {}
+                # No PropKa file: use standard pKa values for titratable residues
+                # present in the structure (as a biologically grounded fallback).
+                filled: Dict[ResKey4, float] = {}
+                try:
+                    residue_keys = self.residue_keys
+                except Exception:
+                    residue_keys = set()
+                for key in residue_keys:
+                    std = get_standard_residue_pka(key[0])
+                    if std is not None:
+                        filled[key] = float(std)
+                self._pka_residue = filled
         return self._pka_residue
 
 
@@ -178,26 +342,16 @@ class StructureContext:
             else:
                 try:
                     data = parse_dssp(self._dssp_path, self.atoms)
+                    data = self._filter_to_structure_residues(
+                        data, label="DSSP", source_path=self._dssp_path
+                    )
                     if data:
-                        try:
-                            residue_keys = self.residue_keys
-                        except Exception:
-                            residue_keys = set()
-                        if residue_keys:
-                            dssp_keys = set(data.keys())
-                            if dssp_keys and len(dssp_keys) < len(residue_keys):
-                                missing = residue_keys - dssp_keys
-                                example_missing = list(missing)[:5]
-                                logger.warning(
-                                    "DSSP missing for %d of %d residues in %r; "
-                                    "examples of missing keys: %r",
-                                    len(missing),
-                                    len(residue_keys),
-                                    self._pdb_path,
-                                    example_missing,
-                                )
+                        self._warn_missing_coverage(
+                            set(data.keys()), label="DSSP", source_path=self._dssp_path
+                        )
                     self._dssp_per_residue = data or {}
                 except Exception as e:
+                    self.parse_errors["dssp"] = f"{type(e).__name__}: {e}"
                     logger.warning(
                         "Failed to parse DSSP file %r for structure %r: %s. "
                         "Proceeding without DSSP data.",
@@ -217,26 +371,81 @@ class StructureContext:
 
                 try:
                     hbond_data, dssp_seq_to_pdb = parse_dssp_hbonds(self._dssp_path, self.atoms)
-                    if hbond_data:
-                        try:
-                            residue_keys = self.residue_keys
-                        except Exception:
-                            residue_keys = set()
+                    hbond_data = self._filter_to_structure_residues(
+                        hbond_data, label="DSSP H-bonds", source_path=self._dssp_path
+                    )
+                    # Keep DSSP index mapping consistent with the same canonical residue key space.
+                    try:
+                        residue_keys = self.residue_keys
+                    except Exception:
+                        residue_keys = set()
+
+                    seq_to_pdb: Dict[int, ResKey4] = {}
+                    if dssp_seq_to_pdb:
                         if residue_keys:
-                            dssp_keys = set(hbond_data.keys())
-                            if dssp_keys and len(dssp_keys) < len(residue_keys):
-                                missing = residue_keys - dssp_keys
-                                example_missing = list(missing)[:5]
+                            seq_to_pdb = {
+                                i: k for i, k in dssp_seq_to_pdb.items() if k in residue_keys
+                            }
+                            dropped = len(dssp_seq_to_pdb) - len(seq_to_pdb)
+                            if dropped > 0:
+                                example_dropped = [
+                                    (i, k)
+                                    for i, k in dssp_seq_to_pdb.items()
+                                    if k not in residue_keys
+                                ][:5]
                                 logger.warning(
-                                    "DSSP H-bond data missing for %d of %d residues in %r; "
-                                    "examples of missing keys: %r",
-                                    len(missing),
-                                    len(residue_keys),
+                                    "DSSP seq->PDB mapping contained %d entries not present in parsed structure for %r "
+                                    "(source=%r); examples of dropped mappings: %r",
+                                    dropped,
                                     self._pdb_path,
-                                    example_missing,
+                                    self._dssp_path,
+                                    example_dropped,
                                 )
-                    self._dssp_hbonds = (hbond_data or {}, dssp_seq_to_pdb or {})
+                        else:
+                            seq_to_pdb = dict(dssp_seq_to_pdb)
+
+                    # Drop H-bond pairs whose target DSSP index no longer resolves.
+                    pruned_hbonds: Dict[ResKey4, List[Tuple[int, float]]] = {}
+                    if hbond_data and seq_to_pdb:
+                        pdb_to_seq = {pdb_key: dssp_seq for dssp_seq, pdb_key in seq_to_pdb.items()}
+                        dropped_pairs = 0
+                        total_pairs = 0
+                        dropped_sources = 0
+
+                        for res_key, pairs in hbond_data.items():
+                            dssp_seq = pdb_to_seq.get(res_key)
+                            if dssp_seq is None:
+                                dropped_sources += 1
+                                continue
+                            kept: List[Tuple[int, float]] = []
+                            for offset, energy in pairs:
+                                total_pairs += 1
+                                target_seq = dssp_seq + offset
+                                if target_seq not in seq_to_pdb:
+                                    dropped_pairs += 1
+                                    continue
+                                kept.append((offset, energy))
+                            if kept:
+                                pruned_hbonds[res_key] = kept
+
+                        if dropped_sources > 0 or dropped_pairs > 0:
+                            logger.warning(
+                                "Pruned DSSP H-bond data for %r (source=%r): dropped %d residues with no DSSP index, "
+                                "and %d of %d H-bond pairs whose targets were outside the parsed structure key space.",
+                                self._pdb_path,
+                                self._dssp_path,
+                                dropped_sources,
+                                dropped_pairs,
+                                total_pairs,
+                            )
+                    else:
+                        pruned_hbonds = hbond_data or {}
+
+                    # Note: DSSP H-bond data is not expected to cover every residue
+                    # warn on dropped keys / pruned pairs and on parse failures.
+                    self._dssp_hbonds = (pruned_hbonds or {}, seq_to_pdb or {})
                 except Exception as e:
+                    self.parse_errors["dssp_hbonds"] = f"{type(e).__name__}: {e}"
                     logger.warning(
                         "Failed to parse DSSP H-bond data from %r for structure %r: %s. "
                         "Proceeding without DSSP H-bond data.",

@@ -78,7 +78,9 @@ class SASAEntry:
     residue_name: str
     chain: str
     residue_number: int
+    total_side_abs: float
     total_side_rel: float
+    main_chain_abs: float
     main_chain_rel: float
 
 
@@ -91,7 +93,9 @@ class SASARawRecord:
     chain: str
     residue_number: int
     insertion_code: str  # '' when not present
+    total_side_abs: str
     total_side_rel: str
+    main_chain_abs: str
     main_chain_rel: str
 
 _SASA_RAW_CACHE: Dict[str, List[SASARawRecord]] = {}
@@ -363,7 +367,11 @@ def load_sasa_raw(sasa_path: str) -> List[SASARawRecord]:
                     if parsed is None:
                         continue
                     residue_number, insertion_code = parsed
+                    # FreeSASA residue format (split parts):
+                    # RES <resName> <chain> <num> <all_abs> <all_rel> <side_abs> <side_rel> <main_abs> <main_rel> ...
+                    total_side_abs = parts[6] if len(parts) > 6 else ""
                     total_side_rel = parts[7] if len(parts) > 7 else ""
+                    main_chain_abs = parts[8] if len(parts) > 8 else ""
                     main_chain_rel = parts[9] if len(parts) > 9 else ""
                     records.append(
                         SASARawRecord(
@@ -371,7 +379,9 @@ def load_sasa_raw(sasa_path: str) -> List[SASARawRecord]:
                             chain=chain,
                             residue_number=residue_number,
                             insertion_code=insertion_code,
+                            total_side_abs=total_side_abs,
                             total_side_rel=total_side_rel,
+                            main_chain_abs=main_chain_abs,
                             main_chain_rel=main_chain_rel,
                         )
                     )
@@ -427,11 +437,19 @@ def parse_sasa(sasa_path: str) -> Dict[Tuple[str, int, str, str], SASAEntry]:
 
     for rec in load_sasa_raw(sasa_path):
         try:
+            if rec.total_side_abs and rec.total_side_abs != "N/A":
+                total_side_abs = float(rec.total_side_abs)
+            else:
+                total_side_abs = 0.0
             if rec.total_side_rel and rec.total_side_rel != "N/A":
                 total_side_rel = float(rec.total_side_rel) / 100.0
             else:
                 total_side_rel = 0.0
 
+            if rec.main_chain_abs and rec.main_chain_abs != "N/A":
+                main_chain_abs = float(rec.main_chain_abs)
+            else:
+                main_chain_abs = 0.0
             if rec.main_chain_rel and rec.main_chain_rel != "N/A":
                 main_chain_rel = float(rec.main_chain_rel) / 100.0
             else:
@@ -442,7 +460,9 @@ def parse_sasa(sasa_path: str) -> Dict[Tuple[str, int, str, str], SASAEntry]:
                 residue_name=rec.residue_name,
                 chain=rec.chain,
                 residue_number=rec.residue_number,
+                total_side_abs=total_side_abs,
                 total_side_rel=total_side_rel,
+                main_chain_abs=main_chain_abs,
                 main_chain_rel=main_chain_rel,
             )
         except ValueError:
