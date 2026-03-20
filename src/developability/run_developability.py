@@ -233,24 +233,27 @@ def main():
             fraction_gln_asn_CDRs = sum(1 for k in cdr_keys if k[0] in GLN_ASN_RESIDUES) / n_cdr
             hydro_cdr = sum(1 for k in cdr_keys if k[0] in HYDROPHOBIC_RESIDUES)
             polar_cdr = sum(1 for k in cdr_keys if k[0] in POLAR_RESIDUES)
-            ratio_hydrophobic_to_polar_CDRs = (hydro_cdr / polar_cdr) if polar_cdr > 0 else None
+            ratio_hydrophobic_to_polar_CDRs = (hydro_cdr / polar_cdr) if polar_cdr > 0 else 0.0
         else:
-            cdr_total_length = None
-            fraction_gly_CDRs = fraction_pro_CDRs = fraction_aromatic_CDRs = fraction_gln_asn_CDRs = None
-            ratio_hydrophobic_to_polar_CDRs = None
+            cdr_total_length = 0
+            fraction_gly_CDRs = fraction_pro_CDRs = fraction_aromatic_CDRs = fraction_gln_asn_CDRs = 0.0
+            ratio_hydrophobic_to_polar_CDRs = 0.0
 
         # Fraction buried and composition of buried residues
         n_total = None if sasa_failed else len(ctx.sasa_residue)
         n_buried = None if sasa_failed else len(buried_keys)
-        fraction_buried = (
-            (n_buried / n_total) if (n_total and n_buried is not None and n_total > 0) else None
-        )
+        if n_total is None or n_buried is None:
+            fraction_buried = None
+        elif n_total > 0:
+            fraction_buried = n_buried / n_total
+        else:
+            fraction_buried = 0.0
         if n_buried > 0:
             fraction_hydrophobic_buried = sum(1 for k in buried_keys if k[0] in HYDROPHOBIC_RESIDUES) / n_buried
             fraction_negative_buried = sum(1 for k in buried_keys if k[0] in NEGATIVE_CHARGED_RESIDUES) / n_buried
             fraction_positive_buried = sum(1 for k in buried_keys if k[0] in POSITIVE_CHARGED_RESIDUES) / n_buried
         else:
-            fraction_hydrophobic_buried = fraction_negative_buried = fraction_positive_buried = None
+            fraction_hydrophobic_buried = fraction_negative_buried = fraction_positive_buried = 0.0
 
         # Beta-sheet composition and Kyte-Doolittle sum
         n_beta = len(beta_keys)
@@ -259,7 +262,7 @@ def main():
             fraction_gln_asn_beta_sheet = sum(1 for k in beta_keys if k[0] in GLN_ASN_RESIDUES) / n_beta
             hydrophobic_beta_sheet_kyte_doolittle_sum = sum(KYTE_DOOLITTLE.get(k[0], 0.0) for k in beta_keys)
         else:
-            fraction_hydrophobic_beta_sheet = fraction_gln_asn_beta_sheet = None
+            fraction_hydrophobic_beta_sheet = fraction_gln_asn_beta_sheet = 0.0
             hydrophobic_beta_sheet_kyte_doolittle_sum = 0.0
 
         # Kyte-Doolittle sum across the whole parsed sequence (all residues in structure)
@@ -441,14 +444,14 @@ def main():
             residue_category=aromatic_buried_keys,
             residues_for_average=None,
             sqrt_weights=False,
-        ) if aromatic_buried_keys else None
+        ) if aromatic_buried_keys else 0.0
         avg_hydrophobic_buried_over_all = calculate_residue_category_density_average(
             args.pdb_file,
             args.sasa_file,
             residue_category=hydrophobic_buried_keys,
             residues_for_average=None,
             sqrt_weights=False,
-        ) if hydrophobic_buried_keys else None
+        ) if hydrophobic_buried_keys else 0.0
 
         aromatic_cdr_keys = aromatic_keys & cdr_keys
         hydrophobic_cdr_keys = hydrophobic_keys & cdr_keys
@@ -458,7 +461,7 @@ def main():
             residue_category=aromatic_cdr_keys,
             residues_for_average=aromatic_cdr_keys,
             sqrt_weights=False,
-        ) if aromatic_cdr_keys else None
+        ) if aromatic_cdr_keys else 0.0
 
         avg_hydrophobic_cdr_over_cdr = calculate_residue_category_density_average(
             args.pdb_file,
@@ -466,7 +469,7 @@ def main():
             residue_category=hydrophobic_cdr_keys,
             residues_for_average=hydrophobic_cdr_keys,
             sqrt_weights=False,
-        ) if hydrophobic_cdr_keys else None
+        ) if hydrophobic_cdr_keys else 0.0
 
         avg_polar = calculate_residue_category_density_average(
             args.pdb_file,
@@ -496,21 +499,21 @@ def main():
             residue_category=polar_cdr_keys,
             residues_for_average=polar_cdr_keys,
             sqrt_weights=False,
-        ) if polar_cdr_keys else None
+        ) if polar_cdr_keys else 0.0
         avg_negative_cdr_over_cdr = calculate_residue_category_density_average(
             args.pdb_file,
             args.sasa_file,
             residue_category=negative_cdr_keys,
             residues_for_average=negative_cdr_keys,
             sqrt_weights=False,
-        ) if negative_cdr_keys else None
+        ) if negative_cdr_keys else 0.0
         avg_positive_cdr_over_cdr = calculate_residue_category_density_average(
             args.pdb_file,
             args.sasa_file,
             residue_category=positive_cdr_keys,
             residues_for_average=positive_cdr_keys,
             sqrt_weights=False,
-        ) if positive_cdr_keys else None
+        ) if positive_cdr_keys else 0.0
 
         avg_wcn = calculate_weighted_contact_number_average(args.pdb_file)
 
@@ -531,7 +534,7 @@ def main():
             residue_category=cdr_keys,
             residues_for_density=cdr_keys,
             residues_for_average=cdr_keys,
-        ) if cdr_keys else None
+        ) if cdr_keys else 0.0
 
         avg_wcn_interface_over_all = calculate_weighted_contact_number_average(
             args.pdb_file,
@@ -594,7 +597,7 @@ def main():
         weights_raw, counts = compute_hbond_density_raw(args.pdb_file, args.sasa_file)
         number_of_hbonds = sum(counts.values()) // 2 if counts else 0
         _n_res = _count_residues_in_pdb(args.pdb_file)
-        mean_hbond_degree = (2.0 * number_of_hbonds / _n_res) if _n_res > 0 else None
+        mean_hbond_degree = (2.0 * number_of_hbonds / _n_res) if _n_res > 0 else 0.0
 
         avg_hbond = calculate_global_hbond_density_average(
             args.pdb_file,
@@ -701,8 +704,8 @@ def main():
         _exposed_tsr = [getattr(_sasa[k], "total_side_rel", None) for k in exposed_keys if k in _sasa]
         _buried_tsr = [v for v in _buried_tsr if v is not None]
         _exposed_tsr = [v for v in _exposed_tsr if v is not None]
-        avg_total_side_rel_buried = sum(_buried_tsr) / len(_buried_tsr) if _buried_tsr else None
-        avg_total_side_rel_exposed = sum(_exposed_tsr) / len(_exposed_tsr) if _exposed_tsr else None
+        avg_total_side_rel_buried = sum(_buried_tsr) / len(_buried_tsr) if _buried_tsr else 0.0
+        avg_total_side_rel_exposed = sum(_exposed_tsr) / len(_exposed_tsr) if _exposed_tsr else 0.0
 
         # total_side_rel sums by residue type (all / buried / exposed)
         def _tsr_sum(keys, res_set):

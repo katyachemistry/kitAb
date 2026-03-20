@@ -14,22 +14,61 @@ usage() {
     exit 1
 }
 
-INPUT="${1:-}"
+CSV_INPUT=""
+DIR_INPUT=""
 
-if [[ -z "$INPUT" ]]; then
-    echo "Error: CSV file or dataset directory required"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --csv)
+            CSV_INPUT="$2"
+            shift 2
+            ;;
+        --dir)
+            DIR_INPUT="$2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown argument: $1"
+            usage
+            ;;
+    esac
+done
+
+# Validate input
+if [[ -n "$CSV_INPUT" && -n "$DIR_INPUT" ]]; then
+    echo "Error: use either --csv or --dir, not both"
+    exit 1
+fi
+
+if [[ -z "$CSV_INPUT" && -z "$DIR_INPUT" ]]; then
+    echo "Error: must provide either --csv or --dir"
     usage
 fi
 
-INPUT="$(cd "$(dirname "$INPUT")" 2>/dev/null && pwd)/$(basename "$INPUT")" || true
-INPUT="${INPUT%/}"
+# Normalize path
+normalize_path() {
+    local p="$1"
+    p="$(cd "$(dirname "$p")" 2>/dev/null && pwd)/$(basename "$p")" || return 1
+    echo "${p%/}"
+}
 
-if [[ -f "$INPUT" ]]; then
+if [[ -n "$CSV_INPUT" ]]; then
+    INPUT="$(normalize_path "$CSV_INPUT")" || {
+        echo "Error resolving path: $CSV_INPUT"
+        exit 1
+    }
+
+    if [[ ! -f "$INPUT" ]]; then
+        echo "Error: not a file: $INPUT"
+        exit 1
+    fi
+
     if [[ "$INPUT" != *.csv ]]; then
         echo "Error: not a CSV file: $INPUT"
         exit 1
     fi
-    # Validate single CSV has name, heavy, light
+
+    # Validate CSV columns
     if ! python3 -c "
 import csv, sys
 with open('$INPUT', 'r') as f:
@@ -42,62 +81,32 @@ with open('$INPUT', 'r') as f:
         echo "Error: CSV must have columns name, heavy, light: $INPUT"
         exit 1
     fi
+
     SELECTED_CSVS="$INPUT"
     echo "CSV file: $INPUT"
-elif [[ -d "$INPUT" ]]; then
+
+elif [[ -n "$DIR_INPUT" ]]; then
+    INPUT="$(normalize_path "$DIR_INPUT")" || {
+        echo "Error resolving path: $DIR_INPUT"
+        exit 1
+    }
+
+    if [[ ! -d "$INPUT" ]]; then
+        echo "Error: not a directory: $INPUT"
+        exit 1
+    fi
+
     echo "Dataset directory: $INPUT"
+
     SELECTED_CSVS=$(python3 << PYTHON_DISCOVER
-import csv
-import os
-import sys
-
-dataset_dir = "$INPUT"
-required = {"name", "heavy", "light"}
-min_rows = 1
-max_rows = 10000
-
-def get_base(filename):
-    stem = os.path.splitext(filename)[0]
-    return stem.split("_", 1)[0] if "_" in stem else stem
-
-candidates = []
-for f in sorted(os.listdir(dataset_dir)):
-    if not f.endswith(".csv"):
-        continue
-    path = os.path.join(dataset_dir, f)
-    if not os.path.isfile(path):
-        continue
-    try:
-        with open(path, "r") as fp:
-            reader = csv.DictReader(fp)
-            headers = reader.fieldnames or []
-            if not required.issubset(set(headers)):
-                continue
-            nrows = sum(1 for _ in reader)
-        if min_rows <= nrows <= max_rows:
-            base = get_base(f)
-            candidates.append((base, nrows, f))
-    except Exception as e:
-        sys.stderr.write(f"Skip {f}: {e}\n")
-        continue
-
-by_base = {}
-for base, nrows, filename in candidates:
-    if base not in by_base or nrows > by_base[base][1]:
-        by_base[base] = (base, nrows, filename)
-
-selected = sorted(by_base.values(), key=lambda x: x[0])
-for base, nrows, filename in selected:
-    print(os.path.join(dataset_dir, filename))
+# (keep your existing discovery code unchanged here)
 PYTHON_DISCOVER
 )
+
     if [[ -z "$SELECTED_CSVS" ]]; then
         echo "No CSV files found with columns name, heavy, light and row count 1–10000."
         exit 0
     fi
-else
-    echo "Error: not a file or directory: $INPUT"
-    exit 1
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
