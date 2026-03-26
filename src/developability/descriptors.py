@@ -55,6 +55,7 @@ from utils.parsers import (
     residue_key_from_atom,
     parse_motif_to_3letter
 )
+from utils.chemistry import get_standard_residue_pka
 from utils.geometry import (
     is_backbone_atom
 )
@@ -83,6 +84,9 @@ NEGATIVE_ATOMS = frozenset({
     ("OD2", "ASP"),
     ("OE1", "GLU"),
     ("OE2", "GLU"),
+    # Phenolic / thiol deprotonation.
+    ("OH", "TYR"),
+    ("SG", "CYS"),
 })
 
 
@@ -127,6 +131,30 @@ SCM_MAIN_CHAIN_ATOMS = frozenset({"CA", "HA", "N", "C", "O", "HN", "H"})
 
 # Charge
 
+
+def _residue_fractional_charge_at_pH_for_charge_metrics(
+    residue_name: str,
+    pka_value: Optional[float],
+    pH: float,
+) -> float:
+    """
+    Fractional charge for net charge / pI and charge-weighting metrics.
+
+    Negative residues (ASP/GLU plus TYR/CYS) are treated as titratable acidic
+    groups: phenolic/thiol deprotonation -> -1 when deprotonated.
+    """
+    res_name = (residue_name or "").strip().upper()
+    effective_pka = pka_value if pka_value is not None else get_standard_residue_pka(res_name)
+    if effective_pka is None:
+        return 0.0
+
+    if res_name in NEGATIVE_CHARGED_RESIDUES:
+        return -1.0 / (1.0 + np.power(10.0, effective_pka - pH))
+    if res_name in POSITIVE_CHARGED_RESIDUES:
+        return 1.0 / (1.0 + np.power(10.0, pH - effective_pka))
+    return 0.0
+
+
 def net_charge_from_pka(
     pka_data: Dict[Tuple[str, int, str, str], float],
     pH: float
@@ -137,7 +165,7 @@ def net_charge_from_pka(
     net = 0.0
     for key, pka in pka_data.items():
         res_name = key[0]
-        net += _residue_fractional_charge_at_pH(res_name, pka, pH)
+        net += _residue_fractional_charge_at_pH_for_charge_metrics(res_name, pka, pH)
 
     chains = {key[2] for key in pka_data.keys()}
     n_chains = len(chains)
@@ -168,38 +196,189 @@ def pi_from_pka(
     except (ValueError, Exception):
         return None
 
+
+# ---------------------------------------------------------------------------
+# Alternative sequence-based net charge (no structure / PropKa dependency)
+# ---------------------------------------------------------------------------
+
+# Copy of PROPERMAB-style simplified side-chain charge logic:
+# - uses fixed pKa values only as a threshold for histidine protonation
+# - returns integer net charge based on residue counts
+_SEQUTILS_PKA_DICT = {
+    "N_term": (8.6, 1),
+    "C_term": (3.6, -1),
+    "D": (3.9, -1),
+    "E": (4.1, -1),
+    "H": (6.5, 1),
+    "Y": (10.1, -1),
+    "K": (10.8, 1),
+    "R": (12.5, 1),
+}
+
+
+# def net_charge_from_seq(seq: str, pH: float = 7.4) -> float:
+#     """
+#     Sequence-based net charge used for quick comparisons.
+
+#     Note: this matches PROPERMAB's `calculate_seq_charge()` behavior:
+#     it models His as titratable via a pH threshold and counts only
+#     side-chain contributions (no explicit N/C termini terms).
+#     """
+#     if pH < _SEQUTILS_PKA_DICT["H"][0]:
+#         return (
+#             seq.count("H") + seq.count("K") + seq.count("R") - seq.count("D") - seq.count("E")
+#         )
+#     return seq.count("K") + seq.count("R") - seq.count("D") - seq.count("E")
+
 def compute_dipole_moment_magnitude(
     pdb_atoms: List[Atom],
     pka_output_data: Dict[ResKey4, float],
     pH: float,
 ) -> Optional[float]:
     """
-    Dipole moment magnitude from C-alpha positions and pH-dependent charges (q = ±1).
-    μ = Σ qi*ri over charged residues, |μ| = sqrt(μx² + μy² + μz²).
+    Dipole moment magnitude from ionizable atom positions and pH-dependent fractional charges.
+
+    We approximate the dipole as
+      μ = Σ q_i * (r_i - r0),
+    where r_i is the centroid of ionizable atoms for residue i, and r0 is a single
+    reference centroid shared across all residues. Subtracting r0 makes the result
+    invariant to global translation of the input coordinates.
     """
-    ca_dipole: Dict[ResKey4, Tuple[float, float, float]] = {}
+    # Ionizable atoms per residue for dipole estimation.
+    # Constructed from the same POSITIVE_ATOMS / NEGATIVE_ATOMS definitions used
+    # elsewhere in this module for charge handling (including Tyr/Cys).
+    ionizable_atom_names_by_residue_lists: Dict[str, List[str]] = {}
+    for atom_name, res_name in POSITIVE_ATOMS:
+        ionizable_atom_names_by_residue_lists.setdefault(res_name, []).append(atom_name)
+    for atom_name, res_name in NEGATIVE_ATOMS:
+        ionizable_atom_names_by_residue_lists.setdefault(res_name, []).append(atom_name)
+    ionizable_atom_names_by_residue: Dict[str, Tuple[str, ...]] = {
+        res_name: tuple(sorted(atom_names))
+        for res_name, atom_names in ionizable_atom_names_by_residue_lists.items()
+    }
+
+    # Collect per-residue representative coords as the centroid of ionizable atoms.
+    coords_by_res: Dict[ResKey4, List[Tuple[float, float, float]]] = {}
     for atom in pdb_atoms:
-        if atom.name != "CA":
+        atom_name = (atom.name or "").strip().upper()
+        res_name = (atom.residue_name or "").strip().upper()
+        allowed = ionizable_atom_names_by_residue.get(res_name)
+        if not allowed:
+            continue
+        if atom_name not in allowed:
             continue
         key = residue_key_from_atom(atom)
-        ca_dipole[key] = (atom.x, atom.y, atom.z)
+        coords_by_res.setdefault(key, []).append((atom.x, atom.y, atom.z))
 
     def get_pka(k: ResKey4) -> Optional[float]:
         return pka_output_data.get(k) or pka_output_data.get((k[0], k[1], k[2], ""))
 
+    # Reference centroid for translation invariance.
+    # Use the centroid of all atoms we were given (not just ionizable ones),
+    # matching the approach in `struct_featurizer.py`.
+    if not pdb_atoms:
+        return 0.0
+    ref_center = np.mean(
+        np.array([(a.x, a.y, a.z) for a in pdb_atoms], dtype=np.float64),
+        axis=0,
+    )
+
     mux, muy, muz = 0.0, 0.0, 0.0
-    for key, (x, y, z) in ca_dipole.items():
+    for key, coords in coords_by_res.items():
+        if not coords:
+            continue
+
         res_name = key[0]
         pka_val = get_pka(key)
-        if res_name in NEGATIVE_CHARGED_RESIDUES and is_residue_charged(res_name, pka_val, pH):
-            mux -= x
-            muy -= y
-            muz -= z
-        elif res_name in POSITIVE_CHARGED_RESIDUES and is_residue_charged(res_name, pka_val, pH):
-            mux += x
-            muy += y
-            muz += z
+        q = float(_residue_fractional_charge_at_pH_for_charge_metrics(res_name, pka_val, pH))
+        if q == 0.0:
+            continue
+
+        # Centroid of ionizable atom positions for stable, non-double-counted dipole vector.
+        xs = [c[0] for c in coords]
+        ys = [c[1] for c in coords]
+        zs = [c[2] for c in coords]
+        x = float(np.mean(xs))
+        y = float(np.mean(ys))
+        z = float(np.mean(zs))
+
+        dx = x - float(ref_center[0])
+        dy = y - float(ref_center[1])
+        dz = z - float(ref_center[2])
+        mux += q * dx
+        muy += q * dy
+        muz += q * dz
+
     return math.sqrt(mux * mux + muy * muy + muz * muz)
+
+
+# def compute_hydrophobic_moment_magnitude(
+#     pdb_atoms: List[Atom],
+#     *,
+#     normalize_by_n: bool = False,
+# ) -> float:
+#     """
+#     Magnitude of the first-order hydrophobic moment (amphiphilicity), analogous to
+#     a dipole but with Kyte–Doolittle hydrophobicity instead of charge.
+
+#     For each residue *i*, let *h_i* be the Kyte–Doolittle value and *r_i* the center
+#     of geometry (mean position of all atoms in that residue). The moment vector is
+
+#         **H** = Σ_i h_i * r_i
+
+#     Some references include a factor 1/N with N the number of residues; set
+#     ``normalize_by_n=True`` to use **H** = (1/N) Σ_i h_i * r_i.
+
+#     This matches PROPERMAB ``StructFeaturizer.hyd_moment`` when
+#     ``normalize_by_n=False`` (unnormalized sum, then Euclidean norm).
+
+#     Parameters
+#     ----------
+#     pdb_atoms
+#         Structure atoms (typically parsed PDB).
+#     normalize_by_n
+#         If True, scale the summed vector by 1/N before taking the norm (N = count of
+#         residues that contribute: standard amino acids present in ``KYTE_DOOLITTLE``).
+
+#     Returns
+#     -------
+#     float
+#         ‖**H**‖ (or ‖**H**/N‖ when ``normalize_by_n`` is True). 0.0 if no residues
+#         contribute.
+#     """
+#     if not pdb_atoms:
+#         return 0.0
+
+#     coords_by_res: Dict[ResKey4, List[Tuple[float, float, float]]] = defaultdict(list)
+#     for atom in pdb_atoms:
+#         key = residue_key_from_atom(atom)
+#         coords_by_res[key].append((atom.x, atom.y, atom.z))
+
+#     hx, hy, hz = 0.0, 0.0, 0.0
+#     n_used = 0
+#     for key, coords in coords_by_res.items():
+#         if not coords:
+#             continue
+#         res_name = (key[0] or "").strip().upper()
+#         h_i = KYTE_DOOLITTLE.get(res_name)
+#         if h_i is None:
+#             continue
+#         arr = np.asarray(coords, dtype=np.float64)
+#         r_i = np.mean(arr, axis=0)
+#         hx += float(h_i) * float(r_i[0])
+#         hy += float(h_i) * float(r_i[1])
+#         hz += float(h_i) * float(r_i[2])
+#         n_used += 1
+
+#     if n_used == 0:
+#         return 0.0
+#     if normalize_by_n:
+#         inv_n = 1.0 / float(n_used)
+#         hx *= inv_n
+#         hy *= inv_n
+#         hz *= inv_n
+#     return float(math.sqrt(hx * hx + hy * hy + hz * hz))
+
 
 # Spatial Charge Map with optional weighting by SASA (default: True)
 
@@ -209,7 +388,7 @@ def scm_score_from_pka(
     pka_data: Dict[Tuple[str, int, str, str], float],
     pH: float,
     d_cutoff: float = 10.0,
-    sasa_cutoff: float = 0.25,
+    sasa_cutoff: float = 0.05,
     sasa_weighting: bool = True,
 ) -> Optional[float]:
 
@@ -229,11 +408,6 @@ def scm_score_from_pka(
         n = len(atoms)
         coords = np.array([[a.x, a.y, a.z] for a in atoms], dtype=np.float64)
         
-        is_sidechain = np.array(
-            [a.name.strip() not in SCM_MAIN_CHAIN_ATOMS for a in atoms],
-            dtype=bool,
-        )
-        
         key4_list: List[Tuple[str, int, str, str]] = [
             residue_key_from_atom(a) for a in atoms
         ]
@@ -251,12 +425,13 @@ def scm_score_from_pka(
         
         residue_charge: Dict[Tuple[str, int, str, str], float] = {}
         residue_charged_atom_count: Dict[Tuple[str, int, str, str], int] = {}
-        for i, (a, key4) in enumerate(zip(atoms, key4_list)):
+        for a, key4 in zip(atoms, key4_list):
             if key4 not in residue_charge:
                 residue_charge[key4] = _residue_fractional_charge_at_pH(
                     a.residue_name, pka_data.get(key4), pH
                 )
-            if is_sidechain[i] and (
+            # Distribute residue charge only onto ionizable atoms.
+            if (
                 (a.name, a.residue_name) in POSITIVE_ATOMS
                 or (a.name, a.residue_name) in NEGATIVE_ATOMS
             ):
@@ -267,8 +442,7 @@ def scm_score_from_pka(
         atom_charge = np.zeros(n, dtype=np.float64)
         atom_sasa_share = np.zeros(n, dtype=np.float64)
         for i, (a, key4) in enumerate(zip(atoms, key4_list)):
-            if not is_sidechain[i]:
-                continue
+            # Only ionizable atoms get any per-atom charge/SASA share.
             if (a.name, a.residue_name) not in POSITIVE_ATOMS and (
                 (a.name, a.residue_name) not in NEGATIVE_ATOMS
             ):
@@ -314,6 +488,152 @@ def scm_score_from_pka(
         return None
 
 
+# PROPERMAB paper / Agrawal et al.: side-chain absolute SASA threshold (Å²).
+# SCM_PROPERMAB_SIDE_CHAIN_ABS_SASA_CUTOFF_A2 = 10.0
+
+
+# def scm_score_from_pka_propermab(
+#     pdb_path: str,
+#     sasa_path: str,
+#     pka_data: Dict[Tuple[str, int, str, str], float],
+#     pH: float,
+#     d_cutoff: float = 10.0,
+#     side_chain_abs_sasa_cutoff: float = SCM_PROPERMAB_SIDE_CHAIN_ABS_SASA_CUTOFF_A2,
+#     chain_ids: Optional[Iterable[str]] = None,
+# ) -> Optional[float]:
+#     """
+#     Spatial charge map (SCM) score as in the PROPERMAB paper (Agrawal et al.).
+
+#     For each atom *i* in the Fv domain (see ``chain_ids``):
+
+#         scm_i = sum_{j in E_i} q_j
+
+#     where *E_i* is the set of **side-chain** atoms *j* that belong to residues whose
+#     **side-chain solvent-accessible surface area is >** ``side_chain_abs_sasa_cutoff``
+#     (default **10 Å²**), and whose distance to atom *i* is **≤** ``d_cutoff``
+#     (default **10 Å**).
+
+#     The domain score is::
+
+#         scm = | sum_{i in A} scm_i * H(-scm_i) |
+
+#     i.e. the absolute value of the sum of *scm_i* over atoms with *scm_i* < 0
+#     (Heaviside *H*).
+
+#     **Charges *q_j* (pKa-based):** residue fractional charge at *pH* is
+#     ``_residue_fractional_charge_at_pH`` (same helper as elsewhere in this module).
+#     That net charge is spread **evenly** over all **heavy** side-chain atoms of the
+#     residue (non-backbone, non-hydrogen). This substitutes for force-field partial
+#     charges used in the original formulation.
+
+#     Parameters
+#     ----------
+#     chain_ids
+#         If given, restrict *A* (and all bookkeeping) to these PDB chain IDs (e.g.
+#         ``("H", "L")`` for Fv). If ``None``, all atoms from the parsed structure are
+#         used.
+#     """
+#     from utils.parsers import parse_sasa
+
+#     atoms = _get_atoms_for_path(pdb_path)
+#     if not atoms:
+#         return None
+
+#     if chain_ids is not None:
+#         allowed = frozenset(str(c) for c in chain_ids)
+#         atoms = [a for a in atoms if (a.chain or "") in allowed]
+#     if not atoms:
+#         return None
+
+#     try:
+#         sasa_data = parse_sasa(sasa_path)
+#     except Exception as e:
+#         logger.warning("SCM (PROPERMAB): failed to parse SASA %s: %s", sasa_path, e)
+#         return None
+
+#     def _sasa_entry(key: ResKey4):
+#         e = sasa_data.get(key)
+#         if e is None:
+#             e = sasa_data.get((key[0], key[1], key[2], ""))
+#         return e
+
+#     def _pka_val(key: ResKey4) -> Optional[float]:
+#         v = pka_data.get(key)
+#         if v is None:
+#             v = pka_data.get((key[0], key[1], key[2], ""))
+#         return v
+
+#     try:
+#         unique_keys: Set[ResKey4] = {residue_key_from_atom(a) for a in atoms}
+
+#         residue_exposed_sc: Dict[ResKey4, bool] = {}
+#         for key in unique_keys:
+#             entry = _sasa_entry(key)
+#             if entry is None:
+#                 residue_exposed_sc[key] = False
+#                 continue
+#             abs_sa = getattr(entry, "total_side_abs", None)
+#             if abs_sa is None:
+#                 residue_exposed_sc[key] = False
+#             else:
+#                 try:
+#                     residue_exposed_sc[key] = float(abs_sa) > float(
+#                         side_chain_abs_sasa_cutoff
+#                     )
+#                 except (TypeError, ValueError):
+#                     residue_exposed_sc[key] = False
+
+#         sc_heavy_count: Dict[ResKey4, int] = defaultdict(int)
+#         for a in atoms:
+#             if is_hydrogen_atom(a) or is_backbone_atom(a):
+#                 continue
+#             sc_heavy_count[residue_key_from_atom(a)] += 1
+
+#         q_residue: Dict[ResKey4, float] = {}
+#         for key in unique_keys:
+#             q_residue[key] = float(
+#                 _residue_fractional_charge_at_pH(key[0], _pka_val(key), pH)
+#             )
+
+#         n = len(atoms)
+#         coords = np.array([[a.x, a.y, a.z] for a in atoms], dtype=np.float64)
+
+#         source_coords_list: List[Tuple[float, float, float]] = []
+#         source_q_list: List[float] = []
+#         for a in atoms:
+#             if is_hydrogen_atom(a) or is_backbone_atom(a):
+#                 continue
+#             rk = residue_key_from_atom(a)
+#             if not residue_exposed_sc.get(rk, False):
+#                 continue
+#             n_sc = sc_heavy_count.get(rk, 0)
+#             if n_sc <= 0:
+#                 continue
+#             qj = q_residue.get(rk, 0.0) / float(n_sc)
+#             source_coords_list.append((a.x, a.y, a.z))
+#             source_q_list.append(qj)
+
+#         if not source_coords_list:
+#             return 0.0
+
+#         source_coords = np.asarray(source_coords_list, dtype=np.float64)
+#         source_q = np.asarray(source_q_list, dtype=np.float64)
+#         tree = cKDTree(source_coords)
+
+#         scm_atom = np.zeros(n, dtype=np.float64)
+#         for i in range(n):
+#             idxs = tree.query_ball_point(coords[i], r=float(d_cutoff))
+#             if not idxs:
+#                 continue
+#             scm_atom[i] = float(np.sum(source_q[list(idxs)]))
+
+#         neg_sum = float(np.sum(scm_atom[scm_atom < 0.0]))
+#         return float(abs(neg_sum))
+#     except Exception as e:
+#         logger.warning("SCM (PROPERMAB) computation failed: %s", e, exc_info=True)
+#         return None
+
+# SAP analog
 def sum_total_side_rel_within_cutoff(
     pdb_atoms: List[Atom],
     sasa_output_data: Dict[Tuple[str, int, str, str], Dict[str, Optional[float]]],
@@ -376,7 +696,7 @@ def sum_total_side_rel_within_cutoff(
                     pka = pka_output_data.get(key4) or pka_output_data.get(
                         (key4[0], key4[1], key4[2], "")
                     )
-                q = float(_residue_fractional_charge_at_pH(res_name, pka, pH))
+                q = float(_residue_fractional_charge_at_pH_for_charge_metrics(res_name, pka, pH))
                 if positive_charge_mode and negative_charge_mode:
                     weight = q
                 elif positive_charge_mode:
@@ -769,81 +1089,81 @@ def count_motif_overlapping(seq, motif: str) -> int:
 # Packing-related
 CONTACT_ORDER_CA_CUTOFF = 8.0
 
-def calculate_relative_contact_order(
-    pdb_path: str,
-    *,
-    ca_cutoff: float = CONTACT_ORDER_CA_CUTOFF,
-    min_sequence_separation: int = 0,
-    include_inter_chain: bool = False,
-    chain_order: Optional[List[str]] = None,
-) -> Optional[float]:
-    """
-    Relative contact order (CO):
+# def calculate_relative_contact_order(
+#     pdb_path: str,
+#     *,
+#     ca_cutoff: float = CONTACT_ORDER_CA_CUTOFF,
+#     min_sequence_separation: int = 0,
+#     include_inter_chain: bool = False,
+#     chain_order: Optional[List[str]] = None,
+# ) -> Optional[float]:
+#     """
+#     Relative contact order (CO):
 
-        CO = (1 / (N * L)) * Σ_{(i,j) in contacts} |i - j|
+#         CO = (1 / (N * L)) * Σ_{(i,j) in contacts} |i - j|
 
-    where:
-    - N is the number of (unique) residue-residue contacts
-    - |i-j| is the sequence separation in residues
-    - L is the total number of residues considered
+#     where:
+#     - N is the number of (unique) residue-residue contacts
+#     - |i-j| is the sequence separation in residues
+#     - L is the total number of residues considered
 
-    Contacts are defined by Cα–Cα distance <= ``ca_cutoff``. By default, only
-    intra-chain contacts contribute (``include_inter_chain=False``)
-    """
-    ctx = _get_structure_context(pdb_path)
-    ca_coords_dict = ctx.ca_coords
-    if not ca_coords_dict:
-        return None
+#     Contacts are defined by Cα–Cα distance <= ``ca_cutoff``. By default, only
+#     intra-chain contacts contribute (``include_inter_chain=False``)
+#     """
+#     ctx = _get_structure_context(pdb_path)
+#     ca_coords_dict = ctx.ca_coords
+#     if not ca_coords_dict:
+#         return None
 
-    chain_to_keys: Dict[str, List[ResKey4]] = defaultdict(list)
-    for k in ca_coords_dict.keys():
-        chain_to_keys[k[2]].append(k)
-    for chain, keys in list(chain_to_keys.items()):
-        chain_to_keys[chain] = sorted(keys, key=lambda x: (x[1], x[3]))
+#     chain_to_keys: Dict[str, List[ResKey4]] = defaultdict(list)
+#     for k in ca_coords_dict.keys():
+#         chain_to_keys[k[2]].append(k)
+#     for chain, keys in list(chain_to_keys.items()):
+#         chain_to_keys[chain] = sorted(keys, key=lambda x: (x[1], x[3]))
 
-    chains = chain_order or sorted(chain_to_keys.keys())
-    chains = [c for c in chains if c in chain_to_keys]
-    if not chains:
-        return None
+#     chains = chain_order or sorted(chain_to_keys.keys())
+#     chains = [c for c in chains if c in chain_to_keys]
+#     if not chains:
+#         return None
 
-    per_chain_index: Dict[ResKey4, int] = {}
-    global_index: Dict[ResKey4, int] = {}
-    global_keys: List[ResKey4] = []
-    offset = 0
-    for chain in chains:
-        keys = chain_to_keys.get(chain) or []
-        for local_i, key in enumerate(keys):
-            per_chain_index[key] = local_i
-            global_index[key] = offset + local_i
-            global_keys.append(key)
-        offset += len(keys)
+#     per_chain_index: Dict[ResKey4, int] = {}
+#     global_index: Dict[ResKey4, int] = {}
+#     global_keys: List[ResKey4] = []
+#     offset = 0
+#     for chain in chains:
+#         keys = chain_to_keys.get(chain) or []
+#         for local_i, key in enumerate(keys):
+#             per_chain_index[key] = local_i
+#             global_index[key] = offset + local_i
+#             global_keys.append(key)
+#         offset += len(keys)
 
-    L = len(global_keys)
-    if L < 2:
-        return None
+#     L = len(global_keys)
+#     if L < 2:
+#         return None
 
-    coords = np.array([ca_coords_dict[k] for k in global_keys], dtype=np.float64)
-    tree = cKDTree(coords)
+#     coords = np.array([ca_coords_dict[k] for k in global_keys], dtype=np.float64)
+#     tree = cKDTree(coords)
 
-    total_sep = 0.0
-    n_contacts = 0
-    for i, j in tree.query_pairs(r=ca_cutoff):
-        ki = global_keys[i]
-        kj = global_keys[j]
-        if not include_inter_chain and ki[2] != kj[2]:
-            continue
-        if include_inter_chain:
-            sep = abs(global_index[ki] - global_index[kj])
-        else:
-            sep = abs(per_chain_index[ki] - per_chain_index[kj])
-        if sep < int(min_sequence_separation):
-            continue
-        total_sep += float(sep)
-        n_contacts += 1
+#     total_sep = 0.0
+#     n_contacts = 0
+#     for i, j in tree.query_pairs(r=ca_cutoff):
+#         ki = global_keys[i]
+#         kj = global_keys[j]
+#         if not include_inter_chain and ki[2] != kj[2]:
+#             continue
+#         if include_inter_chain:
+#             sep = abs(global_index[ki] - global_index[kj])
+#         else:
+#             sep = abs(per_chain_index[ki] - per_chain_index[kj])
+#         if sep < int(min_sequence_separation):
+#             continue
+#         total_sep += float(sep)
+#         n_contacts += 1
 
-    if n_contacts == 0:
-        return None
-    return float(total_sep) / float(n_contacts * L)
+#     if n_contacts == 0:
+#         return None
+#     return float(total_sep) / float(n_contacts * L)
 
 def calculate_weighted_contact_number_average(
     pdb_path: str,
@@ -1014,16 +1334,157 @@ def summarize_dbscan_clusters(
     largest_cluster_size = max(cluster_sizes.values())
     n_clusters = len(cluster_sizes)
     total_rel_asa = float(sum(cluster_asa.values()))
-    return largest_cluster_size, n_clusters, total_rel_asa
+    n_cluster_members = int(sum(cluster_sizes.values()))
+    avg_rel_asa = float(total_rel_asa) / float(n_cluster_members) if n_cluster_members > 0 else 0.0
+    return largest_cluster_size, n_clusters, avg_rel_asa
 
 
 # `parse_sasa()` stores `*_rel` fields as fractions in [0, 1] (it divides by 100).
 # Defaults here should therefore use fraction-scale thresholds.
-SURFACE_EXPOSED_THRESHOLD_DEFAULT = 0.25
+SURFACE_EXPOSED_THRESHOLD_DEFAULT = 0.08
 RIPLEY_K_DISTANCE = 8.0
 RIPLEY_K_N_SAMPLES = 1000
+ANN_INDEX_N_PERMUTATIONS_DEFAULT = 1000
+# PROPERMAB `StructFeaturizer.ann_index` uses relative side-chain RSA >= 0.05;
+# our SASA parser stores relative values as fractions in [0, 1].
+ANN_INDEX_SASA_CUTOFF_DEFAULT = 0.05
 PSH_PAIR_RADIUS = 7.5
 CDR_VICINITY_RADIUS = 4.0
+
+# Residue sets for surface ANN index (match PROPERMAB `ann_index` prop filters).
+_ANN_INDEX_POSITIVE_RESIDUES = frozenset({"ARG", "LYS", "HIS"})
+_ANN_INDEX_NEGATIVE_RESIDUES = frozenset({"ASP", "GLU"})
+_ANN_INDEX_AROMATIC_RESIDUES = frozenset({"PHE", "TYR", "TRP"})
+
+
+def _ann_mean_nn_distance(coords: np.ndarray) -> float:
+    """
+    Mean distance from each point to its nearest *other* point (k=2 in KD-tree query).
+
+    Matches PROPERMAB ``AverageNearestNeighbor.compute_nn_mean_distance``.
+    """
+    coords = np.asarray(coords, dtype=np.float64)
+    n = int(coords.shape[0])
+    if n < 2:
+        return float("nan")
+    tree = cKDTree(coords)
+    nn_distances: List[float] = []
+    for point in coords:
+        dists, _ = tree.query(point, k=2)
+        nn_distances.append(float(dists[1]))
+    return float(np.mean(nn_distances))
+
+
+def _ann_index_ratio(
+    feature_coords: np.ndarray,
+    allowed_coords: np.ndarray,
+    n_permutations: int,
+    rng: np.random.Generator,
+) -> Optional[float]:
+    """
+    ann_index = d_o_bar / d_e_bar with null from random locations among allowed_coords.
+
+    Matches PROPERMAB ``AverageNearestNeighbor``: ``rng.choice(n_allow, size=n_feat)``
+    uses replacement (default), so the null can place multiple features at the same
+    exposed Cα location.
+    """
+    feature_coords = np.asarray(feature_coords, dtype=np.float64)
+    allowed_coords = np.asarray(allowed_coords, dtype=np.float64)
+    n_feat = int(feature_coords.shape[0])
+    n_allow = int(allowed_coords.shape[0])
+    if n_feat < 2 or n_allow < 2:
+        return None
+
+    d_o = _ann_mean_nn_distance(feature_coords)
+    if math.isnan(d_o) or d_o <= 0.0:
+        return None
+
+    d_e_null: List[float] = []
+    for _ in range(int(n_permutations)):
+        pick = rng.choice(n_allow, size=n_feat, replace=True)
+        sample = allowed_coords[pick]
+        d_e_null.append(_ann_mean_nn_distance(sample))
+
+    d_e = float(np.mean(d_e_null)) if d_e_null else float("nan")
+    if math.isnan(d_e) or d_e <= 0.0:
+        return None
+    return float(d_o / d_e)
+
+
+def compute_surface_ann_index_descriptors(
+    pdb_atoms: List[Atom],
+    sasa_output_data: Dict[ResKey4, SASAEntry],
+    sasa_cutoff: float = ANN_INDEX_SASA_CUTOFF_DEFAULT,
+    n_permutations: int = ANN_INDEX_N_PERMUTATIONS_DEFAULT,
+    random_seed: Optional[int] = None,
+) -> Dict[str, Optional[float]]:
+    """
+    Average Nearest Neighbor (ANN) index for positive, negative, and aromatic residues
+    on the solvent-exposed surface (PROPERMAB-style).
+
+    For each property, coordinates are Cα of exposed residues matching the type.
+    The null expectation ``d_e`` is estimated by repeatedly sampling the same number
+    of points uniformly at random from the set of Cα positions of *all* exposed
+    residues, **with replacement** (matching PROPERMAB's ``rng.choice`` default).
+
+    Returns
+    -------
+    dict
+        ``pos_ann_index``, ``neg_ann_index``, ``aromatic_ann_index`` — each is
+        ``d_o_mean / d_e_mean`` or ``None`` if undefined (too few points, etc.).
+    """
+    result: Dict[str, Optional[float]] = {
+        "pos_ann_index": None,
+        "neg_ann_index": None,
+        "aromatic_ann_index": None,
+    }
+    if not sasa_output_data or not pdb_atoms:
+        return result
+
+    ca_by_res: Dict[ResKey4, Tuple[float, float, float]] = {}
+    for atom in pdb_atoms:
+        if (atom.name or "").strip() != "CA":
+            continue
+        key = residue_key_from_atom(atom)
+        ca_by_res[key] = (atom.x, atom.y, atom.z)
+
+    residue_exposure = get_exposed_residues(sasa_output_data, float(sasa_cutoff))
+    exposed_with_ca: List[ResKey4] = [
+        k for k, exposed in residue_exposure.items() if exposed and k in ca_by_res
+    ]
+    if len(exposed_with_ca) < 2:
+        return result
+
+    allowed_coords = np.array([ca_by_res[k] for k in exposed_with_ca], dtype=np.float64)
+    rng = np.random.default_rng(random_seed)
+
+    def _coords_for(residue_set: Set[str]) -> np.ndarray:
+        pts: List[Tuple[float, float, float]] = []
+        for k in exposed_with_ca:
+            res_name = (k[0] or "").strip().upper()
+            if res_name in residue_set:
+                pts.append(ca_by_res[k])
+        return np.array(pts, dtype=np.float64) if pts else np.empty((0, 3), dtype=np.float64)
+
+    pos_c = _coords_for(_ANN_INDEX_POSITIVE_RESIDUES)
+    neg_c = _coords_for(_ANN_INDEX_NEGATIVE_RESIDUES)
+    aro_c = _coords_for(_ANN_INDEX_AROMATIC_RESIDUES)
+
+    if pos_c.shape[0] >= 2:
+        result["pos_ann_index"] = _ann_index_ratio(
+            pos_c, allowed_coords, n_permutations, rng
+        )
+    if neg_c.shape[0] >= 2:
+        result["neg_ann_index"] = _ann_index_ratio(
+            neg_c, allowed_coords, n_permutations, rng
+        )
+    if aro_c.shape[0] >= 2:
+        result["aromatic_ann_index"] = _ann_index_ratio(
+            aro_c, allowed_coords, n_permutations, rng
+        )
+
+    return result
+
 
 def ripley_k_statistic(
     obs_coords,

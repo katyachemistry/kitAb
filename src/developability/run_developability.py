@@ -31,8 +31,10 @@ from developability.descriptors import (
     compute_hbond_density_raw,
     largest_hbond_component_size,
     net_charge_from_pka,
+    # net_charge_from_seq,
     pi_from_pka,
     scm_score_from_pka,
+    # scm_score_from_pka_propermab,
     sum_total_side_rel_within_cutoff,
     calculate_weighted_contact_number_average,
     parse_dssp,
@@ -43,9 +45,11 @@ from developability.descriptors import (
     _get_atoms_for_path,
     get_inter_chain_interface_residues,
     compute_surface_ripley_descriptors,
+    compute_surface_ann_index_descriptors,
     compute_surface_pair_descriptors,
-    calculate_relative_contact_order,
+    # calculate_relative_contact_order,
     compute_dipole_moment_magnitude,
+    # compute_hydrophobic_moment_magnitude,
     compute_inter_chain_buried_sasa,
     NEGATIVE_CHARGED_RESIDUES,
     POSITIVE_CHARGED_RESIDUES,
@@ -60,6 +64,7 @@ from developability.descriptors import (
 from developability.descriptors import GLN_ASN_RESIDUES, KYTE_DOOLITTLE
 from developability.structure_context import StructureContext
 from developability.descriptor_utils import (
+    CDR_RANGES_CA,
     get_residue_region_map,
     get_exposed_residues,
     get_aromatic_residue_keys,
@@ -69,7 +74,7 @@ from developability.descriptor_utils import (
 )
 from utils.parsers import parse_pka, get_pka_file_path, residue_key_from_atom, get_sasa_total
 
-NET_CHARGE_PHS = [4, 5, 6, 7, 8, 9, 10]
+NET_CHARGE_PHS = [3, 7.5]
 
 
 def _to_4(key):
@@ -225,8 +230,12 @@ def main():
             buried_keys = set(ctx.sasa_residue.keys()) - exposed_keys
         # CDR composition (residue name = key[0])
         n_cdr = len(cdr_keys)
+        cdr3_start, cdr3_end = CDR_RANGES_CA[2]
+        cdr3_length = sum(
+            1 for k in cdr_keys
+            if cdr3_start <= int(k[1]) <= cdr3_end
+        )
         if n_cdr > 0:
-            cdr_total_length = n_cdr
             fraction_gly_CDRs = sum(1 for k in cdr_keys if k[0] == "GLY") / n_cdr
             fraction_pro_CDRs = sum(1 for k in cdr_keys if k[0] == "PRO") / n_cdr
             fraction_aromatic_CDRs = sum(1 for k in cdr_keys if k[0] in AROMATIC_RESIDUES) / n_cdr
@@ -235,7 +244,6 @@ def main():
             polar_cdr = sum(1 for k in cdr_keys if k[0] in POLAR_RESIDUES)
             ratio_hydrophobic_to_polar_CDRs = (hydro_cdr / polar_cdr) if polar_cdr > 0 else 0.0
         else:
-            cdr_total_length = 0
             fraction_gly_CDRs = fraction_pro_CDRs = fraction_aromatic_CDRs = fraction_gln_asn_CDRs = 0.0
             ratio_hydrophobic_to_polar_CDRs = 0.0
 
@@ -272,11 +280,29 @@ def main():
             if sasa_failed
             else sum(KYTE_DOOLITTLE.get(k[0], 0.0) for k in ctx.sasa_residue.keys())
         )
-        kyte_doolittle_mean_all = (
+
+        # Kyte-Doolittle average weighted by relative side-chain ASA.
+        # We follow the requested normalization: divide by total residue count (n_total),
+        # not by sum of ASA weights.
+        kyte_doolittle_avg_weighted_by_rel_asa_all = (
             None
-            if sasa_failed or not n_total
-            else (float(kyte_doolittle_sum_all) / n_total)  # type: ignore[arg-type]
+            if sasa_failed
+            else (
+                sum(
+                    KYTE_DOOLITTLE.get(k[0], 0.0)
+                    * (float(getattr(ctx.sasa_residue[k], "total_side_rel", 0.0)) or 0.0)
+                    for k in ctx.sasa_residue.keys()
+                )
+                / float(n_total)
+                if n_total
+                else 0.0
+            )
         )
+        # kyte_doolittle_mean_all = (
+        #     None
+        #     if sasa_failed or not n_total
+        #     else (float(kyte_doolittle_sum_all) / n_total)  # type: ignore[arg-type]
+        # )
 
         hydrophobic_keys = get_residue_keys_by_type(
             args.pdb_file, HYDROPHOBIC_RESIDUES
@@ -569,6 +595,7 @@ def main():
 
         # Ripley K, PSH, PPC, PNC
         ripley = compute_surface_ripley_descriptors(pdb_atoms, ctx.sasa_residue, pka_output_data, args.pH)
+        ann_idx = compute_surface_ann_index_descriptors(pdb_atoms, ctx.sasa_residue)
         pairs = compute_surface_pair_descriptors(
             pdb_atoms,
             ctx.sasa_residue,
@@ -581,6 +608,9 @@ def main():
         ripley_k_aromatic = ripley["ripley_k_aromatic"]
         ripley_k_hydrophobic = ripley["ripley_k_hydrophobic"]
         ripley_k_polar = ripley["ripley_k_polar"]
+        pos_ann_index = ann_idx["pos_ann_index"]
+        neg_ann_index = ann_idx["neg_ann_index"]
+        aromatic_ann_index = ann_idx["aromatic_ann_index"]
         psh_all_surface = pairs["psh_all_surface"]
         psh_cdr_vicinity = pairs["psh_cdr_vicinity"]
         ppc_all_surface = pairs["ppc_all_surface"]
@@ -597,7 +627,7 @@ def main():
         weights_raw, counts = compute_hbond_density_raw(args.pdb_file, args.sasa_file)
         number_of_hbonds = sum(counts.values()) // 2 if counts else 0
         _n_res = _count_residues_in_pdb(args.pdb_file)
-        mean_hbond_degree = (2.0 * number_of_hbonds / _n_res) if _n_res > 0 else 0.0
+        # mean_hbond_degree = (2.0 * number_of_hbonds / _n_res) if _n_res > 0 else 0.0
 
         avg_hbond = calculate_global_hbond_density_average(
             args.pdb_file,
@@ -653,59 +683,132 @@ def main():
 
         # Dipole moment magnitude (structure-level)
         dipole_moment_magnitude = compute_dipole_moment_magnitude(pdb_atoms, pka_output_data, args.pH)
+        # Hydrophobic moment (PROPERMAB-style: ‖Σ h_i r_i‖; optional 1/N via keyword in descriptors)
+        # hydrophobic_moment_magnitude = compute_hydrophobic_moment_magnitude(pdb_atoms)
 
         # Relative contact order (CO) from Cα contacts
         # - "all" is intra-chain only across all chains (H+L for antibodies)
         # - heavy/light are computed within each chain
-        contact_order_all = calculate_relative_contact_order(
-            args.pdb_file,
-            ca_cutoff=8.0,
-            min_sequence_separation=0,
-            include_inter_chain=False,
-            chain_order=[args.heavy_chain, args.light_chain],
-        )
-        contact_order_heavy = calculate_relative_contact_order(
-            args.pdb_file,
-            ca_cutoff=8.0,
-            min_sequence_separation=0,
-            include_inter_chain=False,
-            chain_order=[args.heavy_chain],
-        )
-        contact_order_light = calculate_relative_contact_order(
-            args.pdb_file,
-            ca_cutoff=8.0,
-            min_sequence_separation=0,
-            include_inter_chain=False,
-            chain_order=[args.light_chain],
-        )
+        # contact_order_all = calculate_relative_contact_order(
+        #     args.pdb_file,
+        #     ca_cutoff=8.0,
+        #     min_sequence_separation=0,
+        #     include_inter_chain=False,
+        #     chain_order=[args.heavy_chain, args.light_chain],
+        # )
+        # contact_order_heavy = calculate_relative_contact_order(
+        #     args.pdb_file,
+        #     ca_cutoff=8.0,
+        #     min_sequence_separation=0,
+        #     include_inter_chain=False,
+        #     chain_order=[args.heavy_chain],
+        # )
+        # contact_order_light = calculate_relative_contact_order(
+        #     args.pdb_file,
+        #     ca_cutoff=8.0,
+        #     min_sequence_separation=0,
+        #     include_inter_chain=False,
+        #     chain_order=[args.light_chain],
+        # )
 
         # net charge at different pHs; pI
+        seq_heavy, index_map_heavy = get_full_sequence_with_index_map_from_pdb(
+            args.pdb_file, chain_order=[args.heavy_chain]
+        )
+        seq_light, index_map_light = get_full_sequence_with_index_map_from_pdb(
+            args.pdb_file, chain_order=[args.light_chain]
+        )
+        seq_full = (seq_heavy or "") + (seq_light or "")
         net_charge_by_pH = {}
-        net_charge = net_charge_from_pka(pka_output_data, args.pH)
+        net_charge = net_charge_from_pka(pka_output_data, args.pH)  # PropKa-based
+        # net_charge = net_charge_from_seq(seq_full, args.pH)
+
+        cdr_keys_norm = {_to_4(k) for k in cdr_keys}
+
+        def _subsequence_for_keyset(
+            seq: str,
+            index_map: Dict[Tuple[str, int, str, str], int],
+            keys_norm: Set[Tuple[str, int, str, str]],
+        ) -> str:
+            """1-letter subsequence from seq for residues whose key is in keys_norm (chain order preserved)."""
+            if not seq or not index_map:
+                return ""
+            indices = sorted(
+                {
+                    int(idx)
+                    for key, idx in index_map.items()
+                    if _to_4(key) in keys_norm
+                    and idx is not None
+                    and 0 <= int(idx) < len(seq)
+                }
+            )
+            return "".join(seq[i] for i in indices)
+
+        pka_output_data_cdr = {
+            k: v for k, v in pka_output_data.items() if _to_4(k) in cdr_keys_norm
+        }
+        net_charge_cdr_from_pka = net_charge_from_pka(pka_output_data_cdr, args.pH)
+        exposed_keys_norm = {_to_4(k) for k in exposed_keys}
+        pka_output_data_exposed = {
+            k: v for k, v in pka_output_data.items() if _to_4(k) in exposed_keys_norm
+        }
+        exposed_net_charge = net_charge_from_pka(pka_output_data_exposed, args.pH)
+        pka_output_data_exposed_cdr = {
+            k: v
+            for k, v in pka_output_data.items()
+            if _to_4(k) in exposed_keys_norm and _to_4(k) in cdr_keys_norm
+        }
+        exposed_net_charge_cdr = net_charge_from_pka(pka_output_data_exposed_cdr, args.pH)
+
         protein_pi = pi_from_pka(pka_output_data)
         for ph in NET_CHARGE_PHS:
-            net_charge_by_pH[ph] = net_charge_from_pka(pka_output_data, ph)
+            net_charge_by_pH[ph] = net_charge_from_pka(pka_output_data, ph)  # PropKa-based
+            # net_charge_by_pH[ph] = net_charge_from_seq(seq_full, ph)
             
         # SCM score (requires SASA + pKa)
         weighted_scm_score_by_pH = {}
         for ph in NET_CHARGE_PHS:
             weighted_scm_score_by_pH[ph] = scm_score_from_pka(args.pdb_file, args.sasa_file, pka_output_data, ph, d_cutoff=10.0, sasa_cutoff=0.25)
+        unweighted_scm_score_by_pH = {}
+        for ph in NET_CHARGE_PHS:
+            unweighted_scm_score_by_pH[ph] = scm_score_from_pka(args.pdb_file, args.sasa_file, pka_output_data, ph, d_cutoff=10.0, sasa_cutoff=0.25, sasa_weighting=False)
+        scm_propermab_score_by_pH = {}
+        # for ph in NET_CHARGE_PHS:
+        #     scm_propermab_score_by_pH[ph] = scm_score_from_pka_propermab(
+        #         args.pdb_file,
+        #         args.sasa_file,
+        #         pka_output_data,
+        #         ph,
+        #         d_cutoff=10.0,
+        #         chain_ids=(args.heavy_chain, args.light_chain),
+        #     )
 
         # Per-chain net charge at pH 7 (heavy/light)
         _pka_heavy = {k: v for k, v in pka_output_data.items() if k[2] == args.heavy_chain}
         _pka_light = {k: v for k, v in pka_output_data.items() if k[2] == args.light_chain}
-        heavy_charge_pH7 = net_charge_from_pka(_pka_heavy, 7.0)
-        light_charge_pH7 = net_charge_from_pka(_pka_light, 7.0)
+        heavy_charge = net_charge_from_pka(_pka_heavy, 7.5)
+        light_charge = net_charge_from_pka(_pka_light, 7.5)
+        # heavy_charge_pH74 = net_charge_from_seq(seq_heavy or "", 7.4)
+        # light_charge_pH74 = net_charge_from_seq(seq_light or "", 7.4)
+        asymmetry_score = heavy_charge * light_charge
 
         # SAP-like structure-level metrics (multiple weighting modes)
         sasa_output_data = ctx.sasa_output
         _sasa = ctx.sasa_residue
-        _buried_tsr = [getattr(_sasa[k], "total_side_rel", None) for k in buried_keys if k in _sasa]
-        _exposed_tsr = [getattr(_sasa[k], "total_side_rel", None) for k in exposed_keys if k in _sasa]
+        _buried_tsr = [
+            getattr(_sasa[k], "total_side_abs", None) for k in buried_keys if k in _sasa
+        ]
+        _exposed_tsr = [
+            getattr(_sasa[k], "total_side_abs", None) for k in exposed_keys if k in _sasa
+        ]
         _buried_tsr = [v for v in _buried_tsr if v is not None]
         _exposed_tsr = [v for v in _exposed_tsr if v is not None]
-        avg_total_side_rel_buried = sum(_buried_tsr) / len(_buried_tsr) if _buried_tsr else 0.0
-        avg_total_side_rel_exposed = sum(_exposed_tsr) / len(_exposed_tsr) if _exposed_tsr else 0.0
+        avg_total_side_abs_buried = (
+            sum(_buried_tsr) / len(_buried_tsr) if _buried_tsr else 0.0
+        )
+        avg_total_side_abs_exposed = (
+            sum(_exposed_tsr) / len(_exposed_tsr) if _exposed_tsr else 0.0
+        )
 
         # total_side_rel sums by residue type (all / buried / exposed)
         def _tsr_sum(keys, res_set):
@@ -723,10 +826,12 @@ def main():
         ]
         total_side_rel_sums = {}
         for name, res_set in _cat:
-            total_side_rel_sums[f"{name}_total_side_rel_sum"] = _tsr_sum(_all_keys, res_set)
-            total_side_rel_sums[f"{name}_buried_total_side_rel_sum"] = _tsr_sum(buried_keys, res_set)
-            total_side_rel_sums[f"{name}_exposed_total_side_rel_sum"] = _tsr_sum(exposed_keys, res_set)
-            total_side_rel_sums[f"{name}_inter_chain_total_side_rel_sum"] = _tsr_sum(interface_keys, res_set)
+            # total_side_rel_sums[f"{name}_total_side_rel_sum"] = _tsr_sum(_all_keys, res_set)
+            if not name in ['aromatic', 'hydrophobic']:
+                total_side_rel_sums[f"{name}_buried_total_side_rel_sum"] = _tsr_sum(buried_keys, res_set)
+            if not name in ['polar', 'positive']:
+                total_side_rel_sums[f"{name}_exposed_total_side_rel_sum"] = _tsr_sum(exposed_keys, res_set)
+            # total_side_rel_sums[f"{name}_inter_chain_total_side_rel_sum"] = _tsr_sum(interface_keys, res_set)
 
         def _safe_ratio(numer: Optional[float], denom: Optional[float]) -> Optional[float]:
             if numer is None or denom is None:
@@ -828,27 +933,27 @@ def main():
         (
             neg_largest,
             neg_n_clusters,
-            neg_total_rel_asa,
+            neg_avg_rel_asa,
         ) = neg_exposed_cluster_summary
         (
             pos_largest,
             pos_n_clusters,
-            pos_total_rel_asa,
+            pos_avg_rel_asa,
         ) = pos_exposed_cluster_summary
         (
             aromatic_largest,
             aromatic_n_clusters,
-            aromatic_total_rel_asa,
+            aromatic_avg_rel_asa,
         ) = aromatic_exposed_cluster_summary
         (
             hydro_largest,
             hydro_n_clusters,
-            hydro_total_rel_asa,
+            hydro_avg_rel_asa,
         ) = hydro_exposed_cluster_summary
         (
             polar_largest,
             polar_n_clusters,
-            polar_total_rel_asa,
+            polar_avg_rel_asa,
         ) = polar_exposed_cluster_summary
         aggregated = {}
 
@@ -858,26 +963,29 @@ def main():
                 "cluster_metrics": {
                     # DBSCAN cluster summaries
                     "negative_exposed_cluster_largest_size": neg_largest,
-                    "negative_exposed_cluster_n_clusters": neg_n_clusters,
-                    "negative_exposed_cluster_total_side_rel": neg_total_rel_asa,
+                    # "negative_exposed_cluster_n_clusters": neg_n_clusters,
+                    "negative_exposed_cluster_avg_rel_asa": neg_avg_rel_asa,
                     "positive_exposed_cluster_largest_size": pos_largest,
-                    "positive_exposed_cluster_n_clusters": pos_n_clusters,
-                    "positive_exposed_cluster_total_side_rel": pos_total_rel_asa,
+                    # "positive_exposed_cluster_n_clusters": pos_n_clusters,
+                    "positive_exposed_cluster_avg_rel_asa": pos_avg_rel_asa,
                     "aromatic_exposed_cluster_largest_size": aromatic_largest,
-                    "aromatic_exposed_cluster_n_clusters": aromatic_n_clusters,
-                    "aromatic_exposed_cluster_total_side_rel": aromatic_total_rel_asa,
+                    # "aromatic_exposed_cluster_n_clusters": aromatic_n_clusters,
+                    "aromatic_exposed_cluster_avg_rel_asa": aromatic_avg_rel_asa,
                     "hydrophobic_exposed_cluster_largest_size": hydro_largest,
-                    "hydrophobic_exposed_cluster_n_clusters": hydro_n_clusters,
-                    "hydrophobic_exposed_cluster_total_side_rel": hydro_total_rel_asa,
+                    # "hydrophobic_exposed_cluster_n_clusters": hydro_n_clusters,
+                    "hydrophobic_exposed_cluster_avg_rel_asa": hydro_avg_rel_asa,
                     "polar_exposed_cluster_largest_size": polar_largest,
-                    "polar_exposed_cluster_n_clusters": polar_n_clusters,
-                    "polar_exposed_cluster_total_side_rel": polar_total_rel_asa,
+                    # "polar_exposed_cluster_n_clusters": polar_n_clusters,
+                    "polar_exposed_cluster_avg_rel_asa": polar_avg_rel_asa,
                     # Ripley K and pairwise surface descriptors
                     "ripley_k_negative": ripley_k_negative,
                     "ripley_k_positive": ripley_k_positive,
                     "ripley_k_aromatic": ripley_k_aromatic,
                     "ripley_k_hydrophobic": ripley_k_hydrophobic,
                     "ripley_k_polar": ripley_k_polar,
+                    "pos_ann_index": pos_ann_index,
+                    "neg_ann_index": neg_ann_index,
+                    "aromatic_ann_index": aromatic_ann_index,
                     # PPC/PNC/PSH
                     "psh_all_surface_exposed": psh_all_surface,
                     "psh_cdr_vicinity": psh_cdr_vicinity,
@@ -889,28 +997,28 @@ def main():
                 # H-bond density / energy averages, grouped separately
                 "h_bonds_metrics": {
                     "number_of_hbonds": number_of_hbonds,
-                    "mean_hbond_degree": mean_hbond_degree,
+                    # "mean_hbond_degree": mean_hbond_degree,
                     "largest_hbond_component_size": largest_hbond_component_size_val,
                     "avg_hbond_all": avg_hbond,
                     "avg_hbond_cdr": avg_hbond_cdr,
                     "avg_hbond_buried_over_all": avg_hbond_buried_over_all,
                     "avg_hbond_beta_over_all": avg_hbond_beta_over_all,
                     "avg_hbond_inter_chain": avg_hbond_inter_chain,
-                    "avg_hbond_energy_all": avg_hbond_energy,
-                    "avg_hbond_energy_buried_over_all": avg_hbond_energy_buried_over_all,
-                    "avg_hbond_energy_beta_over_all": avg_hbond_energy_beta_over_all,
+                    # "avg_hbond_energy_all": avg_hbond_energy,
+                    # "avg_hbond_energy_buried_over_all": avg_hbond_energy_buried_over_all,
+                    # "avg_hbond_energy_beta_over_all": avg_hbond_energy_beta_over_all,
                     "avg_hbond_energy_dssp_weighted_all": avg_hbond_energy_dssp_weighted,
                     "avg_hbond_energy_dssp_weighted_buried_over_all": avg_hbond_energy_dssp_weighted_buried_over_all,
                     "avg_hbond_energy_dssp_weighted_beta_over_all": avg_hbond_energy_dssp_weighted_beta_over_all,
-                    "avg_hbond_energy_dssp_unweighted_all": avg_hbond_energy_dssp_unweighted,
-                    "avg_hbond_energy_dssp_unweighted_buried_over_all": avg_hbond_energy_dssp_unweighted_buried_over_all,
-                    "avg_hbond_energy_dssp_unweighted_beta_over_all": avg_hbond_energy_dssp_unweighted_beta_over_all,
+                    # "avg_hbond_energy_dssp_unweighted_all": avg_hbond_energy_dssp_unweighted,
+                    # "avg_hbond_energy_dssp_unweighted_buried_over_all": avg_hbond_energy_dssp_unweighted_buried_over_all,
+                    # "avg_hbond_energy_dssp_unweighted_beta_over_all": avg_hbond_energy_dssp_unweighted_beta_over_all,
                 },
                 # Aromatic / hydrophobic density metrics
                 "density_metrics": {
                     "avg_aromatic_all": avg_aromatic,
                     "avg_hydrophobic_all": avg_hydrophobic,
-                    "ratio_avg_hydrophobic_to_negative_positive_polar_all": ratio_avg_hydrophobic_to_negative_positive_polar_all,
+                    # "ratio_avg_hydrophobic_to_negative_positive_polar_all": ratio_avg_hydrophobic_to_negative_positive_polar_all,
                     "avg_aromatic_buried_over_all": avg_aromatic_buried_over_all,
                     "avg_hydrophobic_buried_over_all": avg_hydrophobic_buried_over_all,
                     "avg_aromatic_cdr_over_cdr": avg_aromatic_cdr_over_cdr,
@@ -924,7 +1032,7 @@ def main():
                 },
                 # CDR composition
                 "cdr_metrics": {
-                    "cdr_total_length": cdr_total_length,
+                    "cdr3_length": cdr3_length,
                     "fraction_gly_CDRs": fraction_gly_CDRs,
                     "fraction_pro_CDRs": fraction_pro_CDRs,
                     "fraction_aromatic_CDRs": fraction_aromatic_CDRs,
@@ -932,26 +1040,26 @@ def main():
                     "ratio_hydrophobic_to_polar_CDRs": ratio_hydrophobic_to_polar_CDRs,
                 },
                 "beta_sheet_metrics": {
-                    "fraction_hydrophobic_beta_sheet": fraction_hydrophobic_beta_sheet,
+                    # "fraction_hydrophobic_beta_sheet": fraction_hydrophobic_beta_sheet,
                     "fraction_gln_asn_beta_sheet": fraction_gln_asn_beta_sheet,
                     "hydrophobic_beta_sheet_kyte_doolittle_sum": hydrophobic_beta_sheet_kyte_doolittle_sum,
                 },
                 "kyte_doolittle_metrics": {
                     "kyte_doolittle_sum_all": kyte_doolittle_sum_all,
-                    "kyte_doolittle_mean_all": kyte_doolittle_mean_all,
+                    "kyte_doolittle_avg_weighted_by_rel_asa_all": kyte_doolittle_avg_weighted_by_rel_asa_all,
                 },
                 # WCN metrics
                 "wcn_metrics": {
-                    "avg_wcn_all": avg_wcn,
-                    "avg_wcn_cdr_over_cdr": avg_wcn_cdr_over_cdr,
-                    "avg_wcn_buried_over_all": avg_wcn_buried_over_all,
+                    # "avg_wcn_all": avg_wcn,
+                    # "avg_wcn_cdr_over_cdr": avg_wcn_cdr_over_cdr,
+                    # "avg_wcn_buried_over_all": avg_wcn_buried_over_all,
                     "avg_wcn_interface_over_all": avg_wcn_interface_over_all,
                 },
-                "topology_metrics": {
-                    "relative_contact_order_all": contact_order_all,
-                    "relative_contact_order_heavy": contact_order_heavy,
-                    "relative_contact_order_light": contact_order_light,
-                },
+                # "topology_metrics": {
+                    # "relative_contact_order_all": contact_order_all,
+                    # "relative_contact_order_heavy": contact_order_heavy,
+                    # "relative_contact_order_light": contact_order_light,
+                # },
                 # Salt-bridge density averages (same partitions as printed above)
                 "salt_bridges_metrics": {
                     "number_of_salt_bridges": number_of_salt_bridges,
@@ -964,17 +1072,27 @@ def main():
                 # Charge-related metrics
                 "charge_metrics": {
                     "dipole_moment_magnitude": dipole_moment_magnitude,
+                    # "hydrophobic_moment_magnitude": hydrophobic_moment_magnitude,
                     "protein_pi": protein_pi,
                     "net_charge_by_pH": net_charge_by_pH,
+                    "net_charge_cdr_from_pka": net_charge_cdr_from_pka,
+                    # "net_charge_cdr_from_seq": net_charge_cdr_from_seq,
+                    "exposed_net_charge": exposed_net_charge,
+                    "exposed_net_charge_cdr": exposed_net_charge_cdr,
+                    # "exposed_net_charge_from_seq": exposed_net_charge_from_seq,
+                    # "exposed_net_charge_cdr_from_seq": exposed_net_charge_cdr_from_seq,
                     "weighted_scm_score_by_pH": weighted_scm_score_by_pH,
-                    "heavy_charge_pH7": heavy_charge_pH7,
-                    "light_charge_pH7": light_charge_pH7,
+                    "unweighted_scm_score_by_pH": unweighted_scm_score_by_pH,
+                    "scm_propermab_score_by_pH": scm_propermab_score_by_pH,
+                    "heavy_charge_pH_7_5": heavy_charge,
+                    "light_charge_pH_7_5": light_charge,
                     "sap_pos_charge_score": _scalar_or_dict_sum(sap_pos_charge_score),
                     "sap_neg_charge_score": _scalar_or_dict_sum(sap_neg_charge_score),
+                    "asymmetry_score": asymmetry_score,
                 },
                 "buried_metrics": {
-                    "fraction_buried": fraction_buried,
-                    "fraction_hydrophobic_buried": fraction_hydrophobic_buried,
+                    # "fraction_buried": fraction_buried,
+                    # "fraction_hydrophobic_buried": fraction_hydrophobic_buried,
                     "fraction_negative_buried": fraction_negative_buried,
                     "fraction_positive_buried": fraction_positive_buried,
                 },
@@ -984,10 +1102,10 @@ def main():
                 },
                 "inter_chain_total_side_rel_sums": inter_chain_total_side_rel_sums,
                 "other_sasa_metrics": {
-                    "total_asa": total_asa,
+                    # "total_asa": total_asa,
                     "inter_chain_buried_sasa": inter_chain_buried_sasa,
-                    "avg_total_side_rel_buried": avg_total_side_rel_buried,
-                    "avg_total_side_rel_exposed": avg_total_side_rel_exposed,
+                    "avg_total_side_abs_buried": avg_total_side_abs_buried,
+                    "avg_total_side_abs_exposed": avg_total_side_abs_exposed,
                 }
             }
         )
@@ -1078,9 +1196,7 @@ def main():
                 inter_frags_flat = _flatten_fragments(fragments_inter)
 
                 for motif, key in [
-                    ("NG", "AsnGly"),
                     ("ND", "AsnAsp"),
-                    ("DG", "AspGly"),
                     ("DS", "AspSer"),
                     ("DD", "AspAsp"),
                     ("DT", "AspThr"),
@@ -1089,9 +1205,20 @@ def main():
                     ("RK", "ArgLys"),
                 ]:
                     sequence_motives[f"n_motif_{key}_CDRs"] = count_motif_overlapping(cdr_frags_flat, motif)
-                    sequence_motives[f"n_motif_{key}_beta_sheet"] = count_motif_overlapping(beta_frags_flat, motif)
                     sequence_motives[f"n_motif_{key}_exposed"] = count_motif_overlapping(exposed_frags_flat, motif)
+                sequence_motives[f"n_motif_AsnGly_CDRs"] = count_motif_overlapping(cdr_frags_flat, "NG")
+                sequence_motives[f"n_motif_AspGly_CDRs"] = count_motif_overlapping(cdr_frags_flat, "DG")
+
+                for motif, key in [
+                    ("NG", "AsnGly"),
+                    ("DG", "AspGly"),
+                    ("DS", "AspSer"),
+                    ("DT", "AspThr"),
+                ]:
+                    sequence_motives[f"n_motif_{key}_beta_sheet"] = count_motif_overlapping(beta_frags_flat, motif)
                     sequence_motives[f"n_motif_{key}_inter_chain"] = count_motif_overlapping(inter_frags_flat, motif)
+                sequence_motives[f"n_motif_AspAsp_inter_chain"] = count_motif_overlapping(inter_frags_flat, "DD")
+                sequence_motives[f"n_motif_AspGlu_inter_chain"] = count_motif_overlapping(inter_frags_flat, "DE")
 
                 # Structure-level motif "side-ASA sum" (relative side SASA, percent-scaled):
                 # for each occurrence of a motif (e.g. "DG"), take residues i and i+1 in the

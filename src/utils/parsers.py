@@ -9,7 +9,12 @@ import logging
 _RESNUM_PATTERN = re.compile(r"^(\d+)([A-Za-z])?$")
 hbond_pattern = re.compile(r"(-?\d+),\s*(-?\d+\.?\d*)")
 
-CHARGED_RESIDUE_TYPES = frozenset({"ASP", "GLU", "LYS", "ARG", "HIS"})
+# Residues we extract pKa values for from PropKa output.
+#
+# Note: this is intentionally broader than the residue/atom sets used for
+# geometric salt-bridge detection. Charge/pI counting and salt-bridge
+# geometry are handled separately elsewhere in the pipeline.
+CHARGED_RESIDUE_TYPES = frozenset({"ASP", "GLU", "LYS", "ARG", "HIS", "TYR", "CYS"})
 
 _PKA_CACHE: Dict[Tuple[str, int], Dict[Tuple[str, int, str, str], float]] = {}
 
@@ -521,11 +526,20 @@ def parse_pka(
                     if len(line) < 15:
                         continue
 
-                    residue_name = line[0:3].strip()
+                    # PropKa output has fixed-width columns, but whitespace
+                    # padding differs between residue types and pKa magnitudes.
+                    # Using split() avoids column-slicing errors like:
+                    #   99.99 -> 9.99 and 11.87 -> 1.87
+                    # which severely distorts titration/charge calculations.
+                    parts = line.split()
+                    if len(parts) < 4:
+                        continue
+
+                    residue_name = parts[0].strip()
                     if not residue_name or residue_name not in CHARGED_RESIDUE_TYPES:
                         continue
 
-                    residue_num_str = line[4:8].strip()
+                    residue_num_str = parts[1].strip()
                     if not residue_num_str:
                         continue
                     match = _RESNUM_PATTERN.match(residue_num_str)
@@ -534,19 +548,11 @@ def parse_pka(
                     residue_number = int(match.group(1))
                     insertion_code = (match.group(2) or "")
 
-                    if len(line) < 11:
-                        continue
-                    chain = line[10:11].strip()
-                    if not chain and len(line) >= 9:
-                        chain = line[8:9].strip()
+                    chain = parts[2].strip()
                     if not chain:
                         continue
 
-                    if len(line) < 18:
-                        continue
-                    pka_str = line[12:18].strip()
-                    if not pka_str and len(line) >= 17:
-                        pka_str = line[10:17].strip()
+                    pka_str = parts[3].strip()
                     if not pka_str:
                         continue
                     try:
