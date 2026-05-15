@@ -6,6 +6,8 @@ import logging
 import numpy as np
 
 from utils.parsers import (
+    atom_sasa_path_from_residue_sasa_path,
+    parse_atom_sasa,
     parse_structure,
     parse_sasa,
     parse_dssp,
@@ -14,6 +16,7 @@ from utils.parsers import (
     get_pka_file_path,
     Atom,
     SASAEntry,
+    ca_xyz_by_residue,
     residue_key_from_atom,
 )
 from utils.chemistry import get_standard_residue_pka
@@ -125,6 +128,9 @@ class StructureContext:
         self._pdb_path = pdb_path
         self._allowed_chains = allowed_chains
         self._sasa_path = sasa_path
+        self._atom_sasa_path = (
+            atom_sasa_path_from_residue_sasa_path(sasa_path) if sasa_path else None
+        )
         self._pka_path = pka_path
         self._dssp_path = dssp_path
         self.parse_errors: Dict[str, str] = {}
@@ -134,6 +140,7 @@ class StructureContext:
         self._ca_coords: Optional[Dict[ResKey4, Tuple[float, float, float]]] = None
         self._sasa_residue: Optional[Dict[ResKey4, SASAEntry]] = None
         self._sasa_output: Optional[Dict[ResKey4, Dict[str, Optional[float]]]] = None
+        self._atom_sasa: Optional[Dict[int, float]] = None
         self._pka_residue: Optional[Dict[ResKey4, float]] = None
         self._dssp_per_residue: Optional[Dict[ResKey4, Dict[str, Optional[float]]]] = None
         self._dssp_hbonds: Optional[
@@ -155,10 +162,7 @@ class StructureContext:
         if self._residue_keys is None:
             keys: Set[ResKey4] = set()
             for atom in self.atoms:
-                key4 = residue_key_from_atom(atom)
-                if key4 in keys:
-                    continue
-                keys.add(key4)
+                keys.add(residue_key_from_atom(atom))
             if not keys:
                 raise ValueError(
                     f"No residues found in structure at {self._pdb_path!r} "
@@ -169,14 +173,9 @@ class StructureContext:
 
     @property
     def ca_coords(self) -> Dict[ResKey4, Tuple[float, float, float]]:
+        """Per-residue Cα coordinates for WCN and distance-based surface metrics."""
         if self._ca_coords is None:
-            ca_by_res: Dict[ResKey4, Tuple[float, float, float]] = {}
-            for atom in self.atoms:
-                if atom.name != "CA":
-                    continue
-                key = residue_key_from_atom(atom)
-                if key not in ca_by_res:
-                    ca_by_res[key] = (atom.x, atom.y, atom.z)
+            ca_by_res = ca_xyz_by_residue(self.atoms)
             try:
                 residue_keys = self.residue_keys
             except Exception:
@@ -186,7 +185,7 @@ class StructureContext:
                 if missing:
                     example_missing = list(missing)[:5]
                     logger.warning(
-                        "CA coordinates missing for %d of %d residues in %r; "
+                        "Cα coordinates missing for %d of %d residues in %r; "
                         "downstream geometric descriptors may be biased. Examples: %r",
                         len(missing),
                         len(residue_keys),
@@ -203,7 +202,7 @@ class StructureContext:
                 self._sasa_residue = {}
             else:
                 try:
-                    data = parse_sasa(self._sasa_path)
+                    data = parse_sasa(self._sasa_path).entries
                     if not data:
                         raise ValueError(
                             f"SASA file {self._sasa_path!r} parsed but "
@@ -233,30 +232,54 @@ class StructureContext:
     @property
     def sasa_output(self) -> Dict[ResKey4, Dict[str, Optional[float]]]:
         """
-        SASA output suitable for reporting
+        SASA data in dict-of-dicts format expected by cluster metrics and SAP functions.
+        Fields mirror SASAEntry (total_side_rel, total_side_abs, main_chain_abs,
+        main_chain_rel, non_polar_abs, non_polar_rel, all_polar_abs, all_polar_rel);
+        all are floats (0.0 when absent/N/A per parse_sasa).
         """
         if self._sasa_output is None:
-            sasa_res = self.sasa_residue
-            output: Dict[ResKey4, Dict[str, Optional[float]]] = {}
-            for key, entry in sasa_res.items():
-                total_side_rel: Optional[float] = None
-                main_chain_rel: Optional[float] = None
-                if getattr(entry, "total_side_rel", None) is not None:
-                    try:
-                        total_side_rel = float(entry.total_side_rel)
-                    except (TypeError, ValueError):
-                        total_side_rel = None
-                if getattr(entry, "main_chain_rel", None) is not None:
-                    try:
-                        main_chain_rel = float(entry.main_chain_rel)
-                    except (TypeError, ValueError):
-                        main_chain_rel = None
-                output[key] = {
-                    "total_side_rel": total_side_rel,
-                    "main_chain_rel": main_chain_rel,
+            self._sasa_output = {
+                key: {
+                    "total_side_rel": entry.total_side_rel,
+                    "total_side_abs": entry.total_side_abs,
+                    "main_chain_abs": entry.main_chain_abs,
+                    "main_chain_rel": entry.main_chain_rel,
+                    "non_polar_abs": entry.non_polar_abs,
+                    "non_polar_rel": entry.non_polar_rel,
+                    "all_polar_abs": entry.all_polar_abs,
+                    "all_polar_rel": entry.all_polar_rel,
                 }
-            self._sasa_output = output
+                for key, entry in self.sasa_residue.items()
+            }
         return self._sasa_output
+
+    @property
+    def atom_sasa(self) -> Dict[int, float]:
+        """
+        Atom-level absolute SASA keyed by PDB atom serial.
+
+        This is populated from the compact companion file generated by
+        FreeSASA ``--format=pdb --depth=atom`` and intentionally stores only the
+        per-atom SASA needed for future exposed-atom descriptors.
+        """
+        if self._atom_sasa is None:
+            atom_sasa_path = self._atom_sasa_path
+            if not atom_sasa_path or not os.path.exists(atom_sasa_path):
+                self._atom_sasa = {}
+            else:
+                try:
+                    self._atom_sasa = parse_atom_sasa(atom_sasa_path, self.atoms)
+                except Exception as e:
+                    self.parse_errors["atom_sasa"] = f"{type(e).__name__}: {e}"
+                    logger.warning(
+                        "Failed to parse atom SASA file %r for structure %r: %s. "
+                        "Proceeding without atom SASA data.",
+                        atom_sasa_path,
+                        self._pdb_path,
+                        e,
+                    )
+                    self._atom_sasa = {}
+        return self._atom_sasa
 
     @property
     def pka_residue(self) -> Dict[ResKey4, float]:
@@ -268,9 +291,6 @@ class StructureContext:
                 # Parse both raw and structure-filtered to detect systematic key mismatches.
                 raw = parse_pka(pka_path, None)
                 filtered = parse_pka(pka_path, self.atoms)
-                filtered = self._filter_to_structure_residues(
-                    filtered, label="pKa", source_path=pka_path
-                )
 
                 if raw and not filtered:
                     raw_chains = sorted({k[2] for k in raw.keys()})
@@ -300,11 +320,16 @@ class StructureContext:
                             example_dropped,
                         )
 
+                # Warn about titratable residues in the structure not covered by PropKa.
+                # Standard pKa values are filled below, but the warning makes sparse
+                # PropKa coverage visible in logs.
+                self._warn_missing_coverage(
+                    set(filtered.keys()), label="pKa", source_path=pka_path
+                )
+
                 # Fill any missing titratable residues with standard pKa values so
                 # charge-based descriptors (net charge, pI, clustering, etc.) remain
                 # well-defined even when PropKa output has incomplete coverage.
-                if filtered is None:
-                    filtered = {}
                 filled = dict(filtered)
                 try:
                     residue_keys = self.residue_keys
@@ -455,4 +480,22 @@ class StructureContext:
                     )
                     self._dssp_hbonds = ({}, {})
         return self._dssp_hbonds
+
+    def get_cdr_vicinity_residue_keys(
+        self,
+        cdr_keys: Set[ResKey4],
+        *,
+        radius: Optional[float] = None,
+    ) -> Set[ResKey4]:
+        """
+        Cached CDR vicinity (see ``descriptor_utils.compute_cdr_vicinity_residue_keys``).
+
+        Uses ``CDR_VICINITY_HEAVY_ATOM_CUTOFF`` from ``utils.chemistry`` when
+        ``radius`` is omitted.
+        """
+        from utils.chemistry import CDR_VICINITY_HEAVY_ATOM_CUTOFF
+        from developability.descriptor_utils import compute_cdr_vicinity_residue_keys
+
+        r = float(CDR_VICINITY_HEAVY_ATOM_CUTOFF if radius is None else radius)
+        return compute_cdr_vicinity_residue_keys(self.atoms, cdr_keys, r)
 

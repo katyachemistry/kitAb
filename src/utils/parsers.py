@@ -5,23 +5,21 @@ import re
 from pathlib import Path
 import logging
 
-# residue number with insertion code (e.g. 111A)
-_RESNUM_PATTERN = re.compile(r"^(\d+)([A-Za-z])?$")
-hbond_pattern = re.compile(r"(-?\d+),\s*(-?\d+\.?\d*)")
+from utils.chemistry import AA_1_TO_3
+
+_RESNUM_PATTERN = re.compile(r"^(\d+)([A-Za-z])?$") # residue number with insertion code (e.g. 111A)
+hbond_pattern = re.compile(r"(-?\d+),\s*(-?\d+\.?\d*)") # hbond pattern from dssp
 
 # Residues we extract pKa values for from PropKa output.
 #
 # Note: this is intentionally broader than the residue/atom sets used for
 # geometric salt-bridge detection. Charge/pI counting and salt-bridge
 # geometry are handled separately elsewhere in the pipeline.
-CHARGED_RESIDUE_TYPES = frozenset({"ASP", "GLU", "LYS", "ARG", "HIS", "TYR", "CYS"})
+CHARGED_RESIDUE_TYPES = frozenset({"ASP", "GLU", "LYS", "ARG", "HIS", "TYR", "CYS", "N+", "C-"})
 
 _PKA_CACHE: Dict[Tuple[str, int], Dict[Tuple[str, int, str, str], float]] = {}
 
-STANDARD_AA = frozenset({
-    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
-    "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
-})
+STANDARD_AA = frozenset(AA_1_TO_3.values())
 ALLOWED_CHAINS = frozenset({"H", "L"})
 
 _SASA_TOTAL_CACHE: Dict[str, Optional[float]] = {}
@@ -87,6 +85,18 @@ class SASAEntry:
     total_side_rel: float
     main_chain_abs: float
     main_chain_rel: float
+    non_polar_abs: float = 0.0
+    non_polar_rel: float = 0.0
+    all_polar_abs: float = 0.0
+    all_polar_rel: float = 0.0
+
+
+@dataclass(frozen=True)
+class SASAParseResult:
+    """Result of parsing a FreeSASA-style SASA file: per-residue entries plus required TOTAL."""
+
+    entries: Dict[Tuple[str, int, str, str], SASAEntry]
+    total_sasa: float
 
 
 @dataclass(frozen=True)
@@ -102,9 +112,14 @@ class SASARawRecord:
     total_side_rel: str
     main_chain_abs: str
     main_chain_rel: str
+    non_polar_abs: str = ""
+    non_polar_rel: str = ""
+    all_polar_abs: str = ""
+    all_polar_rel: str = ""
 
 _SASA_RAW_CACHE: Dict[str, List[SASARawRecord]] = {}
-_SASA_CACHE: Dict[str, Dict[Tuple[str, int, str, str], SASAEntry]] = {}
+_SASA_CACHE: Dict[str, SASAParseResult] = {}
+_ATOM_SASA_CACHE: Dict[Tuple[str, int], Dict[int, float]] = {}
 
 # format: ATOM  serial  name  alt  res  chain  resnum  x  y  z  occ  temp  element
 def parse_pdb(
@@ -223,6 +238,8 @@ def parse_cif(cif_path: str, allowed_chains: Optional[Iterable[str]] = None) -> 
         "label_comp_id", "label_asym_id", "label_seq_id",
         "Cartn_x", "Cartn_y", "Cartn_z",
     }
+    n_total = 0
+    n_skipped = 0
 
     while i < len(lines):
         line = lines[i]
@@ -251,9 +268,7 @@ def parse_cif(cif_path: str, allowed_chains: Optional[Iterable[str]] = None) -> 
         resnum_col = "auth_seq_id" if "auth_seq_id" in col_indices else "label_seq_id"
         ins_code_col = "pdbx_PDB_ins_code" if "pdbx_PDB_ins_code" in col_indices else None
         atom_name_col = "auth_atom_id" if "auth_atom_id" in col_indices else "label_atom_id"
-        # Parse data lines
-        n_total = 0
-        n_skipped = 0
+        max_col_idx = max(col_indices.values())
         while i < len(lines):
             data_line = lines[i].rstrip("\n")
             i += 1
@@ -263,7 +278,7 @@ def parse_cif(cif_path: str, allowed_chains: Optional[Iterable[str]] = None) -> 
                 i -= 1
                 break
             parts = _split_cif_line(data_line)
-            if len(parts) <= max(col_indices.values()):
+            if len(parts) <= max_col_idx:
                 continue
             try:
                 n_total += 1
@@ -336,6 +351,28 @@ def parse_structure(
 def residue_key_from_atom(atom: Atom) -> Tuple[str, int, str, str]:
     return (atom.residue_name, atom.residue_number, atom.chain, getattr(atom, "insertion_code", ""))
 
+
+def ca_xyz_by_residue(
+    atoms: List[Atom],
+) -> Dict[Tuple[str, int, str, str], Tuple[float, float, float]]:
+    """
+    One Cα coordinate per residue for surface clustering (DBSCAN, Ripley, PCF,
+    ANN, WCN).
+
+    The first ``CA`` seen per residue key is kept (alternate conformations: order
+    follows ``atoms``).
+    """
+    ca: Dict[Tuple[str, int, str, str], Tuple[float, float, float]] = {}
+    for atom in atoms:
+        name = (atom.name or "").strip().upper()
+        if name != "CA":
+            continue
+        key = residue_key_from_atom(atom)
+        if key not in ca:
+            ca[key] = (float(atom.x), float(atom.y), float(atom.z))
+    return ca
+
+
 # format: RES resName chain resNum (original residue number, may have letter)
 def load_sasa_raw(sasa_path: str) -> List[SASARawRecord]:
     abs_path = str(Path(sasa_path).resolve())
@@ -373,11 +410,17 @@ def load_sasa_raw(sasa_path: str) -> List[SASARawRecord]:
                         continue
                     residue_number, insertion_code = parsed
                     # FreeSASA residue format (split parts):
-                    # RES <resName> <chain> <num> <all_abs> <all_rel> <side_abs> <side_rel> <main_abs> <main_rel> ...
+                    # RES <resName> <chain> <num> <all_abs> <all_rel> <side_abs> <side_rel>
+                    #     <main_abs> <main_rel> <non_polar_abs> <non_polar_rel>
+                    #     <all_polar_abs> <all_polar_rel>
                     total_side_abs = parts[6] if len(parts) > 6 else ""
                     total_side_rel = parts[7] if len(parts) > 7 else ""
                     main_chain_abs = parts[8] if len(parts) > 8 else ""
                     main_chain_rel = parts[9] if len(parts) > 9 else ""
+                    non_polar_abs = parts[10] if len(parts) > 10 else ""
+                    non_polar_rel = parts[11] if len(parts) > 11 else ""
+                    all_polar_abs = parts[12] if len(parts) > 12 else ""
+                    all_polar_rel = parts[13] if len(parts) > 13 else ""
                     records.append(
                         SASARawRecord(
                             residue_name=residue_name,
@@ -388,6 +431,10 @@ def load_sasa_raw(sasa_path: str) -> List[SASARawRecord]:
                             total_side_rel=total_side_rel,
                             main_chain_abs=main_chain_abs,
                             main_chain_rel=main_chain_rel,
+                            non_polar_abs=non_polar_abs,
+                            non_polar_rel=non_polar_rel,
+                            all_polar_abs=all_polar_abs,
+                            all_polar_rel=all_polar_rel,
                         )
                     )
                 except (ValueError, IndexError):
@@ -404,9 +451,18 @@ def load_sasa_raw(sasa_path: str) -> List[SASARawRecord]:
         msg = f"Failed to read SASA file {sasa_path!r}: {e}; returning partial/empty records"
         logger.warning(msg)
         _write_per_file_log(sasa_path, msg)
+        if total_sasa is None:
+            raise ValueError(
+                f"SASA file {sasa_path!r} must contain a TOTAL line with a valid numeric total SASA (Å²)."
+            ) from e
         _SASA_RAW_CACHE[abs_path] = records
         _SASA_TOTAL_CACHE[abs_path] = total_sasa
         return records
+
+    if total_sasa is None:
+        raise ValueError(
+            f"SASA file {sasa_path!r} must contain a TOTAL line with a valid numeric total SASA (Å²)."
+        )
 
     if n_total > 0 and not records:
         msg = f"Parsed 0 RES records from SASA file {sasa_path!r}"
@@ -424,16 +480,10 @@ def load_sasa_raw(sasa_path: str) -> List[SASARawRecord]:
     return records
 
 
-def get_sasa_total(sasa_path: str) -> Optional[float]:
-    """Return cached total SASA (from TOTAL line) for path; load file if not yet cached."""
+def parse_sasa(sasa_path: str) -> SASAParseResult:
     abs_path = str(Path(sasa_path).resolve())
-    if abs_path not in _SASA_TOTAL_CACHE:
-        load_sasa_raw(sasa_path)
-    return _SASA_TOTAL_CACHE.get(abs_path)
-
-
-def parse_sasa(sasa_path: str) -> Dict[Tuple[str, int, str, str], SASAEntry]:
-    abs_path = str(Path(sasa_path).resolve())
+    if not Path(abs_path).is_file():
+        raise FileNotFoundError(f"SASA file not found: {sasa_path!r}")
     cached = _SASA_CACHE.get(abs_path)
     if cached is not None:
         return cached
@@ -459,6 +509,22 @@ def parse_sasa(sasa_path: str) -> Dict[Tuple[str, int, str, str], SASAEntry]:
                 main_chain_rel = float(rec.main_chain_rel) / 100.0
             else:
                 main_chain_rel = 0.0
+            if rec.non_polar_abs and rec.non_polar_abs != "N/A":
+                non_polar_abs = float(rec.non_polar_abs)
+            else:
+                non_polar_abs = 0.0
+            if rec.non_polar_rel and rec.non_polar_rel != "N/A":
+                non_polar_rel = float(rec.non_polar_rel) / 100.0
+            else:
+                non_polar_rel = 0.0
+            if rec.all_polar_abs and rec.all_polar_abs != "N/A":
+                all_polar_abs = float(rec.all_polar_abs)
+            else:
+                all_polar_abs = 0.0
+            if rec.all_polar_rel and rec.all_polar_rel != "N/A":
+                all_polar_rel = float(rec.all_polar_rel) / 100.0
+            else:
+                all_polar_rel = 0.0
 
             key = (rec.residue_name, rec.residue_number, rec.chain, rec.insertion_code)
             sasa_data[key] = SASAEntry(
@@ -469,12 +535,96 @@ def parse_sasa(sasa_path: str) -> Dict[Tuple[str, int, str, str], SASAEntry]:
                 total_side_rel=total_side_rel,
                 main_chain_abs=main_chain_abs,
                 main_chain_rel=main_chain_rel,
+                non_polar_abs=non_polar_abs,
+                non_polar_rel=non_polar_rel,
+                all_polar_abs=all_polar_abs,
+                all_polar_rel=all_polar_rel,
             )
         except ValueError:
             continue
 
-    _SASA_CACHE[abs_path] = sasa_data
-    return sasa_data
+    total = _SASA_TOTAL_CACHE.get(abs_path)
+    if total is None:
+        raise ValueError(
+            f"SASA file {sasa_path!r} must contain a TOTAL line with a valid numeric total SASA (Å²)."
+        )
+    result = SASAParseResult(entries=sasa_data, total_sasa=float(total))
+    _SASA_CACHE[abs_path] = result
+    return result
+
+
+def atom_sasa_path_from_residue_sasa_path(sasa_path: str) -> str:
+    """
+    Companion file path for atom-level SASA generated from the same structure.
+
+    Current pipeline convention:
+      ``foo_full.sasa`` -> ``foo_full_atom_sasa.pdb``
+    """
+    p = Path(sasa_path)
+    name = p.name
+    if name.endswith(".sasa"):
+        return str(p.with_name(name[:-5] + "_atom_sasa.pdb"))
+    return str(p.with_name(name + "_atom_sasa.pdb"))
+
+
+def parse_atom_sasa(
+    atom_sasa_path: str,
+    pdb_atoms: Optional[List[Atom]] = None,
+) -> Dict[int, float]:
+    """
+    Parse FreeSASA ``--format=pdb --depth=atom`` output.
+
+    Only the atom serial and absolute atom SASA are retained, because the original
+    structure already provides coordinates, atom names, residue IDs, and element types.
+    The FreeSASA output stores atom SASA in the PDB temp-factor column.
+    """
+    abs_path = str(Path(atom_sasa_path).resolve())
+    atoms_id = id(pdb_atoms) if pdb_atoms is not None else 0
+    cache_key = (abs_path, atoms_id)
+    cached = _ATOM_SASA_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    allowed_serials: Optional[set[int]] = None
+    if pdb_atoms is not None:
+        allowed_serials = {int(atom.serial) for atom in pdb_atoms}
+
+    atom_sasa: Dict[int, float] = {}
+    n_total = 0
+    n_skipped = 0
+    try:
+        with open(atom_sasa_path, "r") as f:
+            for line in f:
+                if not line.startswith(("ATOM", "HETATM")):
+                    continue
+                n_total += 1
+                try:
+                    serial = int(line[6:11].strip())
+                    if allowed_serials is not None and serial not in allowed_serials:
+                        continue
+                    sasa_abs = float(line[60:66].strip())
+                    atom_sasa[serial] = sasa_abs
+                except (ValueError, IndexError):
+                    n_skipped += 1
+                    continue
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Atom SASA file not found: {atom_sasa_path!r}")
+
+    if n_total > 0 and n_skipped / n_total > 0.1:
+        msg = (
+            f"Skipped {n_skipped} of {n_total} atom SASA records while parsing "
+            f"{atom_sasa_path!r}"
+        )
+        logger.warning(msg)
+        _write_per_file_log(atom_sasa_path, msg)
+
+    _ATOM_SASA_CACHE[cache_key] = atom_sasa
+    return atom_sasa
+
+
+def get_sasa_total(sasa_path: str) -> float:
+    """Total SASA (Å²) from the SASA file ``TOTAL`` line. Uses ``parse_sasa`` cache."""
+    return parse_sasa(sasa_path).total_sasa
 
 
 def parse_pka(
@@ -552,7 +702,7 @@ def parse_pka(
                     if not chain:
                         continue
 
-                    pka_str = parts[3].strip()
+                    pka_str = parts[3].strip().rstrip("*")
                     if not pka_str:
                         continue
                     try:
@@ -562,7 +712,9 @@ def parse_pka(
 
                     residue_key = (residue_name, residue_number, chain, insertion_code)
 
-                    if pdb_atoms and residue_key not in pdb_residue_set:
+                    # Terminus pseudo-residues (N+, C-) have no atom-level key,
+                    # so skip the pdb_residue_set filter for them.
+                    if pdb_atoms and residue_name not in ("N+", "C-") and residue_key not in pdb_residue_set:
                         continue
 
                     if residue_key not in pka_data:
@@ -650,6 +802,31 @@ def load_dssp_lines(dssp_path: str) -> Tuple[List[str], Optional[int]]:
     return lines, header_line_idx
 
 
+def _parse_dssp_hbond_pair(hbond_str: str) -> Optional[Tuple[int, float]]:
+    if not hbond_str or hbond_str.strip() == "":
+        return None
+    parts = hbond_str.split(",")
+    if len(parts) != 2:
+        return None
+    offset_str = parts[0].strip()
+    energy_str = parts[1].strip()
+    if not offset_str or not energy_str:
+        return None
+    try:
+        residue_offset = int(offset_str)
+        energy = float(energy_str)
+        if residue_offset == 0 and energy == 0.0:
+            return None
+        return (residue_offset, energy)
+    except ValueError:
+        return None
+
+
+def _parse_hbond_energy(hbond_str: str) -> Optional[float]:
+    pair = _parse_dssp_hbond_pair(hbond_str)
+    return pair[1] if pair is not None else None
+
+
 def parse_dssp(
     dssp_path: str,
     pdb_atoms: Optional[List[Atom]] = None,
@@ -659,8 +836,6 @@ def parse_dssp(
     - donor H-bond energies
     - acceptor H-bond energies
     """
-    from developability.descriptors import AA_1_TO_3  # lazy import to avoid cycles
-
     abs_path = str(Path(dssp_path).resolve())
     atoms_id = id(pdb_atoms) if pdb_atoms is not None else 0
     cache_key = (abs_path, atoms_id)
@@ -752,20 +927,6 @@ def parse_dssp(
                 if hbond_pairs:
                     hbond_data[residue_key] = hbond_pairs
 
-            def _parse_hbond_energy(hbond_str: str) -> Optional[float]:
-                if not hbond_str or hbond_str.strip() == "":
-                    return None
-                parts = hbond_str.split(",")
-                if len(parts) != 2:
-                    return None
-                energy_str = parts[1].strip()
-                if not energy_str:
-                    return None
-                try:
-                    return float(energy_str)
-                except ValueError:
-                    return None
-
             nh_o_1_energy = _parse_hbond_energy(nh_o_1_str)
             oh_n_1_energy = _parse_hbond_energy(oh_n_1_str)
             nh_o_2_energy = _parse_hbond_energy(nh_o_2_str)
@@ -783,26 +944,6 @@ def parse_dssp(
 
     _DSSP_FULL_CACHE[cache_key] = (dssp_data, hbond_data, dssp_seq_to_pdb)
     return dssp_data
-
-
-def _parse_dssp_hbond_pair(hbond_str: str) -> Optional[Tuple[int, float]]:
-    if not hbond_str or hbond_str.strip() == "":
-        return None
-    parts = hbond_str.split(",")
-    if len(parts) != 2:
-        return None
-    offset_str = parts[0].strip()
-    energy_str = parts[1].strip()
-    if not offset_str or not energy_str:
-        return None
-    try:
-        residue_offset = int(offset_str)
-        energy = float(energy_str)
-        if residue_offset == 0 and energy == 0.0:
-            return None
-        return (residue_offset, energy)
-    except ValueError:
-        return None
 
 
 def parse_dssp_hbonds(
@@ -827,10 +968,8 @@ def parse_dssp_hbonds(
 
 def parse_motif_to_3letter(motif: str, aa_map: Optional[Dict[str, str]] = None) -> List[str]:
 
-    from developability.descriptors import AA_1_TO_3 as _AA_1_TO_3
-
     if aa_map is None:
-        aa_map = _AA_1_TO_3
+        aa_map = AA_1_TO_3
 
     parts = [p.strip() for p in motif.split("-") if p.strip()]
     if not parts:

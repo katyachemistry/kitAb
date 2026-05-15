@@ -6,8 +6,11 @@ from .parsers import (
     get_sasa_total,
     Atom,
     SASAEntry,
+    SASAParseResult,
+    ca_xyz_by_residue,
+    residue_key_from_atom,
 )
-from .geometry import (
+from .chemistry import (
     distance,
     angle_between_vectors,
     is_backbone_atom,
@@ -19,6 +22,9 @@ __all__ = [
     "get_sasa_total",
     "Atom",
     "SASAEntry",
+    "SASAParseResult",
+    "ca_xyz_by_residue",
+    "residue_key_from_atom",
     "distance",
     "angle_between_vectors",
     "is_backbone_atom",

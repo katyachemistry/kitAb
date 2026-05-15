@@ -1,10 +1,52 @@
+import math
 import os
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from collections import defaultdict
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+import logging
+
+import numpy as np
+from scipy.spatial import ConvexHull, QhullError, cKDTree
+from scipy.spatial.distance import pdist
+from scipy import optimize
+from sklearn.cluster import DBSCAN
 
 from developability.structure_context import StructureContext, ResKey4
-from utils.geometry import is_backbone_atom
-from utils.parsers import Atom, parse_structure, residue_key_from_atom, SASAEntry
-from utils.chemistry import get_standard_residue_pka
+from utils.parsers import (
+    Atom,
+    ca_xyz_by_residue,
+    parse_structure,
+    residue_key_from_atom,
+    SASAEntry,
+)
+from utils.chemistry import (
+    ACCEPTOR_MAX_HBONDS,
+    ACCEPTOR_METADATA,
+    ACCEPTORS_ANY,
+    ACCEPTORS_SPECIFIC,
+    AROMATIC_RESIDUES,
+    DONOR_EXCLUDED,
+    DONOR_INFO,
+    DONOR_MAX_HBONDS,
+    DONOR_METADATA,
+    DONORS_ANY,
+    EXPOSURE_REL_ASA_THRESHOLD,
+    get_standard_residue_pka,
+    HYDROPHOBIC_RESIDUES,
+    INTER_CHAIN_INTERFACE_CUTOFF,
+    is_backbone_atom,
+    KD_MAX,
+    KD_MIN,
+    KYTE_DOOLITTLE,
+    MAX_SALT_BRIDGE_DISTANCE,
+    NEGATIVE_ATOMS,
+    NEGATIVE_CHARGED_RESIDUES,
+    normalize_hydropathy,
+    POLAR_RESIDUES,
+    POSITIVE_ATOMS,
+    POSITIVE_CHARGED_RESIDUES,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def _residue_keys_cache_key(atoms: List["Atom"]) -> Tuple[ResKey4, ...]:
@@ -41,11 +83,10 @@ def is_hydrogen_atom(atom: Atom) -> bool:
 def _sasa_exposure_cache_key(
     sasa_data: Dict[ResKey4, SASAEntry],
     sasa_cutoff: float,
-) -> Tuple[Tuple[ResKey4, Optional[float]], ...]:
-    items: List[Tuple[ResKey4, Optional[float]]] = []
-    for res_key, entry in sasa_data.items():
-        value = getattr(entry, "total_side_rel", None)
-        items.append((res_key, None if value is None else float(value)))
+) -> Tuple[Tuple[ResKey4, float], ...]:
+    items: List[Tuple[ResKey4, float]] = [
+        (res_key, entry.total_side_rel) for res_key, entry in sasa_data.items()
+    ]
     # include cutoff as a synthetic entry to distinguish different thresholds
     items.append((("CUTOFF", -1, "", ""), float(sasa_cutoff)))  # type: ignore[arg-type]
     return tuple(sorted(items))
@@ -78,158 +119,29 @@ _ATOM_LOOKUP_CACHE: Dict[
 
 _INTER_CHAIN_INTERFACE_CACHE: Dict[str, Set[ResKey4]] = {}
 
+_CONVEX_HULL_CA_VOLUME_CACHE: Dict[str, float] = {}
+
+# Cache keyed by id(atoms); safe because _get_atoms_for_path returns the same
+# cached list object for a given path, so id is stable within a pipeline run.
+_HEAVY_ATOM_TREE_CACHE: Dict[
+    int,
+    Tuple["cKDTree", np.ndarray, List[ResKey4], Dict[ResKey4, List[int]]],
+] = {}
+
+_RESIDUE_LOCAL_CURVATURE_CACHE: Dict[
+    Tuple[int, ResKey4, float, int, bool],
+    Optional[float],
+] = {}
+
+_CDR_VICINITY_RESIDUE_KEYS_CACHE: Dict[
+    Tuple[Tuple[ResKey4, ...], float, Tuple[ResKey4, ...]],
+    frozenset,
+] = {}
+
 # One-time warning cache for insertion-code fallback in SASA lookup.
 _SASA_INSERTION_FALLBACK_WARNED: Set[Tuple[ResKey4, ResKey4]] = set()
 
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
-import logging
-import os
-import math
-from collections import defaultdict
-
-logger = logging.getLogger(__name__)
-import numpy as np
-from scipy.spatial import cKDTree
-from scipy import optimize
-from sklearn.cluster import DBSCAN
-import pandas as pd
-import re
-
-KYTE_DOOLITTLE_SCORES = {
-    "ILE": 4.5,
-    "VAL": 4.2,
-    "LEU": 3.8,
-    "PHE": 2.8,
-    "CYS": 2.5,
-    "MET": 1.9,
-    "ALA": 1.8,
-    "GLY": -0.4,
-    "THR": -0.7,
-    "SER": -0.8,
-    "TRP": -0.9,
-    "TYR": -1.3,
-    "PRO": -1.6,
-    "HIS": -3.2,
-    "GLU": -3.5,
-    "GLN": -3.5,
-    "ASP": -3.5,
-    "ASN": -3.5,
-    "LYS": -3.9,
-    "ARG": -4.5,
-}
-KD_MIN = min(KYTE_DOOLITTLE_SCORES.values())
-KD_MAX = max(KYTE_DOOLITTLE_SCORES.values())
-
-def normalize_hydropathy(res_name: str) -> Optional[float]:
-    """
-    Normalize Kyte-Doolittle hydropathy score for a residue to [1, 2].
-    Returns None if residue has no defined score.
-    """
-    score = KYTE_DOOLITTLE_SCORES.get(res_name)
-    if score is None:
-        return None
-    if KD_MAX == KD_MIN:
-        return 1.5
-    return 1.0 + (score - KD_MIN) / (KD_MAX - KD_MIN)
-
-
-# Charge-residue sets.
-#
-# Keep geometric salt-bridge detection separate from charge counting:
-# salt bridges still depend on explicit salt-bridge partner atoms
-# (see POSITIVE_ATOMS / NEGATIVE_ATOMS), while the charged/residue classification
-# is used for charge/pI style metrics and charge-based clustering terms.
-POSITIVE_CHARGED_RESIDUES = frozenset({"LYS", "ARG", "HIS"})
-
-AROMATIC_RESIDUES = frozenset({"PHE", "TYR", "TRP"})
-HYDROPHOBIC_RESIDUES = frozenset(
-    {"ALA", "VAL", "LEU", "ILE", "MET", "PHE", "TRP", "PRO", "CYS"}
-)
-POLAR_RESIDUES = frozenset(
-    {"SER", "THR", "ASN", "GLN", "TYR", "GLU", "ASP", "LYS", "ARG", "HIS"}
-)
-
-POSITIVE_ATOMS = frozenset(
-    {
-        ("NH1", "ARG"),
-        ("NH2", "ARG"),
-        ("NZ", "LYS"),
-        ("ND1", "HIS"),
-        ("NE2", "HIS"),
-    }
-)
-
-NEGATIVE_ATOMS = frozenset(
-    {
-        ("OD1", "ASP"),
-        ("OD2", "ASP"),
-        ("OE1", "GLU"),
-        ("OE2", "GLU"),
-        # Phenolic / thiol deprotonation.
-        ("OH", "TYR"),
-        ("SG", "CYS"),
-    }
-)
-
-# Residues that can be negatively charged at a given pH (charge/pI logic).
-NEGATIVE_CHARGED_RESIDUES = frozenset({res for _atom, res in NEGATIVE_ATOMS})
-
-INTER_CHAIN_INTERFACE_CUTOFF = 5.0
-MAX_SALT_BRIDGE_DISTANCE = 4.0
-
-DONORS_ANY = frozenset({"N"})
-DONOR_EXCLUDED = frozenset({("N", "PRO")})
-
-DONOR_METADATA: Dict[Tuple[str, str], Tuple[str, int]] = {
-    ("NE2", "GLN"): ("CD", 2),
-    ("ND2", "ASN"): ("CG", 2),
-    ("NE", "ARG"): ("CZ", 1),
-    ("NH1", "ARG"): ("CZ", 2),
-    ("NH2", "ARG"): ("CZ", 2),
-    ("NZ", "LYS"): ("CE", 3),
-    ("ND1", "HIS"): ("CG", 1),
-    ("NE2", "HIS"): ("CD2", 1),
-    ("OG", "SER"): ("CB", 1),
-    ("OG1", "THR"): ("CB", 1),
-    ("OH", "TYR"): ("CZ", 1),
-}
-
-DONOR_INFO: Dict[Tuple[str, str], str] = {
-    key: base for key, (base, _max_hbonds) in DONOR_METADATA.items()
-}
-
-DONOR_MAX_HBONDS: Dict[Tuple[str, str], int] = {
-    ("N", "ANY"): 1,  # any residue except PRO (filtered by DONOR_EXCLUDED)
-    **{key: max_hbonds for key, (_base, max_hbonds) in DONOR_METADATA.items()},
-}
-
-ACCEPTORS_ANY = frozenset({"O"})
-
-# Acceptor metadata: (atom_name, residue_name) -> max_hbonds
-ACCEPTOR_METADATA: Dict[Tuple[str, str], int] = {
-    ("O", "ANY"): 2,
-    ("OE1", "GLN"): 1,
-    ("OE2", "GLU"): 2,
-    ("OD1", "ASN"): 1,
-    ("OD2", "ASP"): 2,
-    ("ND1", "HIS"): 1,
-    ("NE2", "HIS"): 1,
-    ("OG", "SER"): 1,
-    ("OG1", "THR"): 1,
-    ("OH", "TYR"): 1,
-}
-
-ACCEPTORS_SPECIFIC = frozenset(
-    {
-        key
-        for key in ACCEPTOR_METADATA.keys()
-        if not (key[0] == "O" and key[1] == "ANY")
-    }
-)
-
-ACCEPTOR_MAX_HBONDS: Dict[Tuple[str, str], int] = dict(ACCEPTOR_METADATA)
-CHARGED_THRESHOLD = 0.1  # |fractional charge| above this is considered charged
-_CHARGE_CACHE: Dict[Tuple[str, Optional[float], float], Tuple[float, Optional[str]]] = {}
+_CHARGE_CACHE: Dict[Tuple[str, Optional[float], float], float] = {}
 
 
 def _residue_fractional_charge_at_pH(
@@ -237,49 +149,24 @@ def _residue_fractional_charge_at_pH(
     pka_value: Optional[float],
     pH: float,
 ) -> float:
-    """fractional charge at pH (Henderson-Hasselbalch eq)"""
+    """Fractional charge at pH via Henderson-Hasselbalch. Returns 0.0 for non-titratable residues."""
     res_name = (residue_name or "").strip().upper()
     effective_pka = pka_value if pka_value is not None else get_standard_residue_pka(res_name)
     cache_key = (res_name, effective_pka, float(pH))
     cached = _CHARGE_CACHE.get(cache_key)
     if cached is not None:
-        return cached[0]
+        return cached
 
-    # Biologically grounded fallback: if PropKa did not provide a pKa for a
-    # titratable residue, use a standard residue pKa value instead of forcing
-    # an always-charged (ASP/GLU/ARG/LYS) or never-charged (HIS) state.
-    pka_value = effective_pka
-
-    if pka_value is None:
+    if effective_pka is None:
         q = 0.0
     elif res_name in NEGATIVE_CHARGED_RESIDUES:
-        # Acidic (deprotonated) state carries -1 charge.
-        q = -1.0 / (1.0 + np.power(10.0, pka_value - pH))
+        q = -1.0 / (1.0 + np.power(10.0, effective_pka - pH))
     elif res_name in POSITIVE_CHARGED_RESIDUES:
-        q = 1.0 / (1.0 + np.power(10.0, pH - pka_value))
+        q = 1.0 / (1.0 + np.power(10.0, pH - effective_pka))
     else:
         q = 0.0
-    if q > CHARGED_THRESHOLD:
-        sign = "positive"
-    elif q < -CHARGED_THRESHOLD:
-        sign = "negative"
-    else:
-        sign = None
-    _CHARGE_CACHE[cache_key] = (q, sign)
+    _CHARGE_CACHE[cache_key] = q
     return q
-
-
-def is_residue_charged(
-    residue_name: str, pka_value: Optional[float], pH: float
-) -> Optional[str]:
-    res_name = (residue_name or "").strip().upper()
-    effective_pka = pka_value if pka_value is not None else get_standard_residue_pka(res_name)
-    cache_key = (res_name, effective_pka, float(pH))
-    cached = _CHARGE_CACHE.get(cache_key)
-    if cached is None:
-        _residue_fractional_charge_at_pH(res_name, effective_pka, pH)
-        cached = _CHARGE_CACHE.get(cache_key)
-    return cached[1] if cached is not None else None
 
 
 def get_aromatic_residue_keys(pdb_path: str) -> Set[ResKey4]:
@@ -303,14 +190,10 @@ def _get_charged_residues_at_pH(
         if res_key in seen:
             continue
         seen.add(res_key)
-        res_name = atom.residue_name
-        pka_val = pka_data.get(res_key)
-        if pka_val is None:
-            pka_val = get_standard_residue_pka(res_name)
-        sign = is_residue_charged(res_name, pka_val, pH)
-        if sign == "positive":
+        q = _residue_fractional_charge_at_pH(atom.residue_name, pka_data.get(res_key), pH)
+        if q > 0.0:
             positive.add(res_key)
-        elif sign == "negative":
+        elif q < 0.0:
             negative.add(res_key)
     return positive, negative
 
@@ -380,25 +263,41 @@ def _residue_category_group(
     pH: float,
 ) -> Optional[str]:
     """
-    Classify residue into charge/type group for clustering/Ripley (with HIS as positive).
+    Classify residue into charge/type group for clustering/Ripley.
     Returns "negative" | "positive" | "aromatic" | "hydrophobic" | "polar", or None.
-    When pKa is None, charged residues are assigned by type (ASP/GLU -> negative, LYS/ARG/HIS -> positive).
-    Aromatic (PHE, TYR, TRP) is checked before hydrophobic/polar so they get a dedicated group.
+    Titratable residues (ASP, GLU, LYS, ARG, HIS, TYR, CYS) are classified by the
+    sign of their fractional charge at pH; if q==0 they fall through to aromatic/
+    hydrophobic/polar below. Aromatic is checked before hydrophobic/polar.
     """
-    if res_name in NEGATIVE_CHARGED_RESIDUES:
-        if pka_val is None:
-            pka_val = get_standard_residue_pka(res_name)
-        if is_residue_charged(res_name, pka_val, pH):
-            return "negative"
-        return None
-    if res_name in POSITIVE_CHARGED_RESIDUES:
-        if pka_val is None:
-            pka_val = get_standard_residue_pka(res_name)
-        if is_residue_charged(res_name, pka_val, pH):
-            return "positive"
-        return None
+    q = _residue_fractional_charge_at_pH(res_name, pka_val, pH)
+    if q < 0.0:
+        return "negative"
+    if q > 0.0:
+        return "positive"
     if res_name in AROMATIC_RESIDUES:
         return "aromatic"
+    if res_name in HYDROPHOBIC_RESIDUES:
+        return "hydrophobic"
+    if res_name in POLAR_RESIDUES:
+        return "polar"
+    return None
+
+
+def _residue_category_group_surface_pcf(
+    res_name: str,
+    pka_val: Optional[float],
+    pH: float,
+) -> Optional[str]:
+    """
+    Like :func:`_residue_category_group` but without a separate **aromatic** bucket
+    (for exposed pair-correlation clustering). Uncharged Phe/Tyr/Trp follow the same
+    hydrophobic / polar ordering as other neutral side chains (hydrophobic first).
+    """
+    q = _residue_fractional_charge_at_pH(res_name, pka_val, pH)
+    if q < 0.0:
+        return "negative"
+    if q > 0.0:
+        return "positive"
     if res_name in HYDROPHOBIC_RESIDUES:
         return "hydrophobic"
     if res_name in POLAR_RESIDUES:
@@ -422,12 +321,10 @@ def get_exposed_residues(
     if cached is not None:
         return cached
 
-    exposure: Dict[ResKey4, bool] = {}
-    for res_key, entry in sasa_data.items():
-        if entry is None or getattr(entry, "total_side_rel", None) is None:
-            exposure[res_key] = False
-        else:
-            exposure[res_key] = bool(entry.total_side_rel > sasa_cutoff)
+    exposure: Dict[ResKey4, bool] = {
+        res_key: entry.total_side_rel > sasa_cutoff
+        for res_key, entry in sasa_data.items()
+    }
 
     _EXPOSED_RESIDUE_CACHE[key] = exposure
     return exposure
@@ -544,6 +441,101 @@ def _get_atoms_for_path(pdb_path: str) -> List[Atom]:
     return atoms
 
 
+def get_heavy_atom_tree(
+    atoms: List[Atom],
+) -> Tuple["cKDTree", np.ndarray, List[ResKey4], Dict[ResKey4, List[int]]]:
+    """Build (and cache) a KDTree over all heavy atoms of the structure.
+
+    Cache key is ``id(atoms)``.  This is safe as long as callers obtain their
+    atom list from ``_get_atoms_for_path``, which caches the list object —
+    meaning the same structure always produces the same Python list object and
+    therefore the same ``id``.
+
+    Returns
+    -------
+    tree : cKDTree
+        Spatial index over heavy-atom coordinates.
+    coords : ndarray, shape (n, 3)
+        Heavy-atom coordinates in the same order as the tree.
+    atom_res_keys : list of ResKey4
+        ``atom_res_keys[i]`` is the ResKey4 of the i-th heavy atom in the tree.
+    heavy_atoms_by_res : dict
+        Maps each ResKey4 to the list of atom indices (into ``coords``/``tree``)
+        that belong to that residue.
+    """
+    cache_key = id(atoms)
+    cached = _HEAVY_ATOM_TREE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    coord_list: List[Tuple[float, float, float]] = []
+    key_list: List[ResKey4] = []
+    for a in atoms:
+        if is_hydrogen_atom(a):
+            continue
+        coord_list.append((a.x, a.y, a.z))
+        key_list.append(residue_key_from_atom(a))
+
+    coords = np.array(coord_list, dtype=np.float64) if coord_list else np.zeros((0, 3), dtype=np.float64)
+    tree = cKDTree(coords) if len(coords) > 0 else cKDTree(np.zeros((1, 3), dtype=np.float64))
+
+    heavy_atoms_by_res: Dict[ResKey4, List[int]] = {}
+    for i, rk in enumerate(key_list):
+        heavy_atoms_by_res.setdefault(rk, []).append(i)
+
+    result = (tree, coords, key_list, heavy_atoms_by_res)
+    _HEAVY_ATOM_TREE_CACHE[cache_key] = result
+    return result
+
+
+def compute_cdr_vicinity_residue_keys(
+    atoms: List[Atom],
+    cdr_keys: Set[ResKey4],
+    radius: float,
+) -> Set[ResKey4]:
+    """
+    Residues in the CDR “vicinity”: any residue that has at least one heavy atom
+    within ``radius`` Å (minimum heavy–heavy distance) of some heavy atom of a CDR
+    residue. All residues in ``cdr_keys`` are included.
+
+    Heavy atoms match :func:`get_heavy_atom_tree` / :func:`is_hydrogen_atom`.
+    Cached per structure (order-invariant residue keying), radius, and CDR set.
+    """
+    if not cdr_keys:
+        return set()
+
+    cdr_key_tuple = tuple(sorted(cdr_keys, key=lambda k: (k[2], k[1], k[3], k[0])))
+    cache_key = (_residue_keys_cache_key(atoms), float(radius), cdr_key_tuple)
+    cached = _CDR_VICINITY_RESIDUE_KEYS_CACHE.get(cache_key)
+    if cached is not None:
+        return set(cached)
+
+    _tree, heavy_coords, _key_list, heavy_atoms_by_res = get_heavy_atom_tree(atoms)
+    seed_indices: List[int] = []
+    for k in cdr_keys:
+        seed_indices.extend(heavy_atoms_by_res.get(k, []))
+
+    out: Set[ResKey4] = set(cdr_keys)
+    if not seed_indices:
+        _CDR_VICINITY_RESIDUE_KEYS_CACHE[cache_key] = frozenset(out)
+        return set(out)
+
+    seed_coords = heavy_coords[np.asarray(seed_indices, dtype=np.int64)]
+    seed_tree = cKDTree(seed_coords)
+    r = float(radius)
+
+    for res_key, atom_idxs in heavy_atoms_by_res.items():
+        if res_key in out:
+            continue
+        for ai in atom_idxs:
+            if seed_tree.query_ball_point(heavy_coords[ai], r=r):
+                out.add(res_key)
+                break
+
+    _CDR_VICINITY_RESIDUE_KEYS_CACHE[cache_key] = frozenset(out)
+    return set(out)
+
+
 def _get_residue_seq_index(
     atoms: List[Atom],
 ) -> Dict[Tuple[str, int, str, str], int]:
@@ -629,6 +621,11 @@ def get_donor_base_atom(
     donor: Atom,
     atoms: List[Atom],
     backbone_base_cache: Optional[Dict[ResKey4, Atom]] = None,
+    *,
+    atom_lookup: Optional[Dict[Tuple[str, int, str, str], Atom]] = None,
+    seq_index: Optional[Dict[Tuple[str, int, str, str], int]] = None,
+    chain_index_to_res: Optional[Dict[str, Dict[int, Tuple[str, int, str, str]]]] = None,
+    residue_cache_key: Optional[Tuple[ResKey4, ...]] = None,
 ) -> Optional[Atom]:
     """
     the base atom is the atom covalently bonded to the donor:
@@ -637,17 +634,23 @@ def get_donor_base_atom(
 
     returns None if not found
     """
-    cache_key = _residue_keys_cache_key(atoms)
-    if cache_key not in _ATOM_LOOKUP_CACHE:
-        _ATOM_LOOKUP_CACHE[cache_key] = {
-            (atom.chain, atom.residue_number, atom.insertion_code, atom.name): atom
-            for atom in atoms
-        }
-    atom_lookup = _ATOM_LOOKUP_CACHE[cache_key]
+    cache_key = residue_cache_key if residue_cache_key is not None else _residue_keys_cache_key(atoms)
+    if atom_lookup is None:
+        if cache_key not in _ATOM_LOOKUP_CACHE:
+            _ATOM_LOOKUP_CACHE[cache_key] = {
+                (atom.chain, atom.residue_number, atom.insertion_code, atom.name): atom
+                for atom in atoms
+            }
+        atom_lookup = _ATOM_LOOKUP_CACHE[cache_key]
 
     if donor.name == "N":
-        seq_index = _get_residue_seq_index(atoms)
+        if seq_index is None:
+            seq_index = _get_residue_seq_index(atoms)
         donor_res_key = residue_key_from_atom(donor)
+        if backbone_base_cache is not None:
+            cached_base = backbone_base_cache.get(donor_res_key)
+            if cached_base is not None:
+                return cached_base
         donor_idx = seq_index.get(donor_res_key)
         if donor_idx is None or donor_idx == 0:
             # no previous residue in sequence (true N-terminus or unmapped), so
@@ -657,7 +660,8 @@ def get_donor_base_atom(
         donor_chain = donor.chain
         if backbone_base_cache is None:
             backbone_base_cache = {}
-        chain_index_to_res = _RES_INDEX_TO_KEY_CACHE.get(cache_key, {})
+        if chain_index_to_res is None:
+            chain_index_to_res = _RES_INDEX_TO_KEY_CACHE.get(cache_key, {})
         prev_chain_map = chain_index_to_res.get(donor_chain, {})
         prev_res_key = prev_chain_map.get(donor_idx - 1)
 
@@ -733,6 +737,497 @@ def _get_region_map_for_pdb(pdb_path: str) -> Dict[Tuple[str, int, str, str], st
     return get_residue_region_map(atoms)
 
 
+def _ca_coords_array(atoms: List[Atom]) -> np.ndarray:
+    """
+    One Cα per residue as (n, 3) float64 (see ``ca_xyz_by_residue``).
+    Used for convex-hull volume helpers.
+    """
+    d = ca_xyz_by_residue(atoms)
+    if not d:
+        return np.empty((0, 3), dtype=np.float64)
+    return np.asarray(list(d.values()), dtype=np.float64)
+
+
+def convex_hull_volume_from_points(pts: np.ndarray) -> float:
+    """
+    Convex-hull volume (Å³) of arbitrary 3D points (rows of ``pts``).
+
+    Returns 0.0 when there are fewer than four points, the array is empty, or
+    Qhull cannot build a 3D hull (degenerate / coplanar).
+    """
+    pts = np.asarray(pts, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 3 or pts.shape[0] < 4:
+        return 0.0
+    try:
+        return float(ConvexHull(pts).volume)
+    except QhullError:
+        return 0.0
+
+
+def convex_hull_ca_volume(atoms: List[Atom]) -> float:
+    """
+    Convex-hull volume (Å³) of per-residue Cα coordinates.
+
+    Uses ``scipy.spatial.ConvexHull`` (Qhull): the smallest convex polyhedron
+    containing those points. This overestimates true solvent-excluded volume
+    but is fast and useful for normalization.
+
+    Returns 0.0 when there are fewer than four points or when Qhull cannot build
+    a proper 3D hull (e.g. coplanar or collinear point clouds).
+    """
+    return convex_hull_volume_from_points(_ca_coords_array(atoms))
+
+
+def spherical_shell_volume(r: float, delta_r: float) -> float:
+    """Volume (Å³) of the spherical shell ``[r, r + delta_r)`` (``r >= 0``)."""
+    if delta_r <= 0.0 or r < 0.0:
+        return 0.0
+    r_hi = r + delta_r
+    return (4.0 / 3.0) * math.pi * (r_hi**3 - r**3)
+
+
+def _per_bin_delta_r(
+    n_bins: int, delta_r: Union[float, Sequence[float]]
+) -> List[float]:
+    """Scalar broadcast or per-bin widths; length must match ``n_bins`` when a sequence."""
+    if isinstance(delta_r, (int, float)):
+        return [float(delta_r)] * n_bins
+    seq = [float(x) for x in delta_r]
+    if len(seq) != n_bins:
+        raise ValueError(
+            f"delta_r has length {len(seq)} but bin_starts has {n_bins} bins"
+        )
+    return seq
+
+
+def _pair_correlation_g_values_for_bins(
+    coords: np.ndarray,
+    rho: float,
+    bin_starts: Sequence[float],
+    delta_r: Union[float, Sequence[float]],
+) -> List[float]:
+    """
+    Pair-correlation ``g(r)`` values for multiple distance shells from one point set.
+
+    This computes the condensed pairwise distance vector once and reuses it for
+    all shells, while preserving the same counting semantics as
+    :func:`pair_correlation_g_for_bin`: each unordered pair contributes to the
+    neighbor count of both endpoints, so ``mean_n = 2 * n_pairs_in_shell / N``.
+    """
+    coords = np.asarray(coords, dtype=np.float64)
+    bin_list = [float(r) for r in bin_starts]
+    n_bin = len(bin_list)
+    zeros = [0.0] * n_bin
+    if rho <= 0.0:
+        return zeros
+    if coords.ndim != 2 or coords.shape[1] != 3:
+        return zeros
+    n = int(coords.shape[0])
+    if n < 2:
+        return zeros
+
+    drs = _per_bin_delta_r(n_bin, delta_r)
+    pairwise_distances = pdist(coords, metric="euclidean")
+    out: List[float] = []
+    for i, r_lo in enumerate(bin_list):
+        dr = drs[i]
+        V = spherical_shell_volume(r_lo, dr)
+        if V <= 0.0:
+            out.append(0.0)
+            continue
+        n_pairs_in_shell = int(
+            np.count_nonzero(
+                (pairwise_distances >= r_lo)
+                & (pairwise_distances < r_lo + dr)
+            )
+        )
+        mean_n = (2.0 * float(n_pairs_in_shell)) / float(n)
+        out.append((1.0 / rho) * (mean_n / V))
+    return out
+
+
+def pair_correlation_g_for_bin(
+    coords: np.ndarray,
+    rho: float,
+    r_lo: float,
+    delta_r: float,
+) -> float:
+    """
+    Pair correlation value g(r) for a single distance shell ``[r_lo, r_lo + delta_r)``.
+
+    ``coords`` are per-residue Cα positions (N, 3) for one category.
+    Neighbors are **same-type only** (all rows of ``coords``). Uses
+    ``g(r) = (1/ρ) · (1/N) · Σ_i n_i(r) / V(r)`` with ``n_i`` counting
+    ``j ≠ i`` in the shell and ``ρ = N / V_reference`` supplied by the caller.
+    """
+    V = spherical_shell_volume(r_lo, delta_r)
+    if V <= 0.0 or rho <= 0.0:
+        return 0.0
+    coords = np.asarray(coords, dtype=np.float64)
+    if coords.ndim != 2 or coords.shape[1] != 3:
+        return 0.0
+    n = coords.shape[0]
+    if n < 2:
+        return 0.0
+    g_values = _pair_correlation_g_values_for_bins(
+        coords, rho, (float(r_lo),), float(delta_r)
+    )
+    return float(g_values[0]) if g_values else 0.0
+
+
+def pair_correlation_clustering_score(
+    coords_same_type: np.ndarray,
+    v_reference: float,
+    bin_starts: Sequence[float] = (3.0, 4.0, 5.0),
+    delta_r: Union[float, Sequence[float]] = 1.0,
+) -> float:
+    """
+    Clustering score ``(1/K) Σ_k g(r_k)`` over distance bins.
+
+    ``v_reference`` is ``V_total`` for ``ρ = N / V_reference`` (typically convex-hull
+    volume of all Cα points in scope, e.g. all exposed residues).
+
+    Returns ``0.0`` when ``N < 1``, ``v_reference <= 0``, or no bins.
+    """
+    coords_same_type = np.asarray(coords_same_type, dtype=np.float64)
+    if coords_same_type.ndim != 2 or coords_same_type.shape[1] != 3:
+        return 0.0
+    n = int(coords_same_type.shape[0])
+    if n < 1 or v_reference <= 0.0:
+        return 0.0
+    rho = n / v_reference
+    gs = _pair_correlation_g_values_for_bins(
+        coords_same_type, rho, bin_starts, delta_r
+    )
+    return float(np.mean(gs)) if gs else 0.0
+
+
+def pair_correlation_clustering_score_random_surface_null(
+    coords_observed: np.ndarray,
+    allowed_coords: np.ndarray,
+    v_reference: float,
+    bin_starts: Sequence[float] = (3.0, 4.0, 5.0),
+    delta_r: Union[float, Sequence[float]] = 1.0,
+    n_permutations: int = 1000,
+    rng: Optional[np.random.Generator] = None,
+) -> float:
+    """
+    Mean pair-correlation score over bins, normalized by a Ripley-style null on
+    the **discrete** surface support.
+
+    Observed score is ``S_obs = mean_k g(r_k)`` (same as
+    :func:`pair_correlation_clustering_score`). The null draws ``N`` Cα
+    locations uniformly at random from ``allowed_coords`` (typically all exposed
+    residues’ Cα coordinates in scope), **without replacement** when ``len(allowed) >= N``, otherwise **with
+    replacement** — same rule as ``ripley_k_statistic`` in ``descriptors.py``.
+
+    ``n_permutations`` is clamped to at least ``1`` (non‑positive values would
+    yield an undefined null mean).
+
+    Returns ``S_obs / mean(S_null)`` over permutations, or ``0.0`` when ``N < 2``,
+    coordinates are not shape ``(N, 3)``, ``v_reference <= 0``, too few allowed
+    sites, or the null mean is non‑positive.
+    """
+    coords_observed = np.asarray(coords_observed, dtype=np.float64)
+    allowed_coords = np.asarray(allowed_coords, dtype=np.float64)
+    n = int(coords_observed.shape[0])
+    n_allow = int(allowed_coords.shape[0])
+    if (
+        coords_observed.ndim != 2
+        or coords_observed.shape[1] != 3
+        or n < 2
+        or n_allow < 2
+        or v_reference <= 0.0
+        or allowed_coords.ndim != 2
+        or allowed_coords.shape[1] != 3
+    ):
+        return 0.0
+    n_perm = max(1, int(n_permutations))
+    s_obs = pair_correlation_clustering_score(
+        coords_observed, v_reference, bin_starts, delta_r
+    )
+    replace = n_allow < n
+    gen = rng if rng is not None else np.random.default_rng(0)
+    null_means: List[float] = []
+    for _ in range(n_perm):
+        idx = gen.choice(n_allow, size=n, replace=replace)
+        sample = allowed_coords[idx]
+        null_means.append(
+            pair_correlation_clustering_score(sample, v_reference, bin_starts, delta_r)
+        )
+    s_e = float(np.mean(null_means)) if null_means else 0.0
+    if s_e <= 0.0 or not math.isfinite(s_e) or not math.isfinite(s_obs):
+        return 0.0
+    return float(s_obs / s_e)
+
+
+def pair_correlation_clustering_score_random_surface_null_by_bin(
+    coords_observed: np.ndarray,
+    allowed_coords: np.ndarray,
+    v_reference: float,
+    bin_starts: Sequence[float] = (3.0, 4.0, 5.0),
+    delta_r: Union[float, Sequence[float]] = 1.0,
+    n_permutations: int = 1000,
+    rng: Optional[np.random.Generator] = None,
+) -> List[float]:
+    """
+    Same normalization as :func:`pair_correlation_clustering_score_random_surface_null`,
+    but **one ratio per distance shell** ``[r, r + Δr)``: ``g_obs(r) / mean_perm(g_null(r))``.
+
+    Uses the **same** random Cα draws per permutation for every shell (one sample per
+    permutation, then ``g(r)`` at each ``r``), matching the structure of the global
+    null while avoiding averaging shells into a single score.
+    """
+    coords_observed = np.asarray(coords_observed, dtype=np.float64)
+    allowed_coords = np.asarray(allowed_coords, dtype=np.float64)
+    n = int(coords_observed.shape[0])
+    n_allow = int(allowed_coords.shape[0])
+    bin_list = [float(r) for r in bin_starts]
+    n_bin = len(bin_list)
+    zeros = [0.0] * n_bin
+    if (
+        coords_observed.ndim != 2
+        or coords_observed.shape[1] != 3
+        or n < 2
+        or n_allow < 2
+        or v_reference <= 0.0
+        or allowed_coords.ndim != 2
+        or allowed_coords.shape[1] != 3
+        or n_bin == 0
+    ):
+        return zeros
+    n_perm = max(1, int(n_permutations))
+    rho = n / v_reference
+    replace = n_allow < n
+    gen = rng if rng is not None else np.random.default_rng(0)
+
+    s_obs = _pair_correlation_g_values_for_bins(
+        coords_observed, rho, bin_list, delta_r
+    )
+    null_sum = np.zeros(n_bin, dtype=np.float64)
+    for _ in range(n_perm):
+        idx = gen.choice(n_allow, size=n, replace=replace)
+        sample = allowed_coords[idx]
+        sample_g = _pair_correlation_g_values_for_bins(
+            sample, rho, bin_list, delta_r
+        )
+        null_sum += np.asarray(sample_g, dtype=np.float64)
+    null_mean = null_sum / float(n_perm)
+    out: List[float] = []
+    for bi in range(n_bin):
+        se = float(null_mean[bi])
+        so = float(s_obs[bi])
+        if se <= 0.0 or not math.isfinite(se) or not math.isfinite(so):
+            out.append(0.0)
+        else:
+            out.append(float(so / se))
+    return out
+
+
+def convex_hull_ca_volume_for_pdb(pdb_path: str) -> float:
+    """Cached convex-hull volume over Cα coordinates (see ``convex_hull_ca_volume``)."""
+    abs_path = os.path.abspath(pdb_path)
+    cached = _CONVEX_HULL_CA_VOLUME_CACHE.get(abs_path)
+    if cached is not None:
+        return cached
+    vol = convex_hull_ca_volume(_get_atoms_for_path(pdb_path))
+    _CONVEX_HULL_CA_VOLUME_CACHE[abs_path] = vol
+    return vol
+
+
+def _local_pca_curvature_ratio(neighbor_coords: np.ndarray) -> float:
+    """
+    Fraction of total variance along the smallest PCA axis of a 3D point cloud.
+
+    With eigenvalues ``λ₁ ≥ λ₂ ≥ λ₃`` of the (3×3) covariance of centered points,
+    returns ``λ₃ / (λ₁ + λ₂ + λ₃)`` — near 0 for a flat patch, larger when the
+    cloud has substantial thickness along the normal direction.
+
+    ``neighbor_coords`` must be shape ``(N, 3)``. Uses population covariance
+    ``(1/N) XᵀX`` after centering. Non-finite coordinates should be filtered
+    by the caller.
+    """
+    pts = np.asarray(neighbor_coords, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        return 0.0
+    n = int(pts.shape[0])
+    if n < 1:
+        return 0.0
+    mean = np.mean(pts, axis=0)
+    xc = pts - mean
+    cov = (xc.T @ xc) / float(n)
+    vals = np.linalg.eigh(cov)[0]
+    vals = np.clip(vals, 0.0, None)
+    total = float(np.sum(vals))
+    if total <= 1e-18:
+        return 0.0
+    # eigh returns ascending order → smallest eigenvalue is index 0 (λ₃).
+    return float(vals[0] / total)
+
+
+def residue_mean_local_curvature(
+    atoms: List[Atom],
+    residue_key: ResKey4,
+    *,
+    neighborhood_radius: float = 8.0,
+    min_neighbors: int = 4,
+    exclude_hydrogens: bool = True,
+) -> Optional[float]:
+    """
+    Mean local surface “curvature” over heavy atoms of one residue.
+
+    For each qualifying atom in ``residue_key``, take all structure atoms within
+    ``neighborhood_radius`` Å (optionally excluding hydrogens), build the 3×3
+    covariance of their positions, and compute ``λ₃ / (λ₁ + λ₂ + λ₃)`` from the
+    eigenvalues (smallest over sum). Average these ratios over all atoms that
+    have at least ``min_neighbors`` points in their neighborhood.
+
+    Returns ``None`` if the residue is missing, has no heavy atoms (when
+    excluding H), or no atom yields a neighborhood large enough to score.
+
+    Parameters
+    ----------
+    atoms
+        Full atom list for the structure (same frame as the residue key).
+    residue_key
+        ``(residue_name, residue_number, chain, insertion_code)``.
+    neighborhood_radius
+        Ball radius (Å) around each atom for the local point cloud.
+    min_neighbors
+        Minimum number of atoms required in the ball (including the center atom
+        if it appears in ``atoms``).
+    exclude_hydrogens
+        If True, hydrogens are omitted from the KD-tree and from target atoms,
+        and this function reuses the shared cached heavy-atom KD-tree from
+        :func:`get_heavy_atom_tree`. If False, the full-atom environment is
+        rebuilt locally to preserve the original semantics exactly; that path is
+        intentionally less optimized.
+    """
+    if neighborhood_radius <= 0.0 or min_neighbors < 1:
+        return None
+    if not atoms:
+        return None
+    cache_key = (
+        id(atoms),
+        residue_key,
+        float(neighborhood_radius),
+        int(min_neighbors),
+        bool(exclude_hydrogens),
+    )
+    if cache_key in _RESIDUE_LOCAL_CURVATURE_CACHE:
+        return _RESIDUE_LOCAL_CURVATURE_CACHE[cache_key]
+
+    r = float(neighborhood_radius)
+
+    if exclude_hydrogens:
+        tree, coords, _atom_res_keys, heavy_atoms_by_res = get_heavy_atom_tree(atoms)
+        res_atom_indices = heavy_atoms_by_res.get(residue_key, [])
+        if not res_atom_indices or coords.shape[0] < min_neighbors:
+            _RESIDUE_LOCAL_CURVATURE_CACHE[cache_key] = None
+            return None
+
+        ratios: List[float] = []
+        for atom_idx in res_atom_indices:
+            idx = tree.query_ball_point(coords[atom_idx], r)
+            if len(idx) < min_neighbors:
+                continue
+            ratios.append(_local_pca_curvature_ratio(coords[idx]))
+
+        result = float(np.mean(ratios)) if ratios else None
+        _RESIDUE_LOCAL_CURVATURE_CACHE[cache_key] = result
+        return result
+
+    res_atoms: List[Atom] = []
+    for a in atoms:
+        if residue_key_from_atom(a) == residue_key:
+            res_atoms.append(a)
+    if not res_atoms:
+        _RESIDUE_LOCAL_CURVATURE_CACHE[cache_key] = None
+        return None
+
+    if len(atoms) < min_neighbors:
+        _RESIDUE_LOCAL_CURVATURE_CACHE[cache_key] = None
+        return None
+
+    coords = np.array(
+        [[float(a.x), float(a.y), float(a.z)] for a in atoms],
+        dtype=np.float64,
+    )
+    tree = cKDTree(coords)
+
+    ratios = []
+    for a in res_atoms:
+        idx = tree.query_ball_point((float(a.x), float(a.y), float(a.z)), r)
+        if len(idx) < min_neighbors:
+            continue
+        ratios.append(_local_pca_curvature_ratio(coords[idx]))
+
+    result = float(np.mean(ratios)) if ratios else None
+    _RESIDUE_LOCAL_CURVATURE_CACHE[cache_key] = result
+    return result
+
+
+def sum_residue_mean_local_curvature(
+    atoms: List[Atom],
+    residue_keys: Iterable[ResKey4],
+    *,
+    neighborhood_radius: float = 8.0,
+    min_neighbors: int = 4,
+    exclude_hydrogens: bool = True,
+) -> float:
+    """
+    Sum of :func:`residue_mean_local_curvature` over many residues.
+
+    Terms where the per-residue mean is undefined (``None`` or non-finite) are
+    omitted from the sum.
+    """
+    total = 0.0
+    for key in residue_keys:
+        v = residue_mean_local_curvature(
+            atoms,
+            key,
+            neighborhood_radius=neighborhood_radius,
+            min_neighbors=min_neighbors,
+            exclude_hydrogens=exclude_hydrogens,
+        )
+        if v is not None and math.isfinite(v):
+            total += float(v)
+    return total
+
+
+def mean_residue_curvature_over_residues(
+    atoms: List[Atom],
+    residue_keys: Iterable[ResKey4],
+    *,
+    neighborhood_radius: float = 8.0,
+    min_neighbors: int = 4,
+    exclude_hydrogens: bool = True,
+) -> float:
+    """
+    Mean per-residue local curvature over ``residue_keys``.
+
+    For each key, :func:`residue_mean_local_curvature` is evaluated; undefined
+    (``None`` or non-finite) values count as **0** in the sum. The average is
+    divided by **len(residue_keys)** (not by the count of defined values).
+    Returns ``0.0`` when ``residue_keys`` is empty.
+    """
+    keys = list(residue_keys)
+    if not keys:
+        return 0.0
+    total = 0.0
+    for key in keys:
+        v = residue_mean_local_curvature(
+            atoms,
+            key,
+            neighborhood_radius=neighborhood_radius,
+            min_neighbors=min_neighbors,
+            exclude_hydrogens=exclude_hydrogens,
+        )
+        if v is not None and math.isfinite(v):
+            total += float(v)
+    return total / float(len(keys))
+
+
 # ---- SASA helpers (scaled rel SASA, per-residue / per-atom weights) ----
 
 def _rel_sasa_scaled(entry: Optional[SASAEntry], attr: str) -> float:
@@ -759,8 +1254,7 @@ def residue_side_sasa_rel(
     entry = sasa_data.get(residue_key)
     if entry is None:
         return 0.0
-    v = getattr(entry, "total_side_rel", None)
-    return float(v) if v is not None else 0.0
+    return entry.total_side_rel
 
 def residue_side_sasa_abs(
     residue_key: ResKey4,
@@ -769,7 +1263,7 @@ def residue_side_sasa_abs(
     entry = sasa_data.get(residue_key)
     if entry is None:
         return 0.0
-    return float(getattr(entry, "total_side_abs", 0.0) or 0.0)
+    return entry.total_side_abs
 
 
 def residue_main_sasa(
@@ -786,7 +1280,7 @@ def residue_main_sasa_abs(
     entry = sasa_data.get(residue_key)
     if entry is None:
         return 0.0
-    return float(getattr(entry, "main_chain_abs", 0.0) or 0.0)
+    return entry.main_chain_abs
 
 
 def atom_sasa_weight(atom: Atom, sasa_data: Dict[ResKey4, SASAEntry]) -> float:
@@ -869,10 +1363,3 @@ def get_residue_keys_by_type(
     _RESIDUE_TYPE_CACHE[cache_key] = result
     return result
 
-# def _extract_residue_num(residue_number: Any) -> Optional[int]:
-#     """Extract integer residue number from PDB-style field (e.g. 111, '111A')."""
-#     if pd.isna(residue_number):
-#         return None
-#     s = str(residue_number).strip()
-#     m = re.search(r"(\\d+)", s)
-#     return int(m.group(1)) if m else None

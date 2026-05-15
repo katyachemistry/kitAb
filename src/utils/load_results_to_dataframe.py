@@ -6,7 +6,7 @@ concat into a single DataFrame compatible with clean_validation.ipynb merge logi
 The notebook merges on (heavy, light) or (name) and expects columns: base, heavy, light, name,
 plus all descriptor columns. This script:
   - Loads all *.json from the given results folder
-  - Flattens nested dicts into columns (e.g. cluster_metrics.negative_cluster_largest_size)
+  - Flattens nested dicts into columns (e.g. cluster_metrics.negative_exposed_clusters_total_side_abs_sasa, total_side_abs_fraction_sums_*)
   - Uses filename stem as "name" (e.g. R1-004)
   - Optionally merges with an order CSV (name, heavy, light) to add heavy, light, base
 
@@ -30,13 +30,7 @@ import pandas as pd
 
 
 def _is_scalar(v):
-    if v is None:
-        return True
-    if isinstance(v, (int, float, bool)):
-        return True
-    if isinstance(v, str):
-        return True
-    return False
+    return v is None or isinstance(v, (int, float, bool, str))
 
 
 def _flatten_dict(obj, parent_key: str = "", sep: str = "_"):
@@ -53,9 +47,6 @@ def _flatten_dict(obj, parent_key: str = "", sep: str = "_"):
         elif isinstance(v, dict):
             # Recurse; filter out non-scalar leaves in nested dicts
             items.extend(_flatten_dict(v, new_key, sep=sep))
-        elif isinstance(v, list):
-            # Skip or could stringify; skip to keep columns numeric where possible
-            continue
         else:
             continue
     return items
@@ -73,8 +64,15 @@ def load_json_results(results_dir: Path, name_from_stem: bool = True) -> pd.Data
 
     rows = []
     for path in jsons:
-        with open(path, "r") as f:
-            data = json.load(f)
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"Warning: skipping {path.name}: {e}", file=sys.stderr)
+            continue
+        if not isinstance(data, dict):
+            print(f"Warning: skipping {path.name}: top-level JSON value is not an object", file=sys.stderr)
+            continue
         flat = dict(_flatten_dict(data))
         if name_from_stem:
             flat["name"] = path.stem
@@ -126,7 +124,7 @@ def main():
         df["base"] = args.base
 
     if args.order_csv is not None:
-        order_path = Path(args.order_csv)
+        order_path = args.order_csv
         if not order_path.exists():
             print(f"Order CSV not found: {order_path}", file=sys.stderr)
             sys.exit(1)
@@ -144,7 +142,7 @@ def main():
             print(f"Warning: only {n_matched}/{before} rows matched order CSV by 'name'.", file=sys.stderr)
 
     if args.out is not None:
-        out = Path(args.out)
+        out = args.out
         out.parent.mkdir(parents=True, exist_ok=True)
         if args.parquet:
             df.to_parquet(out, index=False)
@@ -153,8 +151,6 @@ def main():
         print(f"Wrote {len(df)} rows to {out}")
     else:
         print(f"Loaded {len(df)} rows, {len(df.columns)} columns. Pass --out to save CSV/Parquet.")
-
-    return df
 
 
 if __name__ == "__main__":

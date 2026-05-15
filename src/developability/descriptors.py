@@ -15,25 +15,28 @@ import pandas as pd
 from developability.structure_context import StructureContext, ResKey4
 from developability.descriptor_utils import (
     CDR_RANGES_CA,
+    _ATOM_LOOKUP_CACHE,
+    _RES_INDEX_TO_KEY_CACHE,
     get_residue_region,
-    get_residue_region_map,
+    # get_residue_region_map,
     iter_unique_residues,
     _get_atoms_for_path,
-    get_residue_keys_by_type,
-    normalize_hydropathy,
+    _residue_keys_cache_key,
+    # get_residue_keys_by_type,
     _residue_fractional_charge_at_pH,
-    is_residue_charged,
     is_hydrogen_atom,
     atom_sasa_weight,
     get_residue_sasa_weight,
-    residue_main_sasa,
-    residue_side_sasa,
+    residue_side_sasa_abs,
+    # residue_main_sasa,
+    # residue_side_sasa,
     _get_structure_context,
     _count_residues_in_pdb,
     _get_residue_seq_index,
     _get_charged_residues_at_pH,
-    _RES_INDEX_TO_KEY_CACHE,
+    # _RES_INDEX_TO_KEY_CACHE,
     _residue_category_group,
+    _residue_category_group_surface_pcf,
     get_exposed_residues,
     _sasa_lookup,
     is_donor,
@@ -42,66 +45,66 @@ from developability.descriptor_utils import (
     donor_max_hbonds,
     acceptor_max_hbonds,
     _aggregate_dssp_hbond_energy_to_raw,
-    _INTER_CHAIN_INTERFACE_CACHE,
-    _compute_inter_chain_interface_from_by_chain,
-    get_inter_chain_interface_residues)
+    # _INTER_CHAIN_INTERFACE_CACHE,
+    # _compute_inter_chain_interface_from_by_chain,
+    get_inter_chain_interface_residues,
+    convex_hull_volume_from_points,
+    pair_correlation_clustering_score_random_surface_null_by_bin,
+    get_heavy_atom_tree,
+)
 
 from utils.parsers import (
-    get_sasa_total,
+    ca_xyz_by_residue,
     parse_dssp,
     parse_sasa,
     Atom,
     SASAEntry,
     residue_key_from_atom,
-    parse_motif_to_3letter
+    # parse_motif_to_3letter
 )
-from utils.chemistry import get_standard_residue_pka
-from utils.geometry import (
-    is_backbone_atom
+from utils.chemistry import (
+    _ANN_INDEX_AROMATIC_RESIDUES,
+    _ANN_INDEX_NEGATIVE_RESIDUES,
+    _ANN_INDEX_POSITIVE_RESIDUES,
+    AA_1_TO_3,
+    ANN_INDEX_N_PERMUTATIONS_DEFAULT,
+    ANN_INDEX_SASA_CUTOFF_DEFAULT,
+    AROMATIC_RESIDUES,
+    CDR_VICINITY_RADIUS,
+    CTERM_PKA,
+    DBSCAN_EPS_MIN_SAMPLES_BY_CATEGORY_DEFAULT,
+    EXPOSURE_REL_ASA_THRESHOLD,
+    get_ff19sb_atom_charge,
+    get_ff19sb_atom_charge_with_source,
+    GLN_ASN_RESIDUES,
+    HYDROPHOBIC_RESIDUES,
+    INTER_CHAIN_INTERFACE_CUTOFF,
+    is_backbone_atom,
+    KYTE_DOOLITTLE,
+    MAX_HBOND_DISTANCE,
+    MAX_SALT_BRIDGE_DISTANCE,
+    MIN_BACKBONE_SEPARATION,
+    MIN_HBOND_ANGLE,
+    NEGATIVE_ATOMS,
+    NEGATIVE_CHARGED_RESIDUES,
+    normalize_hydropathy,
+    NTERM_PKA,
+    PCF_CLUSTER_BIN_STARTS_DEFAULT,
+    PCF_CLUSTER_BIN_WIDTHS_DEFAULT,
+    PCF_CLUSTER_N_PERMUTATIONS_DEFAULT,
+    POLAR_RESIDUES,
+    POSITIVE_ATOMS,
+    POSITIVE_CHARGED_RESIDUES,
+    PSH_PAIR_RADIUS,
+    RIPLEY_K_DISTANCE,
+    RIPLEY_K_N_SAMPLES,
+    SCM_MAIN_CHAIN_ATOMS,
+    SURFACE_EXPOSED_THRESHOLD_DEFAULT,
+    THREE_TO_ONE,
+    get_standard_residue_pka,
 )
 
 logger = logging.getLogger(__name__)
-
-AA_1_TO_3 = {
-    'A': 'ALA', 'R': 'ARG', 'N': 'ASN', 'D': 'ASP', 'C': 'CYS',
-    'Q': 'GLN', 'E': 'GLU', 'G': 'GLY', 'H': 'HIS', 'I': 'ILE',
-    'L': 'LEU', 'K': 'LYS', 'M': 'MET', 'F': 'PHE', 'P': 'PRO',
-    'S': 'SER', 'T': 'THR', 'W': 'TRP', 'Y': 'TYR', 'V': 'VAL'
-}
-
-THREE_TO_ONE = {v: k for k, v in AA_1_TO_3.items()}
-
-POSITIVE_ATOMS = frozenset({
-    ("NH1", "ARG"),
-    ("NH2", "ARG"),
-    ("NZ", "LYS"),
-    ("ND1","HIS"),
-    ("NE2","HIS")
-})
-
-NEGATIVE_ATOMS = frozenset({
-    ("OD1", "ASP"),
-    ("OD2", "ASP"),
-    ("OE1", "GLU"),
-    ("OE2", "GLU"),
-    # Phenolic / thiol deprotonation.
-    ("OH", "TYR"),
-    ("SG", "CYS"),
-})
-
-
-# Residue sets used by the notebook
-GLN_ASN_RESIDUES = frozenset({"GLN", "ASN"})
-
-# Metrics for which we compute median / beta_sheet_median / buried_median / exposed_median
-# METRICS = ["hbond_density", "salt_bridge_density", "wcn", "hbond_energy_dssp_density"]
-
-KYTE_DOOLITTLE = {
-    "ILE": 4.5, "VAL": 4.2, "LEU": 3.8, "PHE": 2.8, "CYS": 2.5,
-    "MET": 1.9, "ALA": 1.8, "GLY": -0.4, "THR": -0.7, "SER": -0.8,
-    "TRP": -0.9, "TYR": -1.3, "PRO": -1.6, "HIS": -3.2, "GLU": -3.5,
-    "GLN": -3.5, "ASP": -3.5, "ASN": -3.5, "LYS": -3.9, "ARG": -4.5,
-}
 
 CLUSTER_LABEL_COLS = [
     "negative_cluster_labels",
@@ -111,49 +114,10 @@ CLUSTER_LABEL_COLS = [
     "polar_cluster_labels",
 ]
 
-NEGATIVE_CHARGED_RESIDUES = frozenset({res for _atom, res in NEGATIVE_ATOMS})
-POSITIVE_CHARGED_RESIDUES = frozenset({res for _atom, res in POSITIVE_ATOMS})
-POLAR_RESIDUES = frozenset({"SER", "THR", "ASN", "GLN", "TYR", "GLU", "ASP", "LYS", "ARG", "HIS"})
-AROMATIC_RESIDUES = frozenset({"PHE", "TYR", "TRP"})
-HYDROPHOBIC_RESIDUES = frozenset({"ALA", "VAL", "LEU", "ILE", "MET", "PHE", "TRP", "PRO", "CYS"})
-
-MAX_HBOND_DISTANCE = 3.2
-MAX_SALT_BRIDGE_DISTANCE = 4.0
-INTER_CHAIN_INTERFACE_CUTOFF = 5.0
-MIN_HBOND_ANGLE = 120.0 # angle base -> donor -> acceptor
-MIN_BACKBONE_SEPARATION = 3
-NTERM_PKA = 8.0
-CTERM_PKA = 3.1
-
 _HBOND_PAIRS_CACHE: Dict[Tuple[str, float, float, int], List[Tuple[Atom, Atom]]] = {}
 _PDB_SEQUENCE_CACHE: Dict[str, Dict[str, List[str]]] = {}
-SCM_MAIN_CHAIN_ATOMS = frozenset({"CA", "HA", "N", "C", "O", "HN", "H"})
 
 # Charge
-
-
-def _residue_fractional_charge_at_pH_for_charge_metrics(
-    residue_name: str,
-    pka_value: Optional[float],
-    pH: float,
-) -> float:
-    """
-    Fractional charge for net charge / pI and charge-weighting metrics.
-
-    Negative residues (ASP/GLU plus TYR/CYS) are treated as titratable acidic
-    groups: phenolic/thiol deprotonation -> -1 when deprotonated.
-    """
-    res_name = (residue_name or "").strip().upper()
-    effective_pka = pka_value if pka_value is not None else get_standard_residue_pka(res_name)
-    if effective_pka is None:
-        return 0.0
-
-    if res_name in NEGATIVE_CHARGED_RESIDUES:
-        return -1.0 / (1.0 + np.power(10.0, effective_pka - pH))
-    if res_name in POSITIVE_CHARGED_RESIDUES:
-        return 1.0 / (1.0 + np.power(10.0, pH - effective_pka))
-    return 0.0
-
 
 def net_charge_from_pka(
     pka_data: Dict[Tuple[str, int, str, str], float],
@@ -163,19 +127,44 @@ def net_charge_from_pka(
     if not pka_data:
         return None
     net = 0.0
-    for key, pka in pka_data.items():
-        res_name = key[0]
-        net += _residue_fractional_charge_at_pH_for_charge_metrics(res_name, pka, pH)
+    nterm_pka_by_chain: Dict[str, float] = {}
+    cterm_pka_by_chain: Dict[str, float] = {}
+    chains: set = set()
 
-    chains = {key[2] for key in pka_data.keys()}
-    n_chains = len(chains)
-    if n_chains > 0:
-        # N-terminus
-        net += n_chains * (1.0 / (1.0 + np.power(10.0, pH - NTERM_PKA)))
-        # C-terminus
-        net -= n_chains * (1.0 / (1.0 + np.power(10.0, CTERM_PKA - pH)))
+    for key, pka in pka_data.items():
+        res_name, _, chain, _ = key
+        chains.add(chain)
+        if res_name == "N+":
+            nterm_pka_by_chain[chain] = pka
+        elif res_name == "C-":
+            cterm_pka_by_chain[chain] = pka
+        else:
+            net += _residue_fractional_charge_at_pH(res_name, pka, pH)
+
+    for chain in chains:
+        nterm_pka = nterm_pka_by_chain.get(chain, NTERM_PKA)
+        cterm_pka = cterm_pka_by_chain.get(chain, CTERM_PKA)
+        # N-terminus: positive group, protonated at low pH
+        net += 1.0 / (1.0 + np.power(10.0, pH - nterm_pka))
+        # C-terminus: negative group, deprotonated at high pH
+        net -= 1.0 / (1.0 + np.power(10.0, cterm_pka - pH))
 
     return float(net)
+
+
+def simple_residue_charge_from_sequence(resname: str) -> float:
+    """
+    Fixed formal charge from 3-letter residue name (no pKa): Asp/Glu −1, Lys/Arg +1, His +0.1.
+    """
+    r = (resname or "").upper()
+    if r in {"ASP", "GLU"}:
+        return -1.0
+    if r in {"LYS", "ARG"}:
+        return 1.0
+    if r == "HIS":
+        return 0.1
+    return 0.0
+
 
 def pi_from_pka(
     pka_data: Dict[Tuple[str, int, str, str], float]
@@ -183,532 +172,995 @@ def pi_from_pka(
     if not pka_data:
         return None
 
-    def charge_at_pH(pH: float) -> float:
-        q = net_charge_from_pka(pka_data, pH)
-        return q if q is not None else 0.0
-
     try:
-        q0 = charge_at_pH(0.0)
-        q14 = charge_at_pH(14.0)
+        q0 = net_charge_from_pka(pka_data, 0.0) or 0.0
+        q14 = net_charge_from_pka(pka_data, 14.0) or 0.0
         if q0 * q14 > 0:
             return None
-        return float(optimize.brentq(charge_at_pH, 0.0, 14.0))
+        return float(optimize.brentq(
+            lambda pH: net_charge_from_pka(pka_data, pH) or 0.0,
+            0.0, 14.0,
+        ))
     except (ValueError, Exception):
         return None
-
-
-# ---------------------------------------------------------------------------
-# Alternative sequence-based net charge (no structure / PropKa dependency)
-# ---------------------------------------------------------------------------
-
-# Copy of PROPERMAB-style simplified side-chain charge logic:
-# - uses fixed pKa values only as a threshold for histidine protonation
-# - returns integer net charge based on residue counts
-_SEQUTILS_PKA_DICT = {
-    "N_term": (8.6, 1),
-    "C_term": (3.6, -1),
-    "D": (3.9, -1),
-    "E": (4.1, -1),
-    "H": (6.5, 1),
-    "Y": (10.1, -1),
-    "K": (10.8, 1),
-    "R": (12.5, 1),
-}
-
-
-# def net_charge_from_seq(seq: str, pH: float = 7.4) -> float:
-#     """
-#     Sequence-based net charge used for quick comparisons.
-
-#     Note: this matches PROPERMAB's `calculate_seq_charge()` behavior:
-#     it models His as titratable via a pH threshold and counts only
-#     side-chain contributions (no explicit N/C termini terms).
-#     """
-#     if pH < _SEQUTILS_PKA_DICT["H"][0]:
-#         return (
-#             seq.count("H") + seq.count("K") + seq.count("R") - seq.count("D") - seq.count("E")
-#         )
-#     return seq.count("K") + seq.count("R") - seq.count("D") - seq.count("E")
 
 def compute_dipole_moment_magnitude(
     pdb_atoms: List[Atom],
     pka_output_data: Dict[ResKey4, float],
     pH: float,
+    *,
+    debug_charge_stats: Optional[Dict[str, int]] = None,
 ) -> Optional[float]:
     """
-    Dipole moment magnitude from ionizable atom positions and pH-dependent fractional charges.
+    Dipole moment magnitude ‖μ‖ in e·Å (not Debye).
 
-    We approximate the dipole as
-      μ = Σ q_i * (r_i - r0),
-    where r_i is the centroid of ionizable atoms for residue i, and r0 is a single
-    reference centroid shared across all residues. Subtracting r0 makes the result
-    invariant to global translation of the input coordinates.
+    Uses Amber ff19SB atom partial charges from ``amino19.lib`` (including H;
+    see ``utils.chemistry.FF19SB_ATOM_CHARGES``). Missing (residue, atom) pairs
+    use charge ``0.0``.
+
+    ``μ = Σ_i q_i (r_i − r_0)`` with *r_0* the centroid of all input atoms
+    (translation-invariant). ``pka_output_data`` and ``pH`` are kept for API
+    compatibility with callers; they are not used here.
     """
-    # Ionizable atoms per residue for dipole estimation.
-    # Constructed from the same POSITIVE_ATOMS / NEGATIVE_ATOMS definitions used
-    # elsewhere in this module for charge handling (including Tyr/Cys).
-    ionizable_atom_names_by_residue_lists: Dict[str, List[str]] = {}
-    for atom_name, res_name in POSITIVE_ATOMS:
-        ionizable_atom_names_by_residue_lists.setdefault(res_name, []).append(atom_name)
-    for atom_name, res_name in NEGATIVE_ATOMS:
-        ionizable_atom_names_by_residue_lists.setdefault(res_name, []).append(atom_name)
-    ionizable_atom_names_by_residue: Dict[str, Tuple[str, ...]] = {
-        res_name: tuple(sorted(atom_names))
-        for res_name, atom_names in ionizable_atom_names_by_residue_lists.items()
-    }
+    _ = (pka_output_data, pH)  # unused; retained for call-site compatibility
 
-    # Collect per-residue representative coords as the centroid of ionizable atoms.
-    coords_by_res: Dict[ResKey4, List[Tuple[float, float, float]]] = {}
-    for atom in pdb_atoms:
-        atom_name = (atom.name or "").strip().upper()
-        res_name = (atom.residue_name or "").strip().upper()
-        allowed = ionizable_atom_names_by_residue.get(res_name)
-        if not allowed:
-            continue
-        if atom_name not in allowed:
-            continue
-        key = residue_key_from_atom(atom)
-        coords_by_res.setdefault(key, []).append((atom.x, atom.y, atom.z))
-
-    def get_pka(k: ResKey4) -> Optional[float]:
-        return pka_output_data.get(k) or pka_output_data.get((k[0], k[1], k[2], ""))
-
-    # Reference centroid for translation invariance.
-    # Use the centroid of all atoms we were given (not just ionizable ones),
-    # matching the approach in `struct_featurizer.py`.
     if not pdb_atoms:
         return 0.0
+
+    residue_atom_names: Dict[ResKey4, Set[str]] = {}
+    for a in pdb_atoms:
+        key4 = residue_key_from_atom(a)
+        residue_atom_names.setdefault(key4, set()).add((a.name or "").strip().upper())
+
     ref_center = np.mean(
         np.array([(a.x, a.y, a.z) for a in pdb_atoms], dtype=np.float64),
         axis=0,
     )
+    rx, ry, rz = float(ref_center[0]), float(ref_center[1]), float(ref_center[2])
+
+    lookup_counts: Dict[str, int] = {
+        "direct": 0,
+        "fallback_oxt_to_o": 0,
+        "fallback_h123_to_h": 0,
+        "missing": 0,
+    }
 
     mux, muy, muz = 0.0, 0.0, 0.0
-    for key, coords in coords_by_res.items():
-        if not coords:
-            continue
-
-        res_name = key[0]
-        pka_val = get_pka(key)
-        q = float(_residue_fractional_charge_at_pH_for_charge_metrics(res_name, pka_val, pH))
+    for atom in pdb_atoms:
+        res_name = (atom.residue_name or "").strip().upper()
+        q, source = get_ff19sb_atom_charge_with_source(
+            res_name,
+            atom.name or "",
+            residue_atom_names=residue_atom_names.get(residue_key_from_atom(atom)),
+        )
+        lookup_counts[source] = lookup_counts.get(source, 0) + 1
         if q == 0.0:
             continue
+        mux += q * (float(atom.x) - rx)
+        muy += q * (float(atom.y) - ry)
+        muz += q * (float(atom.z) - rz)
 
-        # Centroid of ionizable atom positions for stable, non-double-counted dipole vector.
-        xs = [c[0] for c in coords]
-        ys = [c[1] for c in coords]
-        zs = [c[2] for c in coords]
-        x = float(np.mean(xs))
-        y = float(np.mean(ys))
-        z = float(np.mean(zs))
+    if debug_charge_stats is not None:
+        debug_charge_stats.clear()
+        debug_charge_stats.update(lookup_counts)
+        debug_charge_stats["n_atoms"] = len(pdb_atoms)
+        debug_charge_stats["n_nonzero_charge"] = (
+            lookup_counts["direct"] + lookup_counts["fallback_oxt_to_o"] + lookup_counts["fallback_h123_to_h"]
+        )
 
-        dx = x - float(ref_center[0])
-        dy = y - float(ref_center[1])
-        dz = z - float(ref_center[2])
-        mux += q * dx
-        muy += q * dy
-        muz += q * dz
-
-    return math.sqrt(mux * mux + muy * muy + muz * muz)
+    return float(math.sqrt(mux * mux + muy * muy + muz * muz))
 
 
-# def compute_hydrophobic_moment_magnitude(
-#     pdb_atoms: List[Atom],
-#     *,
-#     normalize_by_n: bool = False,
-# ) -> float:
-#     """
-#     Magnitude of the first-order hydrophobic moment (amphiphilicity), analogous to
-#     a dipole but with Kyte–Doolittle hydrophobicity instead of charge.
+def compute_hydrophobic_moment_magnitude(
+    pdb_atoms: List[Atom],
+) -> Optional[float]:
+    """
+    PROPERMAB-style hydrophobic moment magnitude.
 
-#     For each residue *i*, let *h_i* be the Kyte–Doolittle value and *r_i* the center
-#     of geometry (mean position of all atoms in that residue). The moment vector is
+    For each residue, compute the center of geometry over all residue atoms and
+    sum ``hydropathy(residue) * r_residue`` using the raw Kyte-Doolittle scale.
+    As in ProperMAb, this uses the absolute residue coordinates directly (no
+    centroid subtraction), so the result is not translation-invariant.
+    """
+    if not pdb_atoms:
+        return 0.0
 
-#         **H** = Σ_i h_i * r_i
+    residue_atoms: Dict[ResKey4, List[Atom]] = defaultdict(list)
+    for atom in pdb_atoms:
+        residue_atoms[residue_key_from_atom(atom)].append(atom)
 
-#     Some references include a factor 1/N with N the number of residues; set
-#     ``normalize_by_n=True`` to use **H** = (1/N) Σ_i h_i * r_i.
+    residue_cogs: List[np.ndarray] = []
+    residue_hydropathy: List[float] = []
+    for key4 in sorted(residue_atoms.keys(), key=lambda k: (k[2], k[1], k[3], k[0])):
+        kd = KYTE_DOOLITTLE.get((key4[0] or "").strip().upper())
+        if kd is None:
+            continue
+        coords = np.array(
+            [(float(a.x), float(a.y), float(a.z)) for a in residue_atoms[key4]],
+            dtype=np.float64,
+        )
+        if coords.size == 0:
+            continue
+        residue_cogs.append(np.mean(coords, axis=0))
+        residue_hydropathy.append(float(kd))
 
-#     This matches PROPERMAB ``StructFeaturizer.hyd_moment`` when
-#     ``normalize_by_n=False`` (unnormalized sum, then Euclidean norm).
+    if not residue_cogs:
+        return 0.0
 
-#     Parameters
-#     ----------
-#     pdb_atoms
-#         Structure atoms (typically parsed PDB).
-#     normalize_by_n
-#         If True, scale the summed vector by 1/N before taking the norm (N = count of
-#         residues that contribute: standard amino acids present in ``KYTE_DOOLITTLE``).
+    cog_arr = np.asarray(residue_cogs, dtype=np.float64)
+    hyd_arr = np.asarray(residue_hydropathy, dtype=np.float64).reshape((-1, 1))
+    hyd_vector = np.sum(cog_arr * hyd_arr, axis=0)
+    return float(np.linalg.norm(hyd_vector))
 
-#     Returns
-#     -------
-#     float
-#         ‖**H**‖ (or ‖**H**/N‖ when ``normalize_by_n`` is True). 0.0 if no residues
-#         contribute.
-#     """
-#     if not pdb_atoms:
-#         return 0.0
+def residue_neighbor_score(
+    pdb_atoms: List[Atom],
+    sasa_data: Dict[ResKey4, SASAEntry],
+    d_cutoff: float,
+    *,
+    pka_data: Optional[Dict[ResKey4, float]] = None,
+    pH: float = 7.0,
+    source: str = "charge",
+    sasa_weight_sources: bool = True,
+    sasa_cutoff: float = EXPOSURE_REL_ASA_THRESHOLD,
+    ionizable_only: bool = False,
+    center_weight: str = "sasa",
+    weight_center_by_sasa: bool = False,
+    reduce: str = "neg_abs",
+) -> Optional[float]:
+    """Generic SASA-weighted residue-pair score using min heavy-atom distance.
 
-#     coords_by_res: Dict[ResKey4, List[Tuple[float, float, float]]] = defaultdict(list)
-#     for atom in pdb_atoms:
-#         key = residue_key_from_atom(atom)
-#         coords_by_res[key].append((atom.x, atom.y, atom.z))
+    For each residue *i* (center), accumulate contributions from all residues *j*
+    (sources) whose heavy atoms lie within ``d_cutoff`` of any heavy atom of *i*.
+    Then apply a per-center multiplier and aggregate.
 
-#     hx, hy, hz = 0.0, 0.0, 0.0
-#     n_used = 0
-#     for key, coords in coords_by_res.items():
-#         if not coords:
-#             continue
-#         res_name = (key[0] or "").strip().upper()
-#         h_i = KYTE_DOOLITTLE.get(res_name)
-#         if h_i is None:
-#             continue
-#         arr = np.asarray(coords, dtype=np.float64)
-#         r_i = np.mean(arr, axis=0)
-#         hx += float(h_i) * float(r_i[0])
-#         hy += float(h_i) * float(r_i[1])
-#         hz += float(h_i) * float(r_i[2])
-#         n_used += 1
+    SASA values are ``total_side_rel`` (relative side-chain SASA, fraction in
+    [0, 1]) throughout.  Distance is the minimum heavy-atom distance (via the
+    shared cached KDTree from ``get_heavy_atom_tree``).
 
-#     if n_used == 0:
-#         return 0.0
-#     if normalize_by_n:
-#         inv_n = 1.0 / float(n_used)
-#         hx *= inv_n
-#         hy *= inv_n
-#         hz *= inv_n
-#     return float(math.sqrt(hx * hx + hy * hy + hz * hz))
+    Parameters
+    ----------
+    source : ``"charge"`` | ``"hydrophobicity"`` | ``"charge_pos"`` |
+             ``"charge_neg"`` | ``"sasa_only"``
+        Property that each source residue *j* contributes (before optional SASA
+        weighting).  ``"charge"`` uses the pH-dependent fractional charge;
+        ``"hydrophobicity"`` uses the Kyte–Doolittle scale; ``"charge_pos"`` /
+        ``"charge_neg"`` use only the positive / negative part of the charge;
+        ``"sasa_only"`` sets the property to 1 (pure SASA weighting).
+    sasa_weight_sources : bool
+        If *True*, source contribution = property(j) × sasa(j); all residues
+        are valid sources.
+        If *False*, source contribution = property(j) with no SASA multiplier;
+        only exposed residues (sasa > ``sasa_cutoff``) are valid sources.
+    ionizable_only : bool
+        Restrict both centers and sources to residues that contain at least one
+        ionizable atom (POSITIVE_ATOMS ∪ NEGATIVE_ATOMS).
+    center_weight : ``"sasa"`` | ``"hydrophobicity"`` | ``"charge"`` |
+                    ``"charge_pos"`` | ``"charge_neg"`` | ``"none"``
+        Multiplier applied to each center's accumulated sum before aggregation.
+    weight_center_by_sasa : bool
+        If *True*, additionally multiply the center weight by ``sasa(i)``, so
+        the effective center multiplier becomes ``center_weight(i) × sasa(i)``.
+        Used by SAP to make the aggregation symmetric with the source weighting.
+    reduce : ``"neg_abs"`` | ``"pos_abs"`` | ``"sum"``
+        ``"neg_abs"``: ``|Σ_{i: result_i < 0} result_i|``  (SCM anionic clustering).
+        ``"pos_abs"``: ``Σ_{i: result_i > 0} result_i``    (SCM cationic clustering).
+        ``"sum"``:     ``Σ_i result_i``                     (SAP-style).
+    """
+    if not pdb_atoms or not sasa_data:
+        return None
+
+    needs_charge = source in ("charge", "charge_pos", "charge_neg") or center_weight in (
+        "charge", "charge_pos", "charge_neg"
+    )
+
+    # --- identify which residues to include ---
+    ionizable_keys: Optional[Set[ResKey4]] = None
+    if ionizable_only:
+        ionizable_atom_names: Dict[str, set] = {}
+        for atom_name, res_name in POSITIVE_ATOMS:
+            ionizable_atom_names.setdefault(res_name, set()).add(atom_name)
+        for atom_name, res_name in NEGATIVE_ATOMS:
+            ionizable_atom_names.setdefault(res_name, set()).add(atom_name)
+        ionizable_keys = set()
+        for a in pdb_atoms:
+            allowed = ionizable_atom_names.get((a.residue_name or "").strip().upper())
+            if allowed and (a.name or "").strip().upper() in allowed:
+                ionizable_keys.add(residue_key_from_atom(a))
+        if not ionizable_keys:
+            return None
+        res_keys: List[ResKey4] = list(ionizable_keys)
+    else:
+        res_keys = list(iter_unique_residues(pdb_atoms))
+
+    if not res_keys:
+        return None
+
+    m = len(res_keys)
+    res_key_to_idx: Dict[ResKey4, int] = {k: i for i, k in enumerate(res_keys)}
+
+    # --- per-residue arrays ---
+    sasa_arr = np.zeros(m, dtype=np.float64)
+    charge_arr = np.zeros(m, dtype=np.float64)
+
+    for i, key4 in enumerate(res_keys):
+        entry = sasa_data.get(key4)
+        sasa_arr[i] = float(getattr(entry, "total_side_rel", 0.0) or 0.0)
+        if needs_charge:
+            pka = pka_data.get(key4) if pka_data else None
+            charge_arr[i] = _residue_fractional_charge_at_pH(key4[0], pka, pH)
+
+    exposed_arr: np.ndarray = sasa_arr > sasa_cutoff
+
+    # --- source contribution per source j ---
+    if source == "charge":
+        raw_source = charge_arr
+    elif source == "hydrophobicity":
+        raw_source = np.array(
+            [float(KYTE_DOOLITTLE.get(k[0], 0.0)) for k in res_keys], dtype=np.float64
+        )
+    elif source == "charge_pos":
+        raw_source = np.maximum(0.0, charge_arr)
+    elif source == "charge_neg":
+        raw_source = np.minimum(0.0, charge_arr)
+    elif source == "sasa_only":
+        raw_source = np.ones(m, dtype=np.float64)
+    else:
+        raise ValueError(f"residue_neighbor_score: unknown source={source!r}")
+
+    if sasa_weight_sources:
+        source_contrib = raw_source * sasa_arr
+        valid_source = np.ones(m, dtype=bool)
+    else:
+        source_contrib = raw_source
+        valid_source = exposed_arr
+
+    # --- center-level multiplier ---
+    if center_weight == "sasa":
+        center_arr = sasa_arr
+    elif center_weight == "hydrophobicity":
+        center_arr = np.array(
+            [float(KYTE_DOOLITTLE.get(k[0], 0.0)) for k in res_keys], dtype=np.float64
+        )
+    elif center_weight == "charge":
+        center_arr = charge_arr
+    elif center_weight == "charge_pos":
+        center_arr = np.maximum(0.0, charge_arr)
+    elif center_weight == "charge_neg":
+        center_arr = np.minimum(0.0, charge_arr)
+    elif center_weight == "none":
+        center_arr = np.ones(m, dtype=np.float64)
+    else:
+        raise ValueError(f"residue_neighbor_score: unknown center_weight={center_weight!r}")
+
+    # --- pairwise accumulation via shared heavy-atom KDTree ---
+    heavy_tree, heavy_coords, heavy_atom_res_keys, heavy_atoms_by_res = get_heavy_atom_tree(pdb_atoms)
+
+    score_arr = np.zeros(m, dtype=np.float64)
+    for ri, key_i in enumerate(res_keys):
+        atom_indices_i = heavy_atoms_by_res.get(key_i, [])
+        if not atom_indices_i:
+            continue
+        # Collect the set of distinct neighbor residue indices within d_cutoff.
+        seen_rj: Set[int] = set()
+        for nb_atom_idxs in heavy_tree.query_ball_point(heavy_coords[atom_indices_i], r=d_cutoff):
+            for nb_atom_idx in nb_atom_idxs:
+                rj = res_key_to_idx.get(heavy_atom_res_keys[nb_atom_idx])
+                if rj is None or rj == ri or rj in seen_rj:
+                    continue
+                if not valid_source[rj]:
+                    continue
+                seen_rj.add(rj)
+                score_arr[ri] += source_contrib[rj]
+
+    if weight_center_by_sasa:
+        center_arr = center_arr * sasa_arr
+    result_arr = score_arr * center_arr
+
+    # --- reduce ---
+    if reduce == "neg_abs":
+        neg_mask = result_arr < 0.0
+        return float(np.abs(np.sum(result_arr[neg_mask])))
+    elif reduce == "pos_abs":
+        pos_mask = result_arr > 0.0
+        return float(np.sum(result_arr[pos_mask]))
+    elif reduce == "sum":
+        return float(np.sum(result_arr))
+    else:
+        raise ValueError(f"residue_neighbor_score: unknown reduce={reduce!r}")
 
 
-# Spatial Charge Map with optional weighting by SASA (default: True)
-
+# Spatial Charge Map — wrapper around residue_neighbor_score
 def scm_score_from_pka(
     pdb_path: str,
     sasa_path: str,
     pka_data: Dict[Tuple[str, int, str, str], float],
     pH: float,
     d_cutoff: float = 10.0,
-    sasa_cutoff: float = 0.05,
+    sasa_cutoff: float = EXPOSURE_REL_ASA_THRESHOLD,
     sasa_weighting: bool = True,
+    reduce: str = "neg_abs",
 ) -> Optional[float]:
+    """Spatial Charge Map score.
 
-    from utils.parsers import parse_sasa
-
-    atoms = _get_atoms_for_path(pdb_path)
+    ``reduce="neg_abs"`` captures anionic charge clustering (default, original SCM).
+    ``reduce="pos_abs"`` captures cationic charge clustering.
+    """
+    ctx = _get_structure_context(pdb_path, sasa_path=sasa_path)
+    atoms = ctx.atoms
     if not atoms:
         return None
-
-    try:
-        sasa_data = parse_sasa(sasa_path)
-    except Exception as e:
-        logger.warning("SCM: failed to parse SASA %s: %s", sasa_path, e)
+    sasa_data = ctx.sasa_residue
+    if not sasa_data:
         return None
-
     try:
-        n = len(atoms)
-        coords = np.array([[a.x, a.y, a.z] for a in atoms], dtype=np.float64)
-        
-        key4_list: List[Tuple[str, int, str, str]] = [
-            residue_key_from_atom(a) for a in atoms
-        ]
-
-        residue_exposure = get_exposed_residues(sasa_data, sasa_cutoff)
-        residue_exposed = np.array(
-            [residue_exposure.get(key4, False) for key4 in key4_list],
-            dtype=bool,
+        return residue_neighbor_score(
+            atoms,
+            sasa_data,
+            d_cutoff,
+            pka_data=pka_data,
+            pH=pH,
+            source="charge",
+            sasa_weight_sources=sasa_weighting,
+            sasa_cutoff=sasa_cutoff,
+            ionizable_only=True,
+            center_weight="sasa" if sasa_weighting else "none",
+            reduce=reduce,
         )
-
-        residue_sasa: Dict[Tuple[str, int, str, str], float] = {}
-        for key4 in key4_list:
-            entry = sasa_data.get(key4)
-            residue_sasa[key4] = float(getattr(entry, "total_side_rel", 0.0) or 0.0)
-        
-        residue_charge: Dict[Tuple[str, int, str, str], float] = {}
-        residue_charged_atom_count: Dict[Tuple[str, int, str, str], int] = {}
-        for a, key4 in zip(atoms, key4_list):
-            if key4 not in residue_charge:
-                residue_charge[key4] = _residue_fractional_charge_at_pH(
-                    a.residue_name, pka_data.get(key4), pH
-                )
-            # Distribute residue charge only onto ionizable atoms.
-            if (
-                (a.name, a.residue_name) in POSITIVE_ATOMS
-                or (a.name, a.residue_name) in NEGATIVE_ATOMS
-            ):
-                residue_charged_atom_count[key4] = (
-                    residue_charged_atom_count.get(key4, 0) + 1
-                )
-        
-        atom_charge = np.zeros(n, dtype=np.float64)
-        atom_sasa_share = np.zeros(n, dtype=np.float64)
-        for i, (a, key4) in enumerate(zip(atoms, key4_list)):
-            # Only ionizable atoms get any per-atom charge/SASA share.
-            if (a.name, a.residue_name) not in POSITIVE_ATOMS and (
-                (a.name, a.residue_name) not in NEGATIVE_ATOMS
-            ):
-                continue
-            total_charged = residue_charged_atom_count.get(key4, 0)
-            if total_charged <= 0:
-                continue
-            per_atom_charge = residue_charge.get(key4, 0.0) / float(total_charged)
-            atom_charge[i] = per_atom_charge
-            atom_sasa_share[i] = residue_sasa.get(key4, 0.0) / float(total_charged)
-
-        valid_center = np.ones(n, dtype=bool)
-        is_charged_atom = np.array(
-            [
-                (a.name, a.residue_name) in POSITIVE_ATOMS
-                or (a.name, a.residue_name) in NEGATIVE_ATOMS
-                for a in atoms
-            ],
-            dtype=bool,
-        )
-        if sasa_weighting:
-            valid_source = is_charged_atom
-        else:
-            valid_source = is_charged_atom & residue_exposed
-        tree = cKDTree(coords)
-        scm_atom = np.zeros(n, dtype=np.float64)
-        for i, j in tree.query_pairs(d_cutoff):
-            if valid_center[i] and valid_source[j]:
-                contrib_j = atom_charge[j]
-                if sasa_weighting:
-                    contrib_j *= atom_sasa_share[j]
-                scm_atom[i] += contrib_j
-            if valid_center[j] and valid_source[i]:
-                contrib_i = atom_charge[i]
-                if sasa_weighting:
-                    contrib_i *= atom_sasa_share[i]
-                scm_atom[j] += contrib_i
-
-        neg_sum = np.sum(scm_atom[scm_atom < 0])
-        return float(np.abs(neg_sum))
     except Exception as e:
         logger.warning("SCM score computation failed: %s", e, exc_info=True)
         return None
 
 
-# PROPERMAB paper / Agrawal et al.: side-chain absolute SASA threshold (Å²).
-# SCM_PROPERMAB_SIDE_CHAIN_ABS_SASA_CUTOFF_A2 = 10.0
+def scm_score_by_atoms(
+    pdb_path: str,
+    d_cutoff: float = 10.0,
+) -> Optional[Dict[str, float]]:
+    """Atom-level SCM using ff19SB atom partial charges.
+
+    For each atom ``i``, compute:
+        ``SCM_i = Σ_j q_j`` for atoms ``j`` within ``d_cutoff`` of ``i``
+        (excluding ``i`` itself), where ``q_j`` is the atom partial charge.
+
+    Returns two aggregated features:
+      - ``scm_by_atoms_neg``: ``Σ_{i: SCM_i < 0} SCM_i``
+      - ``scm_by_atoms_pos``: ``Σ_{i: SCM_i > 0} SCM_i``
+    """
+    atoms = _get_atoms_for_path(pdb_path)
+    if not atoms:
+        return None
+
+    try:
+        coords = np.array([(a.x, a.y, a.z) for a in atoms], dtype=np.float64)
+        charges = np.array(
+            [
+                get_ff19sb_atom_charge(
+                    (a.residue_name or "").strip().upper(),
+                    a.name or "",
+                )
+                for a in atoms
+            ],
+            dtype=np.float64,
+        )
+
+        if coords.shape[0] == 0:
+            return None
+        if coords.shape[0] == 1:
+            return {"scm_by_atoms_neg": 0.0, "scm_by_atoms_pos": 0.0}
+
+        tree = cKDTree(coords)
+        scmi = np.zeros(coords.shape[0], dtype=np.float64)
+        neighbors_by_atom = tree.query_ball_point(coords, r=d_cutoff)
+        for i, neighbor_indices in enumerate(neighbors_by_atom):
+            if not neighbor_indices:
+                continue
+            # Exclude the center atom i; analogous to residue-level SCM (j != i).
+            scmi[i] = float(sum(charges[j] for j in neighbor_indices if j != i))
+
+        neg_mask = scmi < 0.0
+        pos_mask = scmi > 0.0
+        return {
+            "scm_by_atoms_neg": float(np.sum(scmi[neg_mask])),
+            "scm_by_atoms_pos": float(np.sum(scmi[pos_mask])),
+        }
+    except Exception as e:
+        logger.warning("Atom-level SCM computation failed: %s", e, exc_info=True)
+        return None
 
 
-# def scm_score_from_pka_propermab(
-#     pdb_path: str,
-#     sasa_path: str,
-#     pka_data: Dict[Tuple[str, int, str, str], float],
-#     pH: float,
-#     d_cutoff: float = 10.0,
-#     side_chain_abs_sasa_cutoff: float = SCM_PROPERMAB_SIDE_CHAIN_ABS_SASA_CUTOFF_A2,
-#     chain_ids: Optional[Iterable[str]] = None,
-# ) -> Optional[float]:
-#     """
-#     Spatial charge map (SCM) score as in the PROPERMAB paper (Agrawal et al.).
+def scm_score_propermab_like_fast(
+    pdb_path: str,
+    sasa_path: str,
+    d_cutoff: float = 10.0,
+    sidechain_sasa_cutoff: float = 10.0,
+) -> Optional[float]:
+    """
+    Fast approximation of ProperMAb's SCM score.
 
-#     For each atom *i* in the Fv domain (see ``chain_ids``):
+    ProperMAb computes atom-level SCM with force-field partial charges, excludes
+    main-chain atoms from the *neighbor* set, keeps all atoms as centers, and
+    only counts solvent-exposed neighbors. We do not have atom-level SASA here,
+    so exposure is approximated from residue side-chain absolute SASA: all
+    side-chain atoms of a residue are treated as exposed neighbors when that
+    residue's ``total_side_abs`` exceeds ``sidechain_sasa_cutoff``.
 
-#         scm_i = sum_{j in E_i} q_j
+    The final structure score matches ProperMAb's reduction:
+    ``abs(sum(SCM_i for SCM_i < 0))``.
+    """
+    ctx = _get_structure_context(pdb_path, sasa_path=sasa_path)
+    atoms = ctx.atoms
+    if not atoms:
+        return None
+    sasa_data = ctx.sasa_residue
+    if not sasa_data:
+        return None
 
-#     where *E_i* is the set of **side-chain** atoms *j* that belong to residues whose
-#     **side-chain solvent-accessible surface area is >** ``side_chain_abs_sasa_cutoff``
-#     (default **10 Å²**), and whose distance to atom *i* is **≤** ``d_cutoff``
-#     (default **10 Å**).
+    try:
+        residue_atom_names: Dict[ResKey4, Set[str]] = defaultdict(set)
+        for atom in atoms:
+            residue_atom_names[residue_key_from_atom(atom)].add(
+                (atom.name or "").strip().upper()
+            )
 
-#     The domain score is::
+        coords = np.array([(a.x, a.y, a.z) for a in atoms], dtype=np.float64)
+        charges = np.array(
+            [
+                get_ff19sb_atom_charge(
+                    (a.residue_name or "").strip().upper(),
+                    a.name or "",
+                    residue_atom_names=residue_atom_names.get(residue_key_from_atom(a)),
+                )
+                for a in atoms
+            ],
+            dtype=np.float64,
+        )
 
-#         scm = | sum_{i in A} scm_i * H(-scm_i) |
+        if coords.shape[0] <= 1:
+            return 0.0
 
-#     i.e. the absolute value of the sum of *scm_i* over atoms with *scm_i* < 0
-#     (Heaviside *H*).
+        neighbor_allowed = np.zeros(coords.shape[0], dtype=bool)
+        for i, atom in enumerate(atoms):
+            if is_backbone_atom(atom):
+                continue
+            key4 = residue_key_from_atom(atom)
+            entry = sasa_data.get(key4)
+            side_abs = float(getattr(entry, "total_side_abs", 0.0) or 0.0) if entry is not None else 0.0
+            if side_abs > float(sidechain_sasa_cutoff):
+                neighbor_allowed[i] = True
 
-#     **Charges *q_j* (pKa-based):** residue fractional charge at *pH* is
-#     ``_residue_fractional_charge_at_pH`` (same helper as elsewhere in this module).
-#     That net charge is spread **evenly** over all **heavy** side-chain atoms of the
-#     residue (non-backbone, non-hydrogen). This substitutes for force-field partial
-#     charges used in the original formulation.
+        tree = cKDTree(coords)
+        scmi = np.zeros(coords.shape[0], dtype=np.float64)
+        neighbors_by_atom = tree.query_ball_point(coords, r=d_cutoff)
+        for i, neighbor_indices in enumerate(neighbors_by_atom):
+            if not neighbor_indices:
+                continue
+            scmi[i] = float(
+                sum(
+                    charges[j]
+                    for j in neighbor_indices
+                    if j != i and neighbor_allowed[j]
+                )
+            )
 
-#     Parameters
-#     ----------
-#     chain_ids
-#         If given, restrict *A* (and all bookkeeping) to these PDB chain IDs (e.g.
-#         ``("H", "L")`` for Fv). If ``None``, all atoms from the parsed structure are
-#         used.
-#     """
-#     from utils.parsers import parse_sasa
+        neg_mask = scmi < 0.0
+        return float(abs(np.sum(scmi[neg_mask])))
+    except Exception as e:
+        logger.warning("SCM pm-like computation failed: %s", e, exc_info=True)
+        return None
 
-#     atoms = _get_atoms_for_path(pdb_path)
-#     if not atoms:
-#         return None
 
-#     if chain_ids is not None:
-#         allowed = frozenset(str(c) for c in chain_ids)
-#         atoms = [a for a in atoms if (a.chain or "") in allowed]
-#     if not atoms:
-#         return None
-
-#     try:
-#         sasa_data = parse_sasa(sasa_path)
-#     except Exception as e:
-#         logger.warning("SCM (PROPERMAB): failed to parse SASA %s: %s", sasa_path, e)
-#         return None
-
-#     def _sasa_entry(key: ResKey4):
-#         e = sasa_data.get(key)
-#         if e is None:
-#             e = sasa_data.get((key[0], key[1], key[2], ""))
-#         return e
-
-#     def _pka_val(key: ResKey4) -> Optional[float]:
-#         v = pka_data.get(key)
-#         if v is None:
-#             v = pka_data.get((key[0], key[1], key[2], ""))
-#         return v
-
-#     try:
-#         unique_keys: Set[ResKey4] = {residue_key_from_atom(a) for a in atoms}
-
-#         residue_exposed_sc: Dict[ResKey4, bool] = {}
-#         for key in unique_keys:
-#             entry = _sasa_entry(key)
-#             if entry is None:
-#                 residue_exposed_sc[key] = False
-#                 continue
-#             abs_sa = getattr(entry, "total_side_abs", None)
-#             if abs_sa is None:
-#                 residue_exposed_sc[key] = False
-#             else:
-#                 try:
-#                     residue_exposed_sc[key] = float(abs_sa) > float(
-#                         side_chain_abs_sasa_cutoff
-#                     )
-#                 except (TypeError, ValueError):
-#                     residue_exposed_sc[key] = False
-
-#         sc_heavy_count: Dict[ResKey4, int] = defaultdict(int)
-#         for a in atoms:
-#             if is_hydrogen_atom(a) or is_backbone_atom(a):
-#                 continue
-#             sc_heavy_count[residue_key_from_atom(a)] += 1
-
-#         q_residue: Dict[ResKey4, float] = {}
-#         for key in unique_keys:
-#             q_residue[key] = float(
-#                 _residue_fractional_charge_at_pH(key[0], _pka_val(key), pH)
-#             )
-
-#         n = len(atoms)
-#         coords = np.array([[a.x, a.y, a.z] for a in atoms], dtype=np.float64)
-
-#         source_coords_list: List[Tuple[float, float, float]] = []
-#         source_q_list: List[float] = []
-#         for a in atoms:
-#             if is_hydrogen_atom(a) or is_backbone_atom(a):
-#                 continue
-#             rk = residue_key_from_atom(a)
-#             if not residue_exposed_sc.get(rk, False):
-#                 continue
-#             n_sc = sc_heavy_count.get(rk, 0)
-#             if n_sc <= 0:
-#                 continue
-#             qj = q_residue.get(rk, 0.0) / float(n_sc)
-#             source_coords_list.append((a.x, a.y, a.z))
-#             source_q_list.append(qj)
-
-#         if not source_coords_list:
-#             return 0.0
-
-#         source_coords = np.asarray(source_coords_list, dtype=np.float64)
-#         source_q = np.asarray(source_q_list, dtype=np.float64)
-#         tree = cKDTree(source_coords)
-
-#         scm_atom = np.zeros(n, dtype=np.float64)
-#         for i in range(n):
-#             idxs = tree.query_ball_point(coords[i], r=float(d_cutoff))
-#             if not idxs:
-#                 continue
-#             scm_atom[i] = float(np.sum(source_q[list(idxs)]))
-
-#         neg_sum = float(np.sum(scm_atom[scm_atom < 0.0]))
-#         return float(abs(neg_sum))
-#     except Exception as e:
-#         logger.warning("SCM (PROPERMAB) computation failed: %s", e, exc_info=True)
-#         return None
-
-# SAP analog
-def sum_total_side_rel_within_cutoff(
+def compute_atom_patch_area_cdr_pm_like_fast(
     pdb_atoms: List[Atom],
-    sasa_output_data: Dict[Tuple[str, int, str, str], Dict[str, Optional[float]]],
-    cutoff: float = 5.0,
-    sap_mode: bool = False,  # SAP residue-level approximation (hydrophobicity weighting)
-    positive_charge_mode: bool = False,  # weight by positive fractional charge at pH
-    negative_charge_mode: bool = False,  # weight by negative fractional charge at pH
-    pka_output_data: Optional[Dict[Tuple[str, int, str, str], float]] = None,
+    atom_sasa_by_serial: Dict[int, float],
+    cdr_keys: Set[ResKey4],
+    *,
+    charge_radius: float = 8.0,
+    charge_sigma: float = 3.0,
+    hydrophobic_radius: float = 6.0,
+    hydrophobic_sigma: float = 2.5,
+    cdr_distance_cutoff: float = 5.0,
+    charge_eps: float = 4.0,
+    charge_min_samples: int = 4,
+    hydrophobic_eps: float = 3.0,
+    hydrophobic_min_samples: int = 4,
+    min_atom_sasa: float = 0.01,
+    charge_seed_quantile: float = 0.75,
+    hydrophobic_seed_quantile: float = 0.75,
+    positive_charge_seed_threshold: Optional[float] = 0.53,
+    negative_charge_seed_threshold: Optional[float] = 0.34,
+    hydrophobic_seed_threshold: Optional[float] = 12.0,
+    min_charge_seed_abs: float = 0.10,
+    min_hydrophobic_seed: float = 0.50,
+    charge_expand_ratio: float = 0.65,
+    hydrophobic_expand_ratio: float = 0.65,
+    cluster_expand_radius: Optional[float] = None,
+) -> Dict[str, float]:
+    """
+    Fast exposed-atom patch proxy intended as a closer, surface-aware alternative
+    to the residue C-alpha patch descriptors.
+
+    Design:
+      - centers / seed points are exposed atoms (atom SASA > 0)
+      - electrostatic field is a short-range Gaussian-smoothed sum of ff19SB atom
+        partial charges over *all* atoms, including hydrogens and terminal atoms
+      - hydrophobic field is a short-range Gaussian-smoothed sum of positive
+        Kyte-Doolittle residue weights over non-backbone atoms
+      - seed thresholds default to fixed dataset-level cutoffs; quantile fallback is
+        retained only when a fixed threshold is explicitly disabled with ``None``
+      - clusters are built on seed-atom coordinates with DBSCAN
+      - accepted clusters are expanded to nearby exposed atoms that meet a weaker
+        same-sign field threshold before patch area is summed
+      - CDR proximity is defined by atom-to-atom distance from the cluster to any
+        atom belonging to a CDR residue
+
+    Returns three new CDR-focused features:
+      ``pos_patch_area_cdr_pm_like_fast``
+      ``neg_patch_area_cdr_pm_like_fast``
+      ``hyd_patch_area_cdr_pm_like_fast``
+    """
+    result = {
+        "pos_patch_area_cdr_pm_like_fast": 0.0,
+        "neg_patch_area_cdr_pm_like_fast": 0.0,
+        "hyd_patch_area_cdr_pm_like_fast": 0.0,
+    }
+    if not pdb_atoms or not atom_sasa_by_serial or not cdr_keys:
+        return result
+
+    residue_atom_names: Dict[ResKey4, Set[str]] = defaultdict(set)
+    for atom in pdb_atoms:
+        residue_atom_names[residue_key_from_atom(atom)].add((atom.name or "").strip().upper())
+
+    all_atoms = list(pdb_atoms)
+    all_coords = np.asarray([(float(a.x), float(a.y), float(a.z)) for a in all_atoms], dtype=np.float64)
+    if all_coords.shape[0] < 2:
+        return result
+    all_tree = cKDTree(all_coords)
+
+    all_charge_weights = np.asarray(
+        [
+            float(
+                get_ff19sb_atom_charge(
+                    (a.residue_name or "").strip().upper(),
+                    a.name or "",
+                    residue_atom_names=residue_atom_names.get(residue_key_from_atom(a)),
+                )
+            )
+            for a in all_atoms
+        ],
+        dtype=np.float64,
+    )
+    all_hydrophobic_weights = np.asarray(
+        [
+            float(max(KYTE_DOOLITTLE.get((a.residue_name or "").strip().upper(), 0.0), 0.0))
+            if not is_backbone_atom(a)
+            else 0.0
+            for a in all_atoms
+        ],
+        dtype=np.float64,
+    )
+
+    exposed_atoms: List[Atom] = []
+    exposed_coords: List[Tuple[float, float, float]] = []
+    exposed_sasa: List[float] = []
+    exposed_charge_field: List[float] = []
+    exposed_hydrophobic_field: List[float] = []
+    exposed_is_hydrophobic_seedable: List[bool] = []
+
+    for atom in all_atoms:
+        sasa_abs = float(atom_sasa_by_serial.get(int(atom.serial), 0.0) or 0.0)
+        if sasa_abs <= float(min_atom_sasa):
+            continue
+
+        center = np.asarray((float(atom.x), float(atom.y), float(atom.z)), dtype=np.float64)
+
+        charge_neighbors = all_tree.query_ball_point(center, r=float(charge_radius))
+        charge_field = 0.0
+        for j in charge_neighbors:
+            other = all_atoms[j]
+            if other.serial == atom.serial:
+                continue
+            d = float(np.linalg.norm(center - all_coords[j]))
+            if d <= 1e-8:
+                continue
+            w = math.exp(-0.5 * (d / float(charge_sigma)) ** 2)
+            charge_field += float(all_charge_weights[j]) * w
+
+        hyd_neighbors = all_tree.query_ball_point(center, r=float(hydrophobic_radius))
+        hyd_field = 0.0
+        for j in hyd_neighbors:
+            other = all_atoms[j]
+            if other.serial == atom.serial:
+                continue
+            src_w = float(all_hydrophobic_weights[j])
+            if src_w <= 0.0:
+                continue
+            d = float(np.linalg.norm(center - all_coords[j]))
+            if d <= 1e-8:
+                continue
+            w = math.exp(-0.5 * (d / float(hydrophobic_sigma)) ** 2)
+            hyd_field += src_w * w
+
+        exposed_atoms.append(atom)
+        exposed_coords.append((float(atom.x), float(atom.y), float(atom.z)))
+        exposed_sasa.append(sasa_abs)
+        exposed_charge_field.append(charge_field)
+        exposed_hydrophobic_field.append(hyd_field)
+        exposed_is_hydrophobic_seedable.append(
+            (not is_backbone_atom(atom))
+            and float(max(KYTE_DOOLITTLE.get((atom.residue_name or "").strip().upper(), 0.0), 0.0)) > 0.0
+        )
+
+    if len(exposed_atoms) < 2:
+        return result
+
+    exp_coords_arr = np.asarray(exposed_coords, dtype=np.float64)
+    exp_sasa_arr = np.asarray(exposed_sasa, dtype=np.float64)
+    exp_charge_field_arr = np.asarray(exposed_charge_field, dtype=np.float64)
+    exp_hyd_field_arr = np.asarray(exposed_hydrophobic_field, dtype=np.float64)
+    exp_hyd_seedable_arr = np.asarray(exposed_is_hydrophobic_seedable, dtype=bool)
+    exp_tree = cKDTree(exp_coords_arr)
+
+    cdr_atom_coords = np.asarray(
+        [
+            (float(atom.x), float(atom.y), float(atom.z))
+            for atom in all_atoms
+            if residue_key_from_atom(atom) in cdr_keys
+        ],
+        dtype=np.float64,
+    )
+    cdr_tree = cKDTree(cdr_atom_coords) if cdr_atom_coords.shape[0] > 0 else None
+
+    def _seed_threshold(
+        values: np.ndarray,
+        *,
+        positive: bool,
+        quantile: float,
+        floor: float,
+    ) -> Optional[float]:
+        if positive:
+            pool = values[values > 0.0]
+        else:
+            pool = np.abs(values[values < 0.0])
+        if pool.size == 0:
+            return None
+        return float(max(float(floor), float(np.quantile(pool, quantile))))
+
+    pos_thr = (
+        float(max(float(min_charge_seed_abs), float(positive_charge_seed_threshold)))
+        if positive_charge_seed_threshold is not None
+        else _seed_threshold(
+            exp_charge_field_arr,
+            positive=True,
+            quantile=charge_seed_quantile,
+            floor=min_charge_seed_abs,
+        )
+    )
+    neg_thr = (
+        float(max(float(min_charge_seed_abs), float(negative_charge_seed_threshold)))
+        if negative_charge_seed_threshold is not None
+        else _seed_threshold(
+            exp_charge_field_arr,
+            positive=False,
+            quantile=charge_seed_quantile,
+            floor=min_charge_seed_abs,
+        )
+    )
+    hyd_thr = (
+        float(max(float(min_hydrophobic_seed), float(hydrophobic_seed_threshold)))
+        if hydrophobic_seed_threshold is not None
+        else _seed_threshold(
+            exp_hyd_field_arr[exp_hyd_seedable_arr] if np.any(exp_hyd_seedable_arr) else np.asarray([], dtype=np.float64),
+            positive=True,
+            quantile=hydrophobic_seed_quantile,
+            floor=min_hydrophobic_seed,
+        )
+    )
+
+    def _clustered_cdr_area(
+        seed_mask: np.ndarray,
+        *,
+        field_values: np.ndarray,
+        eligible_mask: np.ndarray,
+        polarity: str,
+        seed_threshold: float,
+        expand_ratio: float,
+        eps: float,
+        min_samples: int,
+    ) -> float:
+        if seed_mask.sum() < max(2, int(min_samples)):
+            return 0.0
+        seed_indices = np.flatnonzero(seed_mask)
+        seed_coords = exp_coords_arr[seed_indices]
+        labels = DBSCAN(eps=float(eps), min_samples=int(min_samples)).fit(seed_coords).labels_
+        total = 0.0
+        claimed = np.zeros(exp_coords_arr.shape[0], dtype=bool)
+        expand_radius = float(cluster_expand_radius) if cluster_expand_radius is not None else float(eps)
+        relaxed_threshold = float(seed_threshold) * float(expand_ratio)
+        for label in sorted({int(x) for x in labels.tolist() if int(x) != -1}):
+            members = labels == label
+            if not np.any(members):
+                continue
+            member_seed_indices = seed_indices[members]
+            member_seed_coords = exp_coords_arr[member_seed_indices]
+
+            expanded_index_set: Set[int] = set(int(i) for i in member_seed_indices.tolist())
+            for hit_list in exp_tree.query_ball_point(member_seed_coords, r=expand_radius):
+                expanded_index_set.update(int(i) for i in hit_list)
+
+            expanded_indices = np.asarray(sorted(expanded_index_set), dtype=np.int64)
+            if polarity == "pos":
+                expanded_indices = expanded_indices[
+                    eligible_mask[expanded_indices] & (field_values[expanded_indices] >= relaxed_threshold)
+                ]
+            elif polarity == "neg":
+                expanded_indices = expanded_indices[
+                    eligible_mask[expanded_indices] & (field_values[expanded_indices] <= -relaxed_threshold)
+                ]
+            else:
+                expanded_indices = expanded_indices[
+                    eligible_mask[expanded_indices] & (field_values[expanded_indices] >= relaxed_threshold)
+                ]
+
+            if expanded_indices.size == 0:
+                expanded_indices = member_seed_indices
+            else:
+                expanded_indices = np.unique(
+                    np.concatenate([expanded_indices, member_seed_indices]).astype(np.int64, copy=False)
+                )
+
+            if cdr_tree is not None:
+                near_cdr = cdr_tree.query_ball_point(exp_coords_arr[expanded_indices], r=float(cdr_distance_cutoff))
+                if not any(bool(hits) for hits in near_cdr):
+                    continue
+
+            new_indices = expanded_indices[~claimed[expanded_indices]]
+            if new_indices.size == 0:
+                continue
+            claimed[new_indices] = True
+            total += float(np.sum(exp_sasa_arr[new_indices]))
+        return float(total)
+
+    pos_seed_mask = (
+        exp_charge_field_arr >= float(pos_thr)
+        if pos_thr is not None
+        else np.zeros(exp_charge_field_arr.shape[0], dtype=bool)
+    )
+    neg_seed_mask = (
+        exp_charge_field_arr <= -float(neg_thr)
+        if neg_thr is not None
+        else np.zeros(exp_charge_field_arr.shape[0], dtype=bool)
+    )
+    hyd_seed_mask = (
+        exp_hyd_seedable_arr & (exp_hyd_field_arr >= float(hyd_thr))
+        if hyd_thr is not None
+        else np.zeros(exp_hyd_field_arr.shape[0], dtype=bool)
+    )
+
+    result["pos_patch_area_cdr_pm_like_fast"] = _clustered_cdr_area(
+        pos_seed_mask,
+        field_values=exp_charge_field_arr,
+        eligible_mask=np.ones(exp_charge_field_arr.shape[0], dtype=bool),
+        polarity="pos",
+        seed_threshold=float(pos_thr),
+        expand_ratio=float(charge_expand_ratio),
+        eps=charge_eps,
+        min_samples=charge_min_samples,
+    )
+    result["neg_patch_area_cdr_pm_like_fast"] = _clustered_cdr_area(
+        neg_seed_mask,
+        field_values=exp_charge_field_arr,
+        eligible_mask=np.ones(exp_charge_field_arr.shape[0], dtype=bool),
+        polarity="neg",
+        seed_threshold=float(neg_thr),
+        expand_ratio=float(charge_expand_ratio),
+        eps=charge_eps,
+        min_samples=charge_min_samples,
+    )
+    result["hyd_patch_area_cdr_pm_like_fast"] = _clustered_cdr_area(
+        hyd_seed_mask,
+        field_values=exp_hyd_field_arr,
+        eligible_mask=exp_hyd_seedable_arr,
+        polarity="hyd",
+        seed_threshold=float(hyd_thr),
+        expand_ratio=float(hydrophobic_expand_ratio),
+        eps=hydrophobic_eps,
+        min_samples=hydrophobic_min_samples,
+    )
+    return result
+
+
+# SAP analog — wrapper around residue_neighbor_score.
+# Now uses total_side_rel (relative side-chain SASA) and min heavy-atom distance.
+def sum_side_abs_fraction_within_cutoff(
+    pdb_atoms: List[Atom],
+    sasa_data: Dict[ResKey4, SASAEntry],
+    cutoff: float = 10.0,
+    sap_mode: bool = False,
+    positive_charge_mode: bool = False,
+    negative_charge_mode: bool = False,
+    pka_output_data: Optional[Dict[ResKey4, float]] = None,
     pH: float = 7.0,
 ) -> float:
+    """SAP-style score: for each residue pair (i, j) within ``cutoff``
+    (min heavy-atom distance), accumulate neighbor properties × SASA at center *i*,
+    then weight each center's accumulated sum before summing over *i*.
+
+    **Hydrophobicity** (``sap_mode``): all residues; Kyte–Doolittle at center and
+    neighbor; ``ionizable_only=False``.
+
+    **Full charge** (default flags): ionizable residues only; signed fractional
+    charge at center and neighbor; symmetric ``charge × SASA`` weighting.
+
+    **Positive / negative SAP** (``positive_charge_mode`` / ``negative_charge_mode``):
+    every residue may be a center (charged or neutral). Neighbor contributions
+    use only the positive part (``charge_pos``) or negative part (``charge_neg``)
+    of fractional charge × SASA. Centers are weighted by relative side-chain
+    SASA only (``center_weight="sasa"``, no extra charge factor).
+
+    SASA: ``total_side_rel`` (relative, [0, 1]).
+    Distance: min heavy-atom distance (shared cached KDTree).
     """
-    for each residue, sum total_side_rel of all residues
-    within cutoff (Cα–Cα distance), weighted by either hydrophobicity or fractional charge at pH
+    if not pdb_atoms or not sasa_data:
+        return 0.0
+    if sap_mode:
+        src = "hydrophobicity"
+        ionizable = False
+        ctr = "hydrophobicity"
+        w_sasa_ctr = True
+    elif positive_charge_mode:
+        src = "charge_pos"
+        ionizable = False
+        ctr = "sasa"
+        w_sasa_ctr = False
+    elif negative_charge_mode:
+        src = "charge_neg"
+        ionizable = False
+        ctr = "sasa"
+        w_sasa_ctr = False
+    else:
+        src = "charge"
+        ionizable = True
+        ctr = "charge"
+        w_sasa_ctr = True
+    result = residue_neighbor_score(
+        pdb_atoms,
+        sasa_data,
+        cutoff,
+        pka_data=pka_output_data,
+        pH=pH,
+        source=src,
+        sasa_weight_sources=True,
+        ionizable_only=ionizable,
+        center_weight=ctr,
+        weight_center_by_sasa=w_sasa_ctr,
+        reduce="sum",
+    )
+    return float(result) if result is not None else 0.0
+
+
+def compute_sap_shell_synergy_scores(
+    pdb_atoms: List[Atom],
+    sasa_data: Dict[ResKey4, SASAEntry],
+    pka_data: Optional[Dict[ResKey4, float]],
+    pH: float,
+    d_cutoff: float = 10.0,
+) -> Dict[str, float]:
     """
-    residue_keys: List[Tuple[str, int, str, str]] = []
-    residue_coords: List[Tuple[float, float, float]] = []
-    residue_total_side_rel: List[float] = []
+    Single entry point for structure-level SAP metrics (10 Å min heavy-atom
+    neighborhood, ``total_side_rel`` weights).
 
-    atoms_by_res: Dict[Tuple, List[Atom]] = {}
-    ca_by_res: Dict[Tuple, Tuple[float, float, float]] = {}
-    for key4 in iter_unique_residues(pdb_atoms):
-        residue_keys.append(key4)
-        atoms_by_res[key4] = []
-    for atom in pdb_atoms:
-        key4 = residue_key_from_atom(atom)
-        if key4 in atoms_by_res:
-            atoms_by_res[key4].append(atom)
-            if atom.name.strip() == "CA":
-                ca_by_res[key4] = (atom.x, atom.y, atom.z)
+    **Charge SAP** (same as ``positive_charge_mode`` / ``negative_charge_mode``
+    in :func:`sum_side_abs_fraction_within_cutoff`): ``sap_pos_charge_score``,
+    ``sap_neg_charge_score`` = ``Σ_i total_side_rel(i) × env_{pos|neg}(i)``.
 
-    for key4 in residue_keys:
-        sasa_entry = sasa_output_data.get(key4) or {}
-        val = sasa_entry.get("total_side_rel")
-        if val is not None:
-            total_side_rel = float(val)
-        else:
-            raise ValueError(f"No total_side_rel found for residue {key4}")
-        residue_total_side_rel.append(total_side_rel)
+    **Symmetric hydrophobicity SAP** (``sap_mode`` in
+    :func:`sum_side_abs_fraction_within_cutoff`): ``sap_hydro_score``.
 
-        ca_coord = ca_by_res.get(key4)
-        if ca_coord is not None:
-            residue_coords.append(ca_coord)
-        else:
-            raise ValueError(f"No CA atom found for residue {key4}")
+    **Neighbor-shell channels** (pos/neg-style centering only — not
+    ``sap_hydro_score``): ``sap_hyd_env_score``, ``sap_aromatic_score``,
+    ``sap_histidine_score``.
 
-    coords = np.array(residue_coords, dtype=np.float64)
-    total_side_rel_arr = np.array(residue_total_side_rel, dtype=np.float64)
-    tree = cKDTree(coords)
-    out: Dict[Tuple[str, int, str, str], float] = {}
-    for i, key4 in enumerate(residue_keys):
-        indices = tree.query_ball_point(coords[i], cutoff)
-        value = float(np.sum(total_side_rel_arr[indices]))
-        if sap_mode or positive_charge_mode or negative_charge_mode:
-            res_name = key4[0]
-            if sap_mode:
-                weight = float(KYTE_DOOLITTLE.get(res_name, 0.0))
-            else:
-                pka = None
-                if pka_output_data is not None:
-                    pka = pka_output_data.get(key4) or pka_output_data.get(
-                        (key4[0], key4[1], key4[2], "")
-                    )
-                q = float(_residue_fractional_charge_at_pH_for_charge_metrics(res_name, pka, pH))
-                if positive_charge_mode and negative_charge_mode:
-                    weight = q
-                elif positive_charge_mode:
-                    weight = q if q > 0.0 else 0.0
-                elif negative_charge_mode:
-                    weight = q if q < 0.0 else 0.0
-                else:
-                    weight = 1.0
-            value *= weight
-        out[key4] = value
+    **Composites** use the same neighbor row sums ``pos_i, neg_i, hyd_i, aro_i,
+    his_i`` as for synergies; denominators use ``1 + max(0, -neg_i)``.
+    """
+    out: Dict[str, float] = {
+        # "sap_hydro_score": 0.0,
+        # "sap_pos_charge_score": 0.0,
+        # "sap_neg_charge_score": 0.0,
+        # "sap_hyd_env_score": 0.0,
+        "sap_aromatic_score": 0.0,
+        "sap_histidine_score": 0.0,
+        "sap_pos_aro_synergy": 0.0,
+        # "sap_pos_hyd_synergy": 0.0,
+        # "sap_pos_shield": 0.0,
+        # "sap_heme_like": 0.0,
+        "sap_aro_neg_contrast": 0.0,
+        # "sap_hyd_neg_contrast": 0.0,
+        # "sap_sticky_mix": 0.0,
+    }
+    if not pdb_atoms or not sasa_data:
+        return out
 
-    return float(np.sum(list(out.values())))
+    # out["sap_hydro_score"] = sum_side_abs_fraction_within_cutoff(
+    #     pdb_atoms, sasa_data, cutoff=d_cutoff, sap_mode=True
+    # )
+
+    pka_lookup = pka_data if pka_data is not None else {}
+
+    res_keys: List[ResKey4] = list(iter_unique_residues(pdb_atoms))
+    if not res_keys:
+        return out
+
+    m = len(res_keys)
+    res_key_to_idx: Dict[ResKey4, int] = {k: i for i, k in enumerate(res_keys)}
+
+    sasa_arr = np.zeros(m, dtype=np.float64)
+    charge_arr = np.zeros(m, dtype=np.float64)
+    kd_arr = np.zeros(m, dtype=np.float64)
+    aro_arr = np.zeros(m, dtype=np.float64)
+    his_arr = np.zeros(m, dtype=np.float64)
+
+    for i, key4 in enumerate(res_keys):
+        entry = sasa_data.get(key4)
+        sasa_arr[i] = float(getattr(entry, "total_side_rel", 0.0) or 0.0)
+        aa = (key4[0] or "").strip().upper()
+        pka = pka_lookup.get(key4)
+        charge_arr[i] = _residue_fractional_charge_at_pH(aa, pka, pH)
+        kd_arr[i] = float(KYTE_DOOLITTLE.get(aa, 0.0))
+        aro_arr[i] = 1.0 if aa in AROMATIC_RESIDUES else 0.0
+        his_arr[i] = 1.0 if aa == "HIS" else 0.0
+
+    pos_src = np.maximum(0.0, charge_arr) * sasa_arr
+    neg_src = np.minimum(0.0, charge_arr) * sasa_arr
+    hyd_src = kd_arr * sasa_arr
+    aro_src = aro_arr * sasa_arr
+    his_src = his_arr * sasa_arr
+
+    pos_env = np.zeros(m, dtype=np.float64)
+    neg_env = np.zeros(m, dtype=np.float64)
+    hyd_env = np.zeros(m, dtype=np.float64)
+    aro_env = np.zeros(m, dtype=np.float64)
+    his_env = np.zeros(m, dtype=np.float64)
+
+    heavy_tree, heavy_coords, heavy_atom_res_keys, heavy_atoms_by_res = get_heavy_atom_tree(pdb_atoms)
+
+    for ri, key_i in enumerate(res_keys):
+        atom_indices_i = heavy_atoms_by_res.get(key_i, [])
+        if not atom_indices_i:
+            continue
+        seen_rj: Set[int] = set()
+        for nb_atom_idxs in heavy_tree.query_ball_point(heavy_coords[atom_indices_i], r=d_cutoff):
+            for nb_atom_idx in nb_atom_idxs:
+                rj = res_key_to_idx.get(heavy_atom_res_keys[nb_atom_idx])
+                if rj is None or rj == ri or rj in seen_rj:
+                    continue
+                seen_rj.add(rj)
+                pos_env[ri] += pos_src[rj]
+                neg_env[ri] += neg_src[rj]
+                hyd_env[ri] += hyd_src[rj]
+                aro_env[ri] += aro_src[rj]
+                his_env[ri] += his_src[rj]
+
+    w = sasa_arr
+    neg_mag = np.maximum(0.0, -neg_env)
+
+    # out["sap_pos_charge_score"] = float(np.sum(w * pos_env))
+    # out["sap_neg_charge_score"] = float(np.sum(w * neg_env))
+
+    # out["sap_hyd_env_score"] = float(np.sum(w * hyd_env))
+    out["sap_aromatic_score"] = float(np.sum(w * aro_env))
+    out["sap_histidine_score"] = float(np.sum(w * his_env))
+
+    out["sap_pos_aro_synergy"] = float(np.sum(w * pos_env * aro_env))
+    # out["sap_pos_hyd_synergy"] = float(np.sum(w * pos_env * hyd_env))
+    # out["sap_pos_shield"] = float(np.sum(w * pos_env / (1.0 + neg_mag)))
+    # out["sap_heme_like"] = float(
+    #     np.sum(w * (aro_env + 0.5 * his_env) * (pos_env + 0.5 * his_env) / (1.0 + neg_mag))
+    # )
+    out["sap_aro_neg_contrast"] = float(np.sum(w * aro_env * neg_env))
+    # out["sap_hyd_neg_contrast"] = float(np.sum(w * hyd_env * neg_env))
+    # out["sap_sticky_mix"] = float(np.sum(w * (pos_env + aro_env + hyd_env + neg_env)))
+    return out
+
 
 # Generic helpers
 ResidueDensityRawDict = Dict[ResKey4, float]
@@ -718,7 +1170,7 @@ def average_over_residues(
     weights_raw: Dict[ResKey4, float],
     counts: Optional[Dict[ResKey4, int]] = None,
     residues_for_density: Optional[Iterable[ResKey4]] = None,
-    residues_for_average: Optional[Iterable[ResKey4]] = None,
+    residues_for_average: Optional[Union[str, Iterable[ResKey4]]] = None,
     denom_total_residues: int,
     weighted: bool = True,
     sqrt_weights: bool = True,
@@ -730,13 +1182,25 @@ def average_over_residues(
       if weighted=True and sqrt_weights=True, uses sqrt(weights_raw[k])
       if weighted=True and sqrt_weights=False, uses weights_raw[k] directly
       if weighted=False, uses counts[k] if provided, else 0.0
-    - denominator: len(set(residues_for_average)) if provided, otherwise
-      denom_total_residues (total number of residues in the PDB)
+    - denominator:
+      * ``None``: ``denom_total_residues`` (total residues in the PDB)
+      * ``"all"``: same as ``None``
+      * ``"no"``: no division (returns the numerator sum as a scalar)
+      * otherwise: ``len(set(residues_for_average))`` for an iterable of residue keys
     """
     if not weights_raw:
         return 0.0
 
-    if residues_for_average is not None:
+    if isinstance(residues_for_average, str):
+        if residues_for_average == "all":
+            denom = denom_total_residues
+        elif residues_for_average == "no":
+            denom = 1
+        else:
+            raise ValueError(
+                f"residues_for_average string must be 'all' or 'no', got {residues_for_average!r}"
+            )
+    elif residues_for_average is not None:
         denom = len(set(residues_for_average))
     else:
         denom = denom_total_residues
@@ -790,6 +1254,32 @@ def compute_residue_density_raw(
         weights[key4] = weight
     return weights
 
+
+def compute_residue_side_abs_density_raw(
+    pdb_path: str,
+    sasa_path: str,
+) -> ResidueDensityRawDict:
+    """
+    Per-residue absolute side-chain SASA (Å²), same key space as :func:`compute_residue_density_raw`.
+
+    On SASA parse failure, returns NaN-filled dict like the relative-density helper.
+    """
+    ctx = _get_structure_context(pdb_path, sasa_path=sasa_path)
+    atoms = ctx.atoms
+    if not atoms:
+        return {}
+    sasa_data = ctx.sasa_residue
+    residue_keys = list(iter_unique_residues(atoms))
+
+    if sasa_path and ("sasa" in getattr(ctx, "parse_errors", {}) or not sasa_data):
+        return {k: float("nan") for k in residue_keys}
+
+    weights: ResidueDensityRawDict = {}
+    for key4 in residue_keys:
+        weights[key4] = float(residue_side_sasa_abs(key4, sasa_data))
+    return weights
+
+
 def calculate_residue_category_density_average(
     pdb_path: str,
     sasa_path: str,
@@ -797,7 +1287,7 @@ def calculate_residue_category_density_average(
     residue_category: Optional[Iterable[ResKey4]] = None,
     weighted: bool = True,
     sqrt_weights: bool = True,
-    residues_for_average: Optional[Iterable[ResKey4]] = None,
+    residues_for_average: Optional[Union[str, Iterable[ResKey4]]] = None,
     density_raw: Optional[ResidueDensityRawDict] = None,
 ) -> float:
     """
@@ -805,6 +1295,10 @@ def calculate_residue_category_density_average(
     CDR, or exposed) determined elsewhere and passed in
     density can be SASA-weighted or raw count; the average can be over total residues or over
     the category itself
+
+    ``residues_for_average``: residue iterable for denominator size, or ``None`` /
+    ``"all"`` for total PDB residue count, or ``"no"`` for an undivided sum (see
+    :func:`average_over_residues`).
     """
     if density_raw is None:
         density_raw = compute_residue_density_raw(pdb_path, sasa_path)
@@ -949,7 +1443,7 @@ def calculate_salt_bridge_density_average(
     residues_for_density: Optional[Iterable[Tuple[str, int, str, str]]] = None,
     weighted: bool = True,
     sqrt_weights: bool = True,
-    residues_for_average: Optional[Iterable[Tuple[str, int, str, str]]] = None,
+    residues_for_average: Optional[Union[str, Iterable[Tuple[str, int, str, str]]]] = None,
     salt_bridges: Optional[_SaltBridgesDict] = None,
 ) -> float:
 
@@ -1089,92 +1583,16 @@ def count_motif_overlapping(seq, motif: str) -> int:
 # Packing-related
 CONTACT_ORDER_CA_CUTOFF = 8.0
 
-# def calculate_relative_contact_order(
-#     pdb_path: str,
-#     *,
-#     ca_cutoff: float = CONTACT_ORDER_CA_CUTOFF,
-#     min_sequence_separation: int = 0,
-#     include_inter_chain: bool = False,
-#     chain_order: Optional[List[str]] = None,
-# ) -> Optional[float]:
-#     """
-#     Relative contact order (CO):
-
-#         CO = (1 / (N * L)) * Σ_{(i,j) in contacts} |i - j|
-
-#     where:
-#     - N is the number of (unique) residue-residue contacts
-#     - |i-j| is the sequence separation in residues
-#     - L is the total number of residues considered
-
-#     Contacts are defined by Cα–Cα distance <= ``ca_cutoff``. By default, only
-#     intra-chain contacts contribute (``include_inter_chain=False``)
-#     """
-#     ctx = _get_structure_context(pdb_path)
-#     ca_coords_dict = ctx.ca_coords
-#     if not ca_coords_dict:
-#         return None
-
-#     chain_to_keys: Dict[str, List[ResKey4]] = defaultdict(list)
-#     for k in ca_coords_dict.keys():
-#         chain_to_keys[k[2]].append(k)
-#     for chain, keys in list(chain_to_keys.items()):
-#         chain_to_keys[chain] = sorted(keys, key=lambda x: (x[1], x[3]))
-
-#     chains = chain_order or sorted(chain_to_keys.keys())
-#     chains = [c for c in chains if c in chain_to_keys]
-#     if not chains:
-#         return None
-
-#     per_chain_index: Dict[ResKey4, int] = {}
-#     global_index: Dict[ResKey4, int] = {}
-#     global_keys: List[ResKey4] = []
-#     offset = 0
-#     for chain in chains:
-#         keys = chain_to_keys.get(chain) or []
-#         for local_i, key in enumerate(keys):
-#             per_chain_index[key] = local_i
-#             global_index[key] = offset + local_i
-#             global_keys.append(key)
-#         offset += len(keys)
-
-#     L = len(global_keys)
-#     if L < 2:
-#         return None
-
-#     coords = np.array([ca_coords_dict[k] for k in global_keys], dtype=np.float64)
-#     tree = cKDTree(coords)
-
-#     total_sep = 0.0
-#     n_contacts = 0
-#     for i, j in tree.query_pairs(r=ca_cutoff):
-#         ki = global_keys[i]
-#         kj = global_keys[j]
-#         if not include_inter_chain and ki[2] != kj[2]:
-#             continue
-#         if include_inter_chain:
-#             sep = abs(global_index[ki] - global_index[kj])
-#         else:
-#             sep = abs(per_chain_index[ki] - per_chain_index[kj])
-#         if sep < int(min_sequence_separation):
-#             continue
-#         total_sep += float(sep)
-#         n_contacts += 1
-
-#     if n_contacts == 0:
-#         return None
-#     return float(total_sep) / float(n_contacts * L)
-
 def calculate_weighted_contact_number_average(
     pdb_path: str,
     *,
     residue_category: Optional[Iterable[ResKey4]] = None,
     residues_for_density: Optional[Iterable[ResKey4]] = None,
-    residues_for_average: Optional[Iterable[ResKey4]] = None,
+    residues_for_average: Optional[Union[str, Iterable[ResKey4]]] = None,
     wcn_values: Optional[Dict[ResKey4, float]] = None,
 ) -> float:
     """
-    WCN_i = Σ(j≠i) 1/(r_ij²), where r_ij is Cα–Cα distance.
+    WCN_i = Σ(j≠i) 1/(r_ij²), where r_ij is distance between per-residue Cα atoms.
 
     WCN is first computed for all residues in the structure, then:
     - ``residue_category``: limits which residues have WCN values kept at all
@@ -1184,8 +1602,9 @@ def calculate_weighted_contact_number_average(
       contribute to the numerator of the average. If ``None``, all keys in the
       (possibly category-filtered) weights dictionary are used.
     - ``residues_for_average``: optional set that defines the denominator
-      (number of residues you are averaging over). If ``None``, the
-      denominator is the total number of residues in the PDB.
+      (number of residues you are averaging over). If ``None`` or ``"all"``,
+      the denominator is the total number of residues in the PDB. ``"no"``
+      skips division (sum only); see :func:`average_over_residues`.
 
     Passing ``residue_category`` as a set avoids repeated ``set()`` construction
     when the same category is reused.
@@ -1236,8 +1655,7 @@ def compute_residue_DBSCAN_cluster_labels(
     atoms: List[Atom],
     pka_data: Dict[Tuple[str, int, str, str], float],
     pH: float,
-    eps: float = 4.0,
-    min_samples: int = 2,
+    eps_min_samples_by_category: Optional[Dict[str, Tuple[float, int]]] = None,
 ) -> Tuple[
     Dict[Tuple[str, int, str, str], int],
     Dict[Tuple[str, int, str, str], int],
@@ -1246,19 +1664,20 @@ def compute_residue_DBSCAN_cluster_labels(
     Dict[Tuple[str, int, str, str], int],
 ]:
     """
-    collect C-alpha coordinates for five residue groups (negative, positive, aromatic, hydrophobic, polar),
-    run DBSCAN on each group's 3D coordinates, and return cluster labels per category, for each residue 
+    Collect Cα coordinates per residue for five residue groups
+    (negative, positive, aromatic, hydrophobic, polar), run DBSCAN on each group's
+    3D coordinates, and return cluster labels per category.
+
+    Default ``eps`` / ``min_samples`` follow ``DBSCAN_EPS_MIN_SAMPLES_BY_CATEGORY_DEFAULT``
+    (charged/polar: wider eps; hydrophobic/aromatic: tighter eps and larger
+    ``min_samples``). Pass ``eps_min_samples_by_category`` to override any category.
     """
-    ca_by_res: Dict[Tuple[str, int, str, str], Tuple[float, float, float]] = {}
-    for atom in atoms:
-        if atom.name != "CA":
-            continue
-        key = residue_key_from_atom(atom)
-        ca_by_res[key] = (atom.x, atom.y, atom.z)
-    
-    def get_pka(key):
-        return pka_data.get(key)
-    
+    dbscan_params = {
+        **DBSCAN_EPS_MIN_SAMPLES_BY_CATEGORY_DEFAULT,
+        **(eps_min_samples_by_category or {}),
+    }
+    ca_by_res = ca_xyz_by_residue(atoms)
+
     neg_keys: List[Tuple[str, int, str, str]] = []
     neg_coords: List[Tuple[float, float, float]] = []
     pos_keys: List[Tuple[str, int, str, str]] = []
@@ -1272,8 +1691,7 @@ def compute_residue_DBSCAN_cluster_labels(
     
     for key, xyz in ca_by_res.items():
         res_name = key[0]
-        pka_val = get_pka(key)
-        group = _residue_category_group(res_name, pka_val, pH)
+        group = _residue_category_group(res_name, pka_data.get(key), pH)
         if group == "negative":
             neg_keys.append(key)
             neg_coords.append(xyz)
@@ -1290,71 +1708,100 @@ def compute_residue_DBSCAN_cluster_labels(
             polar_keys.append(key)
             polar_coords.append(xyz)
     
-    def run_dbscan(keys: List, coords: List) -> Dict[Tuple[str, int, str, str], int]:
+    def run_dbscan(
+        keys: List,
+        coords: List,
+        category: str,
+    ) -> Dict[Tuple[str, int, str, str], int]:
         if not coords:
             return {}
+        eps, min_samples = dbscan_params[category]
         X = np.array(coords)
         clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(X)
         return dict(zip(keys, clustering.labels_.tolist()))
-    
-    neg_labels = run_dbscan(neg_keys, neg_coords)
-    pos_labels = run_dbscan(pos_keys, pos_coords)
-    aromatic_labels = run_dbscan(aromatic_keys, aromatic_coords)
-    hydro_labels = run_dbscan(hydro_keys, hydro_coords)
-    polar_labels = run_dbscan(polar_keys, polar_coords)
+
+    neg_labels = run_dbscan(neg_keys, neg_coords, "negative")
+    pos_labels = run_dbscan(pos_keys, pos_coords, "positive")
+    aromatic_labels = run_dbscan(aromatic_keys, aromatic_coords, "aromatic")
+    hydro_labels = run_dbscan(hydro_keys, hydro_coords, "hydrophobic")
+    polar_labels = run_dbscan(polar_keys, polar_coords, "polar")
     
     return neg_labels, pos_labels, aromatic_labels, hydro_labels, polar_labels
 
 
-def summarize_dbscan_clusters(
+def _dbscan_cluster_member_counts_and_side_abs_sums(
     labels: Dict[ResKey4, int],
     sasa_output_data: Dict[ResKey4, Dict[str, Optional[float]]],
-) -> Tuple[int, int, float]:
-
-    if not labels:
-        return 0, 0, 0.0
-
-    from collections import defaultdict
-
+) -> Tuple[Dict[int, int], Dict[int, float]]:
+    """
+    For non-noise DBSCAN labels, return (residue count per label, sum of
+    ``total_side_abs`` per label).     Noise ``-1`` is excluded.
+    """
     cluster_sizes: Dict[int, int] = defaultdict(int)
-    cluster_asa: Dict[int, float] = defaultdict(float)
-
+    cluster_abs_sasa: Dict[int, float] = defaultdict(float)
     for key, label in labels.items():
         if label == -1:
             continue
         cluster_sizes[label] += 1
         entry = _sasa_lookup(sasa_output_data, key) or {}
-        total_side_rel = entry.get("total_side_rel")
-        if total_side_rel is not None:
-            cluster_asa[label] += float(total_side_rel)
-
-    if not cluster_sizes:
-        return 0, 0, 0.0
-
-    largest_cluster_size = max(cluster_sizes.values())
-    n_clusters = len(cluster_sizes)
-    total_rel_asa = float(sum(cluster_asa.values()))
-    n_cluster_members = int(sum(cluster_sizes.values()))
-    avg_rel_asa = float(total_rel_asa) / float(n_cluster_members) if n_cluster_members > 0 else 0.0
-    return largest_cluster_size, n_clusters, avg_rel_asa
+        total_side_abs = entry.get("total_side_abs")
+        if total_side_abs is not None:
+            cluster_abs_sasa[label] += float(total_side_abs)
+    return dict(cluster_sizes), dict(cluster_abs_sasa)
 
 
-# `parse_sasa()` stores `*_rel` fields as fractions in [0, 1] (it divides by 100).
-# Defaults here should therefore use fraction-scale thresholds.
-SURFACE_EXPOSED_THRESHOLD_DEFAULT = 0.08
-RIPLEY_K_DISTANCE = 8.0
-RIPLEY_K_N_SAMPLES = 1000
-ANN_INDEX_N_PERMUTATIONS_DEFAULT = 1000
-# PROPERMAB `StructFeaturizer.ann_index` uses relative side-chain RSA >= 0.05;
-# our SASA parser stores relative values as fractions in [0, 1].
-ANN_INDEX_SASA_CUTOFF_DEFAULT = 0.05
-PSH_PAIR_RADIUS = 7.5
-CDR_VICINITY_RADIUS = 4.0
+def summarize_dbscan_clusters(
+    labels: Dict[ResKey4, int],
+    sasa_output_data: Dict[ResKey4, Dict[str, Optional[float]]],
+) -> float:
+    """
+    For DBSCAN clusters (noise label ``-1`` excluded), return the **sum** of
+    absolute side-chain SASA over **all** non-noise clusters: each cluster
+    contributes the sum of ``total_side_abs`` for its member residues.
 
-# Residue sets for surface ANN index (match PROPERMAB `ann_index` prop filters).
-_ANN_INDEX_POSITIVE_RESIDUES = frozenset({"ARG", "LYS", "HIS"})
-_ANN_INDEX_NEGATIVE_RESIDUES = frozenset({"ASP", "GLU"})
-_ANN_INDEX_AROMATIC_RESIDUES = frozenset({"PHE", "TYR", "TRP"})
+    Units: Å² (same as ``total_side_abs``). Returns ``0.0`` when there are no
+    clusters or ``labels`` is empty.
+    """
+    if not labels:
+        return 0.0
+    _, cluster_abs_sasa = _dbscan_cluster_member_counts_and_side_abs_sums(
+        labels, sasa_output_data
+    )
+    if not cluster_abs_sasa:
+        return 0.0
+    return float(sum(cluster_abs_sasa.values()))
+
+
+def dbscan_cluster_side_abs_sasa_entropy(
+    labels: Dict[ResKey4, int],
+    sasa_output_data: Dict[ResKey4, Dict[str, Optional[float]]],
+) -> float:
+    """
+    Shannon entropy of DBSCAN cluster **total side-chain absolute SASA** masses.
+
+    For each non-noise cluster label ``i``, let ``s_i`` be the sum of
+    ``total_side_abs`` over residues in that cluster, ``S = Σ_i s_i``, and
+    ``p_i = s_i / S``. Returns ``H = -Σ_i p_i log(p_i)`` (natural logarithm,
+    units **nats**). Noise ``-1`` is excluded; clusters with ``s_i = 0`` contribute
+    no entropy mass.
+
+    Returns ``0.0`` when there are no clusters, ``S <= 0``, or ``labels`` empty.
+    High ``H`` → SASA mass spread across similar-sized (in abs SASA) clusters;
+    low ``H`` → one or few clusters dominate ``S``.
+    """
+    if not labels:
+        return 0.0
+    _, cluster_abs_sasa = _dbscan_cluster_member_counts_and_side_abs_sums(
+        labels, sasa_output_data
+    )
+    if not cluster_abs_sasa:
+        return 0.0
+    s_vals = np.asarray(list(cluster_abs_sasa.values()), dtype=np.float64)
+    s_total = float(np.sum(s_vals))
+    if s_total <= 0.0:
+        return 0.0
+    p = s_vals / s_total
+    return float(-np.sum(np.where(p > 0.0, p * np.log(p), 0.0)))
 
 
 def _ann_mean_nn_distance(coords: np.ndarray) -> float:
@@ -1368,11 +1815,8 @@ def _ann_mean_nn_distance(coords: np.ndarray) -> float:
     if n < 2:
         return float("nan")
     tree = cKDTree(coords)
-    nn_distances: List[float] = []
-    for point in coords:
-        dists, _ = tree.query(point, k=2)
-        nn_distances.append(float(dists[1]))
-    return float(np.mean(nn_distances))
+    dists, _ = tree.query(coords, k=2)
+    return float(np.mean(dists[:, 1]))
 
 
 def _ann_index_ratio(
@@ -1399,13 +1843,13 @@ def _ann_index_ratio(
     if math.isnan(d_o) or d_o <= 0.0:
         return None
 
-    d_e_null: List[float] = []
+    d_e_null_sum = 0.0
     for _ in range(int(n_permutations)):
         pick = rng.choice(n_allow, size=n_feat, replace=True)
         sample = allowed_coords[pick]
-        d_e_null.append(_ann_mean_nn_distance(sample))
+        d_e_null_sum += _ann_mean_nn_distance(sample)
 
-    d_e = float(np.mean(d_e_null)) if d_e_null else float("nan")
+    d_e = (d_e_null_sum / float(int(n_permutations))) if int(n_permutations) > 0 else float("nan")
     if math.isnan(d_e) or d_e <= 0.0:
         return None
     return float(d_o / d_e)
@@ -1422,9 +1866,10 @@ def compute_surface_ann_index_descriptors(
     Average Nearest Neighbor (ANN) index for positive, negative, and aromatic residues
     on the solvent-exposed surface (PROPERMAB-style).
 
-    For each property, coordinates are Cα of exposed residues matching the type.
+    For each property, coordinates are Cα of exposed residues
+    matching the type.
     The null expectation ``d_e`` is estimated by repeatedly sampling the same number
-    of points uniformly at random from the set of Cα positions of *all* exposed
+    of points uniformly at random from the set of reference positions of *all* exposed
     residues, **with replacement** (matching PROPERMAB's ``rng.choice`` default).
 
     Returns
@@ -1441,26 +1886,21 @@ def compute_surface_ann_index_descriptors(
     if not sasa_output_data or not pdb_atoms:
         return result
 
-    ca_by_res: Dict[ResKey4, Tuple[float, float, float]] = {}
-    for atom in pdb_atoms:
-        if (atom.name or "").strip() != "CA":
-            continue
-        key = residue_key_from_atom(atom)
-        ca_by_res[key] = (atom.x, atom.y, atom.z)
+    ca_by_res = ca_xyz_by_residue(pdb_atoms)
 
     residue_exposure = get_exposed_residues(sasa_output_data, float(sasa_cutoff))
-    exposed_with_ca: List[ResKey4] = [
+    exposed_with_ref: List[ResKey4] = [
         k for k, exposed in residue_exposure.items() if exposed and k in ca_by_res
     ]
-    if len(exposed_with_ca) < 2:
+    if len(exposed_with_ref) < 2:
         return result
 
-    allowed_coords = np.array([ca_by_res[k] for k in exposed_with_ca], dtype=np.float64)
+    allowed_coords = np.array([ca_by_res[k] for k in exposed_with_ref], dtype=np.float64)
     rng = np.random.default_rng(random_seed)
 
     def _coords_for(residue_set: Set[str]) -> np.ndarray:
         pts: List[Tuple[float, float, float]] = []
-        for k in exposed_with_ca:
+        for k in exposed_with_ref:
             res_name = (k[0] or "").strip().upper()
             if res_name in residue_set:
                 pts.append(ca_by_res[k])
@@ -1491,6 +1931,7 @@ def ripley_k_statistic(
     allowed_coords,
     distance: float = 6.0,
     n: int = 1000,
+    random_seed: int = 0,
 ) -> float:
     """
     Ripley's K-like statistic for a set of observed points embedded in a space of
@@ -1509,23 +1950,16 @@ def ripley_k_statistic(
 
     denominator = feature_size * (feature_size - 1)
 
-    def _get_number_of_pairs(coords, dist: float) -> int:
-        if len(coords) == 0:
-            return 0
-        kd_tree = cKDTree(coords)
-        neighbor_pairs = kd_tree.query_pairs(r=dist)
-        return len(neighbor_pairs)
+    k_o = len(cKDTree(obs_coords).query_pairs(r=distance)) / denominator
 
-    k_o = _get_number_of_pairs(obs_coords, distance) / denominator
-
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(random_seed)
     k_e_null = []
     allowed_size = allowed_coords.shape[0]
     replace = allowed_size < feature_size
     for _ in range(int(n)):
         indices = rng.choice(allowed_size, size=feature_size, replace=replace)
         new_coords = allowed_coords[indices]
-        k_e_null.append(_get_number_of_pairs(new_coords, distance) / denominator)
+        k_e_null.append(len(cKDTree(new_coords).query_pairs(r=distance)) / denominator)
 
     k_e = float(np.mean(k_e_null)) if k_e_null else float("nan")
     if k_e == 0.0 or math.isnan(k_e):
@@ -1537,10 +1971,10 @@ def get_pka_for_key(key: ResKey4, pka_output_data: Dict[ResKey4, float]) -> Opti
         (key[0], key[1], key[2], "")
     )
 
-def compute_ripley(coords: List[Tuple[float, float, float]], allowed_coords: List[Tuple[float, float, float]], ripley_distance: float = RIPLEY_K_DISTANCE, ripley_n: int = RIPLEY_K_N_SAMPLES) -> Optional[float]:
+def compute_ripley(coords: List[Tuple[float, float, float]], allowed_coords: List[Tuple[float, float, float]], ripley_distance: float = RIPLEY_K_DISTANCE, ripley_n: int = RIPLEY_K_N_SAMPLES, random_seed: int = 0) -> Optional[float]:
         if len(coords) < 2:
             return 0.0
-        value = ripley_k_statistic(coords, allowed_coords, distance=ripley_distance, n=ripley_n)
+        value = ripley_k_statistic(coords, allowed_coords, distance=ripley_distance, n=ripley_n, random_seed=random_seed)
         if value is None or (isinstance(value, float) and math.isnan(value)):
             return None
         return float(value)
@@ -1553,7 +1987,14 @@ def compute_surface_ripley_descriptors(
     surface_exposed_threshold: float = SURFACE_EXPOSED_THRESHOLD_DEFAULT,
     ripley_distance: float = RIPLEY_K_DISTANCE,
     ripley_n: int = RIPLEY_K_N_SAMPLES,
+    random_seed: int = 0,
 ) -> Dict[str, Optional[float]]:
+    """
+    Ripley-style ratios for charge/hydrophobicity classes on the **full** exposed
+    surface (relative side SASA above threshold, with Cα coordinates). The
+    null resamples ``N`` locations uniformly from that same exposed reference set (same
+    rule as ``ripley_k_statistic``).
+    """
 
     result: Dict[str, Optional[float]] = {
         "ripley_k_negative": None,
@@ -1565,21 +2006,18 @@ def compute_surface_ripley_descriptors(
     if not sasa_output_data:
         return result
 
-    ca_by_res: Dict[ResKey4, Tuple[float, float, float]] = {}
-    atoms_by_res: Dict[ResKey4, List[Atom]] = defaultdict(list)
-    for atom in pdb_atoms:
-        key = residue_key_from_atom(atom)
-        atoms_by_res[key].append(atom)
-        if atom.name == "CA":
-            ca_by_res[key] = (atom.x, atom.y, atom.z)
+    ca_by_res = ca_xyz_by_residue(pdb_atoms)
 
     residue_exposure = get_exposed_residues(sasa_output_data, surface_exposed_threshold)
     exposed_keys: Set[ResKey4] = {
         key for key, is_exposed in residue_exposure.items() if is_exposed
     }
 
-    exposed_keys_with_ca = [k for k in exposed_keys if k in ca_by_res]
-    if len(exposed_keys_with_ca) < 2:
+    exposed_keys_with_ref = sorted(
+        [k for k in exposed_keys if k in ca_by_res],
+        key=lambda k: (k[2], k[1], k[3], k[0]),
+    )
+    if len(exposed_keys_with_ref) < 2:
         result["ripley_k_negative"] = 0.0
         result["ripley_k_positive"] = 0.0
         result["ripley_k_aromatic"] = 0.0
@@ -1588,7 +2026,7 @@ def compute_surface_ripley_descriptors(
         return result
 
     allowed_coords = np.array(
-        [ca_by_res[k] for k in exposed_keys_with_ca],
+        [ca_by_res[k] for k in exposed_keys_with_ref],
         dtype=float,
     )
 
@@ -1597,7 +2035,7 @@ def compute_surface_ripley_descriptors(
     aromatic_coords: List[Tuple[float, float, float]] = []
     hydro_coords: List[Tuple[float, float, float]] = []
     polar_coords: List[Tuple[float, float, float]] = []
-    for key in exposed_keys_with_ca:
+    for key in exposed_keys_with_ref:
         xyz = ca_by_res[key]
         res_name = key[0]
         pka_val = get_pka_for_key(key, pka_output_data)
@@ -1613,11 +2051,264 @@ def compute_surface_ripley_descriptors(
         elif group == "polar":
             polar_coords.append(xyz)
 
-    result["ripley_k_negative"] = compute_ripley(neg_coords, allowed_coords)
-    result["ripley_k_positive"] = compute_ripley(pos_coords, allowed_coords)
-    result["ripley_k_aromatic"] = compute_ripley(aromatic_coords, allowed_coords)
-    result["ripley_k_hydrophobic"] = compute_ripley(hydro_coords, allowed_coords)
-    result["ripley_k_polar"] = compute_ripley(polar_coords, allowed_coords)
+    result["ripley_k_negative"] = compute_ripley(neg_coords, allowed_coords, random_seed=random_seed)
+    result["ripley_k_positive"] = compute_ripley(pos_coords, allowed_coords, random_seed=random_seed)
+    result["ripley_k_aromatic"] = compute_ripley(aromatic_coords, allowed_coords, random_seed=random_seed)
+    result["ripley_k_hydrophobic"] = compute_ripley(hydro_coords, allowed_coords, random_seed=random_seed)
+    result["ripley_k_polar"] = compute_ripley(polar_coords, allowed_coords, random_seed=random_seed)
+
+    return result
+
+
+def _pcf_shell_numeric_token(x: float) -> str:
+    """Stable token for one distance in Å (no unit suffix), e.g. ``3.0`` -> ``3``, ``3.5`` -> ``3p5``."""
+    v = float(x)
+    ir = round(v)
+    if abs(v - ir) < 1e-9:
+        return str(int(ir))
+    return f"{v:g}".replace(".", "p")
+
+
+def _pcf_shell_key_suffix(r_lo: float, width: float) -> str:
+    """Metric key fragment for shell ``[r_lo, r_lo + width)``, e.g. ``(3, 2)`` -> ``3w2A``."""
+    return f"{_pcf_shell_numeric_token(r_lo)}w{_pcf_shell_numeric_token(width)}A"
+
+
+def _empty_pcf_cluster_scores(
+    bin_starts: Tuple[float, ...],
+    bin_widths: Tuple[float, ...],
+) -> Dict[str, Optional[float]]:
+    if len(bin_starts) != len(bin_widths):
+        raise ValueError("bin_starts and bin_widths must have the same length")
+    tags = [
+        _pcf_shell_key_suffix(float(r), float(w))
+        for r, w in zip(bin_starts, bin_widths)
+    ]
+    out: Dict[str, Optional[float]] = {}
+    for cat in ("negative", "positive", "hydrophobic"):
+        for tag in tags:
+            out[f"pcf_cluster_score_{cat}_{tag}"] = None
+    return out
+
+
+def _empty_pcf_buried_aromatic_hydrophobic_scores(
+    bin_starts: Tuple[float, ...],
+    bin_widths: Tuple[float, ...],
+) -> Dict[str, Optional[float]]:
+    """PCF keys for buried aromatic / hydrophobic only (``buried`` infix disambiguates from exposed)."""
+    if len(bin_starts) != len(bin_widths):
+        raise ValueError("bin_starts and bin_widths must have the same length")
+    tags = [
+        _pcf_shell_key_suffix(float(r), float(w))
+        for r, w in zip(bin_starts, bin_widths)
+    ]
+    out: Dict[str, Optional[float]] = {}
+    for cat in ("aromatic", "hydrophobic"):
+        for tag in tags:
+            out[f"pcf_cluster_score_buried_{cat}_{tag}"] = None
+    return out
+
+
+def compute_exposed_pair_correlation_cluster_scores(
+    pdb_atoms: List[Atom],
+    sasa_output_data: Dict[ResKey4, SASAEntry],
+    pka_output_data: Dict[ResKey4, float],
+    pH: float,
+    surface_exposed_threshold: float = SURFACE_EXPOSED_THRESHOLD_DEFAULT,
+    bin_starts: Tuple[float, ...] = PCF_CLUSTER_BIN_STARTS_DEFAULT,
+    bin_widths: Tuple[float, ...] = PCF_CLUSTER_BIN_WIDTHS_DEFAULT,
+    n_permutations: int = PCF_CLUSTER_N_PERMUTATIONS_DEFAULT,
+    random_seed: int = 0,
+) -> Dict[str, Optional[float]]:
+    """
+    Pair-correlation clustering scores for surface-exposed Cα atoms,
+    by residue category (negative / positive / hydrophobic; polar currently disabled).
+    Uncharged
+    Phe/Tyr/Trp are typed as hydrophobic or polar (no separate aromatic channel;
+    Ripley / DBSCAN surface metrics still use a five-way split elsewhere).
+
+    Only residues that are **exposed** (relative side SASA above threshold) and
+    have a Cα coordinate are considered — same scope as ``compute_surface_ripley_descriptors``.
+
+    For each category, ρ = N_type / V_ref with ``V_ref`` the convex-hull volume
+    of **all** exposed Cα positions in scope. For **each** distance shell ``[r, r + Δr)``
+    (defaults: 1 Å bins ``[3,4)``, ``[4,5)``, ``[5,6)`` plus 2 Å bins ``[3,5)``, ``[5,7)``;
+    see ``PCF_CLUSTER_BIN_STARTS_DEFAULT`` / ``PCF_CLUSTER_BIN_WIDTHS_DEFAULT``), the reported
+    value is ``g_obs(r) / mean(g_null(r))`` under the same Ripley-style null as
+    ``pair_correlation_clustering_score_random_surface_null`` (uniform draws of
+    ``N`` sites from the exposed set per permutation; default
+    ``n_permutations`` is ``PCF_CLUSTER_N_PERMUTATIONS_DEFAULT``, 3000). Keys look like
+    ``pcf_cluster_score_negative_3w1A``, ``…_4w1A``, ``…_5w1A``, ``…_3w2A``, ``…_5w2A``.
+    """
+    result = _empty_pcf_cluster_scores(bin_starts, bin_widths)
+    if not sasa_output_data:
+        return result
+
+    ca_by_res = ca_xyz_by_residue(pdb_atoms)
+
+    residue_exposure = get_exposed_residues(
+        sasa_output_data, float(surface_exposed_threshold)
+    )
+    exposed_keys: Set[ResKey4] = {
+        key for key, is_exposed in residue_exposure.items() if is_exposed
+    }
+
+    exposed_keys_with_ref: List[ResKey4] = sorted(
+        [k for k in exposed_keys if k in ca_by_res],
+        key=lambda k: (k[2], k[1], k[3], k[0]),
+    )
+    if len(exposed_keys_with_ref) < 2:
+        for k in result:
+            result[k] = 0.0
+        return result
+
+    allowed_coords = np.array(
+        [ca_by_res[k] for k in exposed_keys_with_ref],
+        dtype=np.float64,
+    )
+    v_ref = convex_hull_volume_from_points(allowed_coords)
+    if v_ref <= 0.0:
+        for k in result:
+            result[k] = 0.0
+        return result
+
+    rng = np.random.default_rng(random_seed)
+
+    neg: List[Tuple[float, float, float]] = []
+    pos: List[Tuple[float, float, float]] = []
+    hydro: List[Tuple[float, float, float]] = []
+    # polar: List[Tuple[float, float, float]] = []
+
+    for key in exposed_keys_with_ref:
+        xyz = ca_by_res[key]
+        res_name = key[0]
+        pka_val = get_pka_for_key(key, pka_output_data)
+        group = _residue_category_group_surface_pcf(res_name, pka_val, pH)
+        if group == "negative":
+            neg.append(xyz)
+        elif group == "positive":
+            pos.append(xyz)
+        elif group == "hydrophobic":
+            hydro.append(xyz)
+        # elif group == "polar":
+        #     polar.append(xyz)
+
+    shell_tags = [
+        _pcf_shell_key_suffix(float(r), float(w))
+        for r, w in zip(bin_starts, bin_widths)
+    ]
+
+    for cat, coords_list in (
+        ("negative", neg),
+        ("positive", pos),
+        ("hydrophobic", hydro),
+        # ("polar", polar),
+    ):
+        per_shell = pair_correlation_clustering_score_random_surface_null_by_bin(
+            np.array(coords_list, dtype=np.float64),
+            allowed_coords,
+            v_ref,
+            bin_starts,
+            bin_widths,
+            n_permutations,
+            rng,
+        )
+        for tag, val in zip(shell_tags, per_shell):
+            result[f"pcf_cluster_score_{cat}_{tag}"] = val
+
+    return result
+
+
+def compute_buried_pair_correlation_cluster_scores_aromatic_hydrophobic(
+    pdb_atoms: List[Atom],
+    sasa_output_data: Dict[ResKey4, SASAEntry],
+    pka_output_data: Dict[ResKey4, float],
+    pH: float,
+    surface_exposed_threshold: float = SURFACE_EXPOSED_THRESHOLD_DEFAULT,
+    bin_starts: Tuple[float, ...] = PCF_CLUSTER_BIN_STARTS_DEFAULT,
+    bin_widths: Tuple[float, ...] = PCF_CLUSTER_BIN_WIDTHS_DEFAULT,
+    n_permutations: int = PCF_CLUSTER_N_PERMUTATIONS_DEFAULT,
+    random_seed: int = 0,
+) -> Dict[str, Optional[float]]:
+    """
+    Pair-correlation clustering scores for **buried** Cα atoms (complement of exposed:
+    ``total_side_rel <= surface_exposed_threshold``), for **aromatic** and **hydrophobic**
+    only, using the same residue typing as :func:`compute_exposed_pair_correlation_cluster_scores`.
+
+    Reference volume ``V_ref`` is the convex hull of **all** buried Cα positions in scope.
+    For each category and distance shell, the statistic matches the exposed implementation:
+    ``g_obs(r) / mean(g_null(r))`` with null draws uniform on the buried Cα support
+    (same ``bin_starts``, ``bin_widths``, ``n_permutations`` defaults as exposed PCF).
+
+    Keys use the same shell suffixes as exposed PCF (``3w1A``, ``4w1A``, ``5w1A``, ``3w2A``, ``5w2A``).
+    """
+    result = _empty_pcf_buried_aromatic_hydrophobic_scores(bin_starts, bin_widths)
+    if not sasa_output_data:
+        return result
+
+    ca_by_res = ca_xyz_by_residue(pdb_atoms)
+
+    residue_exposure = get_exposed_residues(
+        sasa_output_data, float(surface_exposed_threshold)
+    )
+    buried_keys: Set[ResKey4] = {
+        key for key, is_exposed in residue_exposure.items() if not is_exposed
+    }
+
+    buried_keys_with_ref: List[ResKey4] = sorted(
+        [k for k in buried_keys if k in ca_by_res],
+        key=lambda k: (k[2], k[1], k[3], k[0]),
+    )
+    if len(buried_keys_with_ref) < 2:
+        for k in result:
+            result[k] = 0.0
+        return result
+
+    allowed_coords = np.array(
+        [ca_by_res[k] for k in buried_keys_with_ref],
+        dtype=np.float64,
+    )
+    v_ref = convex_hull_volume_from_points(allowed_coords)
+    if v_ref <= 0.0:
+        for k in result:
+            result[k] = 0.0
+        return result
+
+    rng = np.random.default_rng(random_seed)
+
+    aromatic: List[Tuple[float, float, float]] = []
+    hydro: List[Tuple[float, float, float]] = []
+
+    for key in buried_keys_with_ref:
+        xyz = ca_by_res[key]
+        res_name = key[0]
+        pka_val = get_pka_for_key(key, pka_output_data)
+        group = _residue_category_group(res_name, pka_val, pH)
+        if group == "aromatic":
+            aromatic.append(xyz)
+        elif group == "hydrophobic":
+            hydro.append(xyz)
+
+    shell_tags = [
+        _pcf_shell_key_suffix(float(r), float(w))
+        for r, w in zip(bin_starts, bin_widths)
+    ]
+
+    for cat, coords_list in (
+        ("aromatic", aromatic),
+        ("hydrophobic", hydro),
+    ):
+        per_shell = pair_correlation_clustering_score_random_surface_null_by_bin(
+            np.array(coords_list, dtype=np.float64),
+            allowed_coords,
+            v_ref,
+            bin_starts,
+            bin_widths,
+            n_permutations,
+            rng,
+        )
+        for tag, val in zip(shell_tags, per_shell):
+            result[f"pcf_cluster_score_buried_{cat}_{tag}"] = val
 
     return result
 
@@ -1650,13 +2341,11 @@ def compute_surface_pair_descriptors(
     if not sasa_output_data:
         return result
 
-    ca_by_res: Dict[ResKey4, Tuple[float, float, float]] = {}
+    ca_by_res = ca_xyz_by_residue(pdb_atoms)
     atoms_by_res: Dict[ResKey4, List[Atom]] = defaultdict(list)
     for atom in pdb_atoms:
         key = residue_key_from_atom(atom)
         atoms_by_res[key].append(atom)
-        if atom.name == "CA":
-            ca_by_res[key] = (atom.x, atom.y, atom.z)
 
     # Use shared exposure helper instead of duplicating SASA threshold logic
     residue_exposure = get_exposed_residues(sasa_output_data, surface_exposed_threshold)
@@ -1664,8 +2353,8 @@ def compute_surface_pair_descriptors(
         key for key, is_exposed in residue_exposure.items() if is_exposed
     }
 
-    exposed_keys_with_ca = [k for k in exposed_keys if k in ca_by_res]
-    if len(exposed_keys_with_ca) < 2:
+    exposed_keys_with_ref = [k for k in exposed_keys if k in ca_by_res]
+    if len(exposed_keys_with_ref) < 2:
         result["psh_all_surface"] = 0.0
         result["psh_cdr_vicinity"] = 0.0
         result["ppc_all_surface"] = 0.0
@@ -1692,16 +2381,14 @@ def compute_surface_pair_descriptors(
         result["pnc_cdr_vicinity"] = 0.0
         return result
 
-    points_list: List[List[float]] = []
-    labels_list: List[int] = []
-    for idx, key in enumerate(exposed_residue_keys):
-        for atom in atoms_by_res[key]:
-            if is_hydrogen_atom(atom):
-                continue
-            points_list.append([atom.x, atom.y, atom.z])
-            labels_list.append(idx)
+    # Shared heavy-atom KDTree; pair (i, j) uses minimum heavy-atom distance.
+    heavy_tree, heavy_coords, heavy_atom_res_keys, heavy_atoms_by_res = get_heavy_atom_tree(pdb_atoms)
 
-    if not points_list:
+    exposed_res_to_idx: Dict[ResKey4, int] = {key: idx for idx, key in enumerate(exposed_residue_keys)}
+    exposed_res_set: Set[ResKey4] = set(exposed_residue_keys)
+
+    # Verify that exposed residues have heavy atoms in the tree; bail if none do.
+    if not any(heavy_atoms_by_res.get(k) for k in exposed_residue_keys):
         result["psh_all_surface"] = 0.0
         result["psh_cdr_vicinity"] = 0.0
         result["ppc_all_surface"] = 0.0
@@ -1710,26 +2397,27 @@ def compute_surface_pair_descriptors(
         result["pnc_cdr_vicinity"] = 0.0
         return result
 
-    points_arr = np.array(points_list, dtype=float)
-    labels_arr = np.array(labels_list, dtype=int)
-    atom_tree = cKDTree(points_arr)
     pair_min_dist: Dict[Tuple[int, int], float] = {}
-    for i in range(points_arr.shape[0]):
-        res_i = labels_arr[i]
-        neighbors = atom_tree.query_ball_point(points_arr[i], pair_radius)
-        for j in neighbors:
-            if j <= i:
-                continue
-            res_j = labels_arr[j]
-            if res_i == res_j:
-                continue
-            pair = (min(res_i, res_j), max(res_i, res_j))
-            dist_ij = float(np.linalg.norm(points_arr[i] - points_arr[j]))
-            if dist_ij <= 0.0:
-                continue
-            current = pair_min_dist.get(pair)
-            if current is None or dist_ij < current:
-                pair_min_dist[pair] = dist_ij
+    for idx, key in enumerate(exposed_residue_keys):
+        atom_indices_i = heavy_atoms_by_res.get(key, [])
+        if not atom_indices_i:
+            continue
+        neighbours_list = heavy_tree.query_ball_point(heavy_coords[atom_indices_i], pair_radius)
+        for atom_i, neighbour_atom_idxs in zip(atom_indices_i, neighbours_list):
+            for atom_j in neighbour_atom_idxs:
+                nb_key = heavy_atom_res_keys[atom_j]
+                if nb_key == key or nb_key not in exposed_res_set:
+                    continue
+                nb_local = exposed_res_to_idx[nb_key]
+                if idx >= nb_local:
+                    continue  # process each pair once (smaller idx first)
+                pair = (idx, nb_local)
+                dist_ij = float(np.linalg.norm(heavy_coords[atom_i] - heavy_coords[atom_j]))
+                if dist_ij <= 0.0:
+                    continue
+                current = pair_min_dist.get(pair)
+                if current is None or dist_ij < current:
+                    pair_min_dist[pair] = dist_ij
 
     if not pair_min_dist:
         result["psh_all_surface"] = 0.0
@@ -1746,12 +2434,11 @@ def compute_surface_pair_descriptors(
     for idx, key in enumerate(exposed_residue_keys):
         if salt_bridge_residues is not None and key in salt_bridge_residues:
             continue
-        res_name = key[0]
-        pka_val = get_pka_for_key(key, pka_output_data)
-        if res_name in POSITIVE_CHARGED_RESIDUES and is_residue_charged(res_name, pka_val, pH):
-            pos_charge[idx] = 1.0
-        elif res_name in NEGATIVE_CHARGED_RESIDUES and is_residue_charged(res_name, pka_val, pH):
-            neg_charge[idx] = 1.0
+        q = _residue_fractional_charge_at_pH(key[0], get_pka_for_key(key, pka_output_data), pH)
+        if q > 0.0:
+            pos_charge[idx] = q
+        elif q < 0.0:
+            neg_charge[idx] = q
 
     psh_all_surface_acc = 0.0
     ppc_all_surface_acc = 0.0
@@ -1763,22 +2450,16 @@ def compute_surface_pair_descriptors(
         psh_all_surface_acc += (h1 * h2) * inv_r2
         if pos_charge[ri] > 0.0 and pos_charge[rj] > 0.0:
             ppc_all_surface_acc += (pos_charge[ri] * pos_charge[rj]) * inv_r2
-        if neg_charge[ri] > 0.0 and neg_charge[rj] > 0.0:
+        if neg_charge[ri] < 0.0 and neg_charge[rj] < 0.0:
             pnc_all_surface_acc += (neg_charge[ri] * neg_charge[rj]) * inv_r2
 
     result["psh_all_surface"] = psh_all_surface_acc
     result["ppc_all_surface"] = ppc_all_surface_acc
     result["pnc_all_surface"] = pnc_all_surface_acc
 
-    def is_cdr_residue(k: ResKey4) -> bool:
-        num = k[1]
-        for start, end in CDR_RANGES_CA:
-            if start <= num <= end:
-                return True
-        return False
-
     seed_indices = {
-        idx for idx, key in enumerate(exposed_residue_keys) if is_cdr_residue(key)
+        idx for idx, key in enumerate(exposed_residue_keys)
+        if get_residue_region(key[1]) == "CDR"
     }
     seed_points_list: List[List[float]] = []
     for idx, key in enumerate(exposed_residue_keys):
@@ -1815,7 +2496,7 @@ def compute_surface_pair_descriptors(
                 psh_cdr_acc += (H_array[ri] * H_array[rj]) * inv_r2
                 if pos_charge[ri] > 0.0 and pos_charge[rj] > 0.0:
                     ppc_cdr_acc += (pos_charge[ri] * pos_charge[rj]) * inv_r2
-                if neg_charge[ri] > 0.0 and neg_charge[rj] > 0.0:
+                if neg_charge[ri] < 0.0 and neg_charge[rj] < 0.0:
                     pnc_cdr_acc += (neg_charge[ri] * neg_charge[rj]) * inv_r2
         result["psh_cdr_vicinity"] = psh_cdr_acc
         result["ppc_cdr_vicinity"] = ppc_cdr_acc
@@ -1841,12 +2522,13 @@ def compute_inter_chain_buried_sasa(complex_sasa_path: str) -> Optional[float]:
     sasa_H_path = str(path.with_name(f"{base}_H_full{suffix}"))
     sasa_L_path = str(path.with_name(f"{base}_L_full{suffix}"))
 
-    complex_total = get_sasa_total(str(path.resolve()))
-    h_total = get_sasa_total(sasa_H_path)
-    l_total = get_sasa_total(sasa_L_path)
-    if complex_total is not None and h_total is not None and l_total is not None:
-        return h_total + l_total - complex_total
-    return None
+    try:
+        complex_total = parse_sasa(str(path.resolve())).total_sasa
+        h_total = parse_sasa(sasa_H_path).total_sasa
+        l_total = parse_sasa(sasa_L_path).total_sasa
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+    return h_total + l_total - complex_total
 
 # H-bonds
 def _enumerate_hbonds(pdb_path: str) -> List[Tuple[Atom, Atom]]:
@@ -1869,18 +2551,46 @@ def _enumerate_hbonds(pdb_path: str) -> List[Tuple[Atom, Atom]]:
         return cached
 
     atoms = _get_atoms_for_path(pdb_path)
+    residue_cache_key = _residue_keys_cache_key(atoms)
     seq_index = _get_residue_seq_index(atoms)
-    donors = [atom for atom in atoms if is_donor(atom)]
-    acceptors = [atom for atom in atoms if is_acceptor(atom)]
+    atom_lookup = _ATOM_LOOKUP_CACHE.get(residue_cache_key)
+    if atom_lookup is None:
+        atom_lookup = {
+            (atom.chain, atom.residue_number, atom.insertion_code, atom.name): atom
+            for atom in atoms
+        }
+        _ATOM_LOOKUP_CACHE[residue_cache_key] = atom_lookup
+    chain_index_to_res = _RES_INDEX_TO_KEY_CACHE.get(residue_cache_key, {})
+
+    donors: List[Atom] = []
+    donor_coords_list: List[Tuple[float, float, float]] = []
+    donor_res_keys: List[ResKey4] = []
+    donor_is_backbone: List[bool] = []
+    donor_max_list: List[int] = []
+    acceptors: List[Atom] = []
+    acceptor_coords_list: List[Tuple[float, float, float]] = []
+    acceptor_keys: List[ResKey4] = []
+    acceptor_max_list: List[int] = []
+    for atom in atoms:
+        if is_donor(atom):
+            donors.append(atom)
+            donor_coords_list.append((atom.x, atom.y, atom.z))
+            donor_res_keys.append(residue_key_from_atom(atom))
+            donor_is_backbone.append(is_backbone_atom(atom.name))
+            donor_max_list.append(donor_max_hbonds(atom))
+        if is_acceptor(atom):
+            acceptors.append(atom)
+            acceptor_coords_list.append((atom.x, atom.y, atom.z))
+            acceptor_keys.append(residue_key_from_atom(atom))
+            acceptor_max_list.append(acceptor_max_hbonds(atom))
 
     if not donors or not acceptors:
         _HBOND_PAIRS_CACHE[cache_key] = []
         return []
 
-    acceptor_coords = np.array([[a.x, a.y, a.z] for a in acceptors])
-    acceptor_keys = [residue_key_from_atom(a) for a in acceptors]
+    acceptor_coords = np.array(acceptor_coords_list, dtype=np.float64)
     acceptor_tree = cKDTree(acceptor_coords)
-    donor_coords = np.array([[d.x, d.y, d.z] for d in donors])
+    donor_coords = np.array(donor_coords_list, dtype=np.float64)
     backbone_base_cache: Dict[ResKey4, Atom] = {}
     backbone_base_vec_cache: Dict[ResKey4, np.ndarray] = {}
     backbone_base_vec_norm_sq_cache: Dict[ResKey4, float] = {}
@@ -1894,18 +2604,26 @@ def _enumerate_hbonds(pdb_path: str) -> List[Tuple[Atom, Atom]]:
 
     for donor_idx, donor in enumerate(donors):
         donor_coord = donor_coords[donor_idx]
-        donor_res_key = residue_key_from_atom(donor)
+        donor_res_key = donor_res_keys[donor_idx]
         # Distance filter: all candidates come from KD-tree (same for backbone and sidechain)
         indices = acceptor_tree.query_ball_point(donor_coord, MAX_HBOND_DISTANCE)
         if not indices:
             continue
 
-        is_backbone_donor = is_backbone_atom(donor.name)
-        donor_max = donor_max_hbonds(donor)
+        is_backbone_donor = donor_is_backbone[donor_idx]
+        donor_max = donor_max_list[donor_idx]
 
         # Resolve base atom and base->donor vector for angle check (same for backbone and sidechain)
         if is_backbone_donor:
-            precomputed_base = get_donor_base_atom(donor, atoms, backbone_base_cache)
+            precomputed_base = get_donor_base_atom(
+                donor,
+                atoms,
+                backbone_base_cache,
+                atom_lookup=atom_lookup,
+                seq_index=seq_index,
+                chain_index_to_res=chain_index_to_res,
+                residue_cache_key=residue_cache_key,
+            )
             if precomputed_base is None:
                 continue
             base_vec = backbone_base_vec_cache.get(donor_res_key)
@@ -1921,7 +2639,15 @@ def _enumerate_hbonds(pdb_path: str) -> List[Tuple[Atom, Atom]]:
         else:
             base = sidechain_base_cache.get(donor)
             if base is None and donor not in sidechain_base_cache:
-                base = get_donor_base_atom(donor, atoms, backbone_base_cache)
+                base = get_donor_base_atom(
+                    donor,
+                    atoms,
+                    backbone_base_cache,
+                    atom_lookup=atom_lookup,
+                    seq_index=seq_index,
+                    chain_index_to_res=chain_index_to_res,
+                    residue_cache_key=residue_cache_key,
+                )
                 sidechain_base_cache[donor] = base
             if base is None:
                 continue
@@ -1936,7 +2662,7 @@ def _enumerate_hbonds(pdb_path: str) -> List[Tuple[Atom, Atom]]:
         valid_acceptors = []
         for idx in indices:
             acceptor = acceptors[idx]
-            if acceptor_hbond_counts.get(acceptor, 0) >= acceptor_max_hbonds(acceptor):
+            if acceptor_hbond_counts.get(acceptor, 0) >= acceptor_max_list[idx]:
                 continue
             acceptor_res_key = acceptor_keys[idx]
             if donor_res_key == acceptor_res_key:
@@ -1979,7 +2705,7 @@ def _enumerate_hbonds(pdb_path: str) -> List[Tuple[Atom, Atom]]:
             if donor_hbond_counts.get(donor, 0) >= donor_max:
                 break
             acceptor = valid_acceptors[local_idx]
-            acc_max = acceptor_max_hbonds(acceptor)
+            acc_max = acceptor_max_list[valid_indices[local_idx]]
             if acceptor_hbond_counts.get(acceptor, 0) >= acc_max:
                 continue
             pairs.append((donor, acceptor))
@@ -2086,7 +2812,7 @@ def calculate_global_hbond_density_average(
     *,
     residues_for_density: Optional[Iterable[Tuple[str, int, str, str]]] = None,
     weighted: bool = True,
-    residues_for_average: Optional[Iterable[Tuple[str, int, str, str]]] = None,
+    residues_for_average: Optional[Union[str, Iterable[Tuple[str, int, str, str]]]] = None,
     sqrt_weights: bool = True,
     weights_raw: Optional[Dict[Tuple[str, int, str, str], float]] = None,
     counts: Optional[Dict[Tuple[str, int, str, str], int]] = None,
@@ -2237,7 +2963,7 @@ def calculate_hbond_energy_density_dssp_backbone_only_average(
     *,
     residues_for_density: Optional[Iterable[Tuple[str, int, str, str]]] = None,
     weighted: bool = True,
-    residues_for_average: Optional[Iterable[Tuple[str, int, str, str]]] = None,
+    residues_for_average: Optional[Union[str, Iterable[Tuple[str, int, str, str]]]] = None,
     sqrt_weights: bool = True,
     dssp_hbond_energy_density_raw: Optional[_DsspHbondEnergyDensityRaw] = None,
 ) -> float:
@@ -2258,7 +2984,13 @@ def calculate_hbond_energy_density_dssp_backbone_only_average(
             residues_for_average = list(weights_raw.keys())
         else:
             residues_for_average = [k for k in residues_for_density if k in weights_raw]
-    if not list(residues_for_average):
+    elif isinstance(residues_for_average, str):
+        if residues_for_average not in ("all", "no"):
+            raise ValueError(
+                f"residues_for_average must be None, 'all', 'no', or an iterable; "
+                f"got {residues_for_average!r}"
+            )
+    elif not list(residues_for_average):
         return float("nan")
 
     return average_over_residues(
@@ -2340,7 +3072,7 @@ def calculate_hbond_energy_dssp_backbone_only_unweighted_average(
         numer_keys = denom_set
     else:
         numer_keys = set(residues_for_density) & denom_set
-    total = sum(energy_by_res.get(k, 0.0) for k in numer_keys)
+    total = sum(energy_by_res.get(k, 0.0) for k in numer_keys) # WRONG FORMULA REDO
     return total / float(len(denom_set))
 
 
