@@ -1722,11 +1722,11 @@ def compute_residue_DBSCAN_cluster_labels(
 
     neg_labels = run_dbscan(neg_keys, neg_coords, "negative")
     pos_labels = run_dbscan(pos_keys, pos_coords, "positive")
-    aromatic_labels = run_dbscan(aromatic_keys, aromatic_coords, "aromatic")
+    # aromatic_labels = run_dbscan(aromatic_keys, aromatic_coords, "aromatic")
     hydro_labels = run_dbscan(hydro_keys, hydro_coords, "hydrophobic")
-    polar_labels = run_dbscan(polar_keys, polar_coords, "polar")
+    # polar_labels = run_dbscan(polar_keys, polar_coords, "polar")
     
-    return neg_labels, pos_labels, aromatic_labels, hydro_labels, polar_labels
+    return neg_labels, pos_labels, hydro_labels
 
 
 def _dbscan_cluster_member_counts_and_side_abs_sums(
@@ -2085,9 +2085,9 @@ def _empty_pcf_cluster_scores(
         for r, w in zip(bin_starts, bin_widths)
     ]
     out: Dict[str, Optional[float]] = {}
-    for cat in ("negative", "positive", "hydrophobic"):
+    for cat in ("neg", "pos", "hyd"):
         for tag in tags:
-            out[f"pcf_cluster_score_{cat}_{tag}"] = None
+            out[f"pcf_{cat}_{tag}"] = None
     return out
 
 
@@ -2199,9 +2199,9 @@ def compute_exposed_pair_correlation_cluster_scores(
     ]
 
     for cat, coords_list in (
-        ("negative", neg),
-        ("positive", pos),
-        ("hydrophobic", hydro),
+        ("neg", neg),
+        ("pos", pos),
+        ("hyd", hydro),
         # ("polar", polar),
     ):
         per_shell = pair_correlation_clustering_score_random_surface_null_by_bin(
@@ -2214,7 +2214,7 @@ def compute_exposed_pair_correlation_cluster_scores(
             rng,
         )
         for tag, val in zip(shell_tags, per_shell):
-            result[f"pcf_cluster_score_{cat}_{tag}"] = val
+            result[f"pcf_{cat}_{tag}"] = val
 
     return result
 
