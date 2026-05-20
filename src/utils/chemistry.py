@@ -23,7 +23,6 @@ NET_CHARGE_EXPOSURE_REL_ASA_THRESHOLD: float = 0.05
 DBSCAN_EPS_MIN_SAMPLES_BY_CATEGORY_DEFAULT: Dict[str, Tuple[float, int]] = {
     "negative": (10.0, 2),
     "positive": (10.0, 2),
-    "polar": (10.0, 2),
     "hydrophobic": (5.0, 3),
     "aromatic": (7.0, 3),
 }
@@ -170,9 +169,6 @@ POSITIVE_CHARGED_RESIDUES = frozenset({res for _atom, res in POSITIVE_ATOMS})
 CHARGE_FRACTION_NEGATIVE_RESIDUES = frozenset({"ASP", "GLU"})
 CHARGE_FRACTION_POSITIVE_RESIDUES = frozenset({"LYS", "ARG"})
 
-POLAR_RESIDUES = frozenset(
-    {"SER", "THR", "ASN", "GLN", "TYR", "GLU", "ASP", "LYS", "ARG", "HIS", "CYS"}
-)
 AROMATIC_RESIDUES = frozenset({"PHE", "TYR", "TRP"})
 HYDROPHOBIC_RESIDUES = frozenset(
     {"ALA", "VAL", "LEU", "ILE", "MET", "PHE", "TRP", "PRO"}
