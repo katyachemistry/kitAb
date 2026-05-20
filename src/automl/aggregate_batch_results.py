@@ -1000,7 +1000,7 @@ def main() -> None:
         sp_list, pe_list, r2_list, sd_list = _fold_eval_lists(fm)
         # Spearman / Pearson / R2: require ALL expected folds to have a finite value.
         # Rows where any fold failed (error, constant predictions, …) get None so they
-        # are excluded from best-metric selection in best_metrics_from_aggregated.py.
+        # are excluded from best-metric selection in analysis/analyze_results.py.
         sp_mean = _strict_mean(sp_list, n_expected)
         pe_mean = _strict_mean(pe_list, n_expected)
         r2_mean = _strict_mean(r2_list, n_expected)

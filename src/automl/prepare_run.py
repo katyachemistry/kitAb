@@ -11,7 +11,7 @@ restricted by ``--developability-feature-groups``). Experimental columns are cho
 the experimental table (``--feature-cols``). Only those columns are inner-merged on ID,
 so the join is never a full Cartesian column explosion. Optional ``--feature-cols`` are
 **in addition to** developability features. Group flags follow JSON top-level namespaces
-from ``run_developability`` (``surface``, ``core``, ``general``, ``sequence_motives``).
+from ``calculate_descriptors`` (``surface``, ``core``, ``general``, ``sequence_motives``).
 Omit group flags to use all developability columns. Ignored for Propermab ``.csv``
 (with a warning).
 
@@ -37,7 +37,7 @@ Optional ``--jobs-file`` appends one tab-separated line per fold:
 For disposable fold parquets, use a temp directory under the repository root (e.g.
 ``<repo>/tmp/...``); ``src/prepare_then_parallel.sh`` defaults to ``mktemp`` there.
 
-``src`` is prepended to ``sys.path`` like ``run_developability.py``.
+``src`` is prepended to ``sys.path`` like ``calculate_descriptors.py``.
 """
 
 from __future__ import annotations
@@ -383,7 +383,7 @@ def _validate_experimental_column_roles(
             )
 
 
-# Top-level object keys in run_developability aggregated JSON (after flatten, columns are
+# Top-level object keys in calculate_descriptors aggregated JSON (after flatten, columns are
 # ``{group}_{...}`` with this separator).
 _KNOWN_DEVELOPABILITY_JSON_GROUPS = frozenset(
     {"surface", "core", "general", "sequence_motives"}

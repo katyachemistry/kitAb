@@ -1,7 +1,6 @@
 from typing import Dict, Iterable, List, Optional, Set, Tuple, Any, Union
 import os
 import math
-import weakref
 from collections import defaultdict
 import numpy as np
 from scipy.spatial import cKDTree
@@ -94,7 +93,7 @@ _RESIDUE_LOCAL_PLANARITY_CACHE: Dict[
     Tuple[int, ResKey4, float, int, bool],
     Optional[float],
 ] = {}
-_PLANARITY_ATOMS_REFS: Dict[int, "weakref.ref"] = {}
+_PLANARITY_ATOMS_REFS: Dict[int, int] = {}
 _PDB_SEQUENCE_CACHE: Dict[str, Dict[str, List[str]]] = {}
 
 _IONIZABLE_ATOM_NAMES_BY_RES: Dict[str, Set[str]] = {}
@@ -174,18 +173,16 @@ def pi_from_pka(
 
 def compute_dipole_moment_magnitude(
     pdb_atoms: List[Atom],
-    pka_output_data: Dict[ResKey4, float],
-    pH: float = 7.5,
     *,
     debug_charge_stats: Optional[Dict[str, int]] = None,
 ) -> Optional[float]:
     """
     Dipole moment magnitude ‖μ‖ in e·Å.
 
-    Uses Amber ff19SB atom partial charges from amino19.lib. Missing (residue, atom) pairs
-    use charge 0.0.
+    Uses Amber ff19SB atom partial charges from amino19.lib; pH and pKa data are
+    not used. Missing (residue, atom) pairs use charge 0.0.
+    Reference point: geometric centroid of all atoms (uniform weight).
     """
-    _ = (pka_output_data, pH)  # unused
 
     if not pdb_atoms:
         return 0.0
@@ -320,7 +317,7 @@ def residue_neighbor_score(
         sasa_arr[i] = float(getattr(entry, "total_side_rel", 0.0) or 0.0)
         if needs_charge:
             pka = pka_data.get(key4) if pka_data else None
-            charge_arr[i] = _residue_fractional_charge_at_pH(key4[0], pka, pH)
+            charge_arr[i] = _residue_fractional_charge_at_pH(key4[0], pka, pH, use_fallback=not bool(pka_data))
 
     exposed_arr: np.ndarray = sasa_arr > sasa_cutoff
 
@@ -530,7 +527,7 @@ def compute_sap_shell_synergy_scores(
         sasa_arr[i] = float(getattr(entry, "total_side_rel", 0.0) or 0.0)
         aa = (key4[0] or "").strip().upper()
         pka = pka_lookup.get(key4)
-        charge_arr[i] = _residue_fractional_charge_at_pH(aa, pka, pH)
+        charge_arr[i] = _residue_fractional_charge_at_pH(aa, pka, pH, use_fallback=not bool(pka_lookup))
         aro_arr[i] = 1.0 if aa in AROMATIC_RESIDUES else 0.0
         his_arr[i] = 1.0 if aa == "HIS" else 0.0
 
@@ -908,7 +905,7 @@ def compute_residue_DBSCAN_cluster_labels(
 
     for key, xyz in ca_by_res.items():
         res_name = key[0]
-        group = _residue_category_group(res_name, pka_data.get(key), pH)
+        group = _residue_category_group(res_name, pka_data.get(key), pH, use_fallback_pka=not bool(pka_data))
         if group == "negative":
             neg_keys.append(key)
             neg_coords.append(xyz)
@@ -1081,7 +1078,7 @@ def compute_exposed_pair_correlation_cluster_scores(
         xyz = ca_by_res[key]
         res_name = key[0]
         pka_val = get_pka_for_key(key, pka_output_data)
-        group = _residue_category_group_surface_pcf(res_name, pka_val, pH)
+        group = _residue_category_group_surface_pcf(res_name, pka_val, pH, use_fallback_pka=not bool(pka_output_data))
         if group == "negative":
             neg.append(xyz)
         elif group == "positive":
@@ -1170,11 +1167,11 @@ def residue_mean_local_planarity(
         return None
     atoms_id = id(atoms)
     existing_ref = _PLANARITY_ATOMS_REFS.get(atoms_id)
-    if existing_ref is None or existing_ref() is not atoms:
+    if existing_ref is None or existing_ref != atoms_id:
         stale = [k for k in _RESIDUE_LOCAL_PLANARITY_CACHE if k[0] == atoms_id]
         for k in stale:
             del _RESIDUE_LOCAL_PLANARITY_CACHE[k]
-        _PLANARITY_ATOMS_REFS[atoms_id] = weakref.ref(atoms)
+        _PLANARITY_ATOMS_REFS[atoms_id] = atoms_id
     cache_key = (
         atoms_id,
         residue_key,

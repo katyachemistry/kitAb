@@ -19,7 +19,6 @@ from developability.descriptors import (
     calculate_salt_bridge_density_average,
     detect_salt_bridges,
     calculate_residue_category_density_average,
-    compute_residue_side_abs_density_raw,
     compute_hbond_density_raw,
     net_charge_from_pka,
     pi_from_pka,
@@ -43,8 +42,6 @@ from developability.descriptors import (
 )
 from utils.chemistry import (
     AROMATIC_RESIDUES,
-    CHARGE_FRACTION_NEGATIVE_RESIDUES,
-    CHARGE_FRACTION_POSITIVE_RESIDUES,
     EXPOSURE_REL_ASA_THRESHOLD,
     GLN_ASN_RESIDUES,
     HYDROPHOBIC_RESIDUES,
@@ -58,6 +55,7 @@ from developability.descriptor_utils import (
     get_exposed_residues,
     get_aromatic_residue_keys,
     get_residue_keys_by_type,
+    _get_charged_residues_at_pH,
     residue_side_sasa,
 )
 from developability.descriptors import (
@@ -237,6 +235,13 @@ def main():
             exposed_flags = get_exposed_residues(ctx.sasa_residue, EXPOSURE_REL_ASA_THRESHOLD)
             exposed_keys = {key for key, is_exposed in exposed_flags.items() if is_exposed}
 
+        # pH-aware positive/negative residue sets (replaces static CHARGE_FRACTION_* sets).
+        # Covers HIS, TYR, CYS in addition to ARG/LYS and ASP/GLU when their
+        # PropKa-derived fractional charge is non-zero at args.pH.
+        positive_charged_keys, negative_charged_keys = _get_charged_residues_at_pH(
+            pdb_atoms, pka_output_data, args.pH
+        )
+
         n_cdr = len(cdr_keys)
         cdr3_start, cdr3_end = CDR_RANGES_CA[2]
         cdr3_length = sum(
@@ -248,8 +253,8 @@ def main():
             n_gly_cdr = sum(1 for k in cdr_keys if k[0] == "GLY")
             n_pro_cdr = sum(1 for k in cdr_keys if k[0] == "PRO")
             n_aromatic_cdr = sum(1 for k in cdr_keys if k[0] in AROMATIC_RESIDUES)
-            n_positive_cdr = sum(1 for k in cdr_keys if k[0] in {"ARG", "LYS"})
-            n_negative_cdr = sum(1 for k in cdr_keys if k[0] in {"ASP", "GLU"})
+            n_positive_cdr = sum(1 for k in cdr_keys if k in positive_charged_keys)
+            n_negative_cdr = sum(1 for k in cdr_keys if k in negative_charged_keys)
             n_gln_asn_cdr = sum(1 for k in cdr_keys if k[0] in GLN_ASN_RESIDUES)
             inv_cdr = 1.0 / float(n_cdr)
             fraction_gly_in_cdr = n_gly_cdr * inv_cdr
@@ -301,12 +306,8 @@ def main():
         hydrophobic_keys = get_residue_keys_by_type(
             args.pdb_file, HYDROPHOBIC_RESIDUES
         )
-        negative_keys = get_residue_keys_by_type(
-            args.pdb_file, CHARGE_FRACTION_NEGATIVE_RESIDUES
-        )
-        positive_keys = get_residue_keys_by_type(
-            args.pdb_file, CHARGE_FRACTION_POSITIVE_RESIDUES
-        )
+        negative_keys = negative_charged_keys
+        positive_keys = positive_charged_keys
         aromatic_keys = get_aromatic_residue_keys(args.pdb_file)
 
         salt_bridges = detect_salt_bridges(
@@ -376,12 +377,6 @@ def main():
             normalized_local_planarity_aromatic_cdr_vicinity = 0.0
             normalized_local_planarity_hydrophobic_cdr_vicinity = 0.0
 
-        density_side_abs_raw: Optional[Dict[ResKey4, float]] = None
-        if not sasa_failed:
-            density_side_abs_raw = compute_residue_side_abs_density_raw(
-                args.pdb_file, args.sasa_file
-            )
-
         sum_aromatic_weighted_rel_side_asa_cdr_vicinity = (
             calculate_residue_category_density_average(
                 args.pdb_file,
@@ -422,41 +417,6 @@ def main():
                 residues_for_average="no",
             )
             if positive_cdr_vicinity_keys
-            else 0.0
-        )
-
-        # Sum of absolute side-chain SASA (Å²) over category ∩ CDR vicinity (no division).
-        sum_aromatic_side_abs_sasa_cdr_vicinity = (
-            calculate_residue_category_density_average(
-                args.pdb_file,
-                args.sasa_file,
-                residue_category=aromatic_cdr_vicinity_keys,
-                residues_for_average="no",
-                density_raw=density_side_abs_raw,
-            )
-            if (density_side_abs_raw and aromatic_cdr_vicinity_keys)
-            else 0.0
-        )
-        sum_negative_side_abs_sasa_cdr_vicinity = (
-            calculate_residue_category_density_average(
-                args.pdb_file,
-                args.sasa_file,
-                residue_category=negative_cdr_vicinity_keys,
-                residues_for_average="no",
-                density_raw=density_side_abs_raw,
-            )
-            if (density_side_abs_raw and negative_cdr_vicinity_keys)
-            else 0.0
-        )
-        sum_positive_side_abs_sasa_cdr_vicinity = (
-            calculate_residue_category_density_average(
-                args.pdb_file,
-                args.sasa_file,
-                residue_category=positive_cdr_vicinity_keys,
-                residues_for_average="no",
-                density_raw=density_side_abs_raw,
-            )
-            if (density_side_abs_raw and positive_cdr_vicinity_keys)
             else 0.0
         )
 
@@ -524,7 +484,7 @@ def main():
         )
 
         inter_chain_buried_sasa = compute_inter_chain_buried_sasa(args.sasa_file)
-        dipole_moment_magnitude = compute_dipole_moment_magnitude(pdb_atoms, pka_output_data, args.pH)
+        dipole_moment_magnitude = compute_dipole_moment_magnitude(pdb_atoms)
 
         net_charge_by_pH = {}
         protein_pi = pi_from_pka(pka_output_data)
@@ -554,6 +514,10 @@ def main():
             )
             return float(backbone_q + sidechain_q)
 
+        # FF19SB partial charges assume canonical protonation states as encoded in the
+        # PDB (HID/HIE = neutral HIS, HIP = charged). If the input PDB represents HIS
+        # as neutral (most folding tools default to HID/HIE), this value will differ
+        # from net_charge_by_pH[7.5] for structures with histidines.
         net_charge_ff19sb = sum(_ff19sb_total_charge_for_residue(k) for k in residue_keys_all)
 
         hyd_asa_total = sum(
@@ -565,28 +529,46 @@ def main():
             for entry in _sasa.values()
         )
 
-        def _category_side_abs_sum(residue_keys: Set[ResKey4], res_set) -> float:
+        def _name_side_abs_sum(residue_keys: Set[ResKey4], res_set: Set[str]) -> float:
+            """Sum absolute side-chain SASA for residues whose name is in res_set."""
             return sum(
                 float(getattr(_sasa[k], "total_side_abs", 0.0)) or 0.0
                 for k in residue_keys
                 if k in _sasa and k[0] in res_set
             )
 
-        _cat = [
-            ("aro", AROMATIC_RESIDUES),
-            ("neg", CHARGE_FRACTION_NEGATIVE_RESIDUES),
-            ("pos", CHARGE_FRACTION_POSITIVE_RESIDUES),
-            ("hyd", HYDROPHOBIC_RESIDUES),
-        ]
+        def _key_side_abs_sum(residue_keys: Set[ResKey4], key_set: Set[ResKey4]) -> float:
+            """Sum absolute side-chain SASA for residues whose key is in key_set."""
+            return sum(
+                float(getattr(_sasa[k], "total_side_abs", 0.0)) or 0.0
+                for k in residue_keys
+                if k in _sasa and k in key_set
+            )
+
+        def _side_abs_sum(residue_keys: Set[ResKey4]) -> float:
+            """Sum absolute side-chain SASA for an already-filtered key set."""
+            return sum(
+                float(getattr(_sasa[k], "total_side_abs", 0.0)) or 0.0
+                for k in residue_keys
+                if k in _sasa
+            )
+
         all_sasa_keys: Set[ResKey4] = set(_sasa.keys())
-        total_side_abs_sums: Dict[str, float] = {}
-        for name, res_set in _cat:
-            total_side_abs_sums[f"{name}_exposed_sasa"] = _category_side_abs_sum(
-                exposed_keys, res_set
-            )
-            total_side_abs_sums[f"{name}_all_sasa"] = _category_side_abs_sum(
-                all_sasa_keys, res_set
-            )
+        total_side_abs_sums: Dict[str, float] = {
+            # whole-antibody scope
+            "aro_exposed_sasa": _name_side_abs_sum(exposed_keys, AROMATIC_RESIDUES),
+            "aro_all_sasa":     _name_side_abs_sum(all_sasa_keys, AROMATIC_RESIDUES),
+            "neg_exposed_sasa": _key_side_abs_sum(exposed_keys, negative_charged_keys),
+            "neg_all_sasa":     _key_side_abs_sum(all_sasa_keys, negative_charged_keys),
+            "pos_exposed_sasa": _key_side_abs_sum(exposed_keys, positive_charged_keys),
+            "pos_all_sasa":     _key_side_abs_sum(all_sasa_keys, positive_charged_keys),
+            "hyd_exposed_sasa": _name_side_abs_sum(exposed_keys, HYDROPHOBIC_RESIDUES),
+            "hyd_all_sasa":     _name_side_abs_sum(all_sasa_keys, HYDROPHOBIC_RESIDUES),
+            # CDR vicinity scope (exposed ∩ CDR vicinity ∩ category — keys pre-filtered)
+            "aro_sasa_cdr":     _side_abs_sum(aromatic_cdr_vicinity_keys),
+            "neg_sasa_cdr":     _side_abs_sum(negative_cdr_vicinity_keys),
+            "pos_sasa_cdr":     _side_abs_sum(positive_cdr_vicinity_keys),
+        }
 
         sap_scores = compute_sap_shell_synergy_scores(
             pdb_atoms,
@@ -610,31 +592,28 @@ def main():
                     **_pcf_cluster_per_shell_and_mean_per_category(pcf_cluster),
                     "neg_cluster_entropy": neg_cluster_side_abs_sasa_entropy,
                     "pos_cluster_entropy": pos_cluster_side_abs_sasa_entropy,
-                    "hbond_density_cdr": avg_hbond_cdr_vicinity,
-                    "aro_exposure_cdr": sum_aromatic_weighted_rel_side_asa_cdr_vicinity,
-                    "hyd_exposure_cdr": sum_hydrophobic_weighted_rel_side_asa_cdr_vicinity,
-                    "neg_exposure_cdr": sum_negative_weighted_rel_side_asa_cdr_vicinity,
-                    "pos_exposure_cdr": sum_positive_weighted_rel_side_asa_cdr_vicinity,
-                    "aro_sasa_cdr": sum_aromatic_side_abs_sasa_cdr_vicinity,
-                    "neg_sasa_cdr": sum_negative_side_abs_sasa_cdr_vicinity,
-                    "pos_sasa_cdr": sum_positive_side_abs_sasa_cdr_vicinity,
                     "neg_planarity_cdr": normalized_local_planarity_negative_cdr_vicinity,
                     "pos_planarity_cdr": normalized_local_planarity_positive_cdr_vicinity,
                     "aro_planarity_cdr": normalized_local_planarity_aromatic_cdr_vicinity,
                     "hyd_planarity_cdr": normalized_local_planarity_hydrophobic_cdr_vicinity,
+                    "pos_patch": pos_patch_area,
+                    "neg_patch": neg_patch_area,
+                    "hyd_patch": hyd_patch_area,
+                    "pos_patch_cdr": pos_patch_area_cdr,
+                    "neg_patch_cdr": neg_patch_area_cdr,
+                    "hyd_patch_cdr": hyd_patch_area_cdr,
+                    **total_side_abs_sums,
+                    "aro_exposure_cdr": sum_aromatic_weighted_rel_side_asa_cdr_vicinity,
+                    "hyd_exposure_cdr": sum_hydrophobic_weighted_rel_side_asa_cdr_vicinity,
+                    "neg_exposure_cdr": sum_negative_weighted_rel_side_asa_cdr_vicinity,
+                    "pos_exposure_cdr": sum_positive_weighted_rel_side_asa_cdr_vicinity,
                     "exposure_weighted_hyd_score_cdr": avg_kd_times_total_side_rel_cdr_vicinity_over_cdr_vicinity,
                     "exposure_weighted_salt_bridge_score_cdr": avg_salt_cdr_vicinity_over_cdr_vicinity,
+                    "hbond_density_cdr": avg_hbond_cdr_vicinity,
                     "weighted_scm": weighted_scm_score_by_pH,
                     "scm_neg_ff19sb": scm_neg_ff19sb,
                     "scm_pos_ff19sb": scm_pos_ff19sb,
                     **{k: _scalar_or_dict_sum(v) for k, v in sap_scores.items()},
-                    "pos_patch_area": pos_patch_area,
-                    "neg_patch_area": neg_patch_area,
-                    "hyd_patch_area": hyd_patch_area,
-                    "pos_patch_area_cdr": pos_patch_area_cdr,
-                    "neg_patch_area_cdr": neg_patch_area_cdr,
-                    "hyd_patch_area_cdr": hyd_patch_area_cdr,
-                    **total_side_abs_sums,
                 },
                 "core": {
                     "hbond_energy_density": avg_hbond_energy_dssp_weighted,
@@ -643,20 +622,20 @@ def main():
                 "general": {
                     "dipole_moment_ff19sb": dipole_moment_magnitude,
                     "net_charge_ff19sb": net_charge_ff19sb,
-                    "protein_pi": protein_pi,
                     "net_charge_by_pH": net_charge_by_pH,
-                    "asymmetry_score": asymmetry_score,
-                    "hyd_asa_total": hyd_asa_total,
-                    "hph_asa_total": hph_asa_total,
+                    "protein_pi": protein_pi,
                     "cdr3_length": cdr3_length,
+                    "charge_symmetry": asymmetry_score,
+                    "hyd_score": kyte_doolittle_sum_all,
+                    "number_of_salt_bridges": number_of_salt_bridges,
+                    "hyd_asa_total": hyd_asa_total,
+                    "polar_asa_total": hph_asa_total,
                     "fraction_gly_in_cdr": fraction_gly_in_cdr,
                     "fraction_pro_in_cdr": fraction_pro_in_cdr,
                     "fraction_aro_in_cdr": fraction_aromatic_in_cdr,
                     "fraction_pos_in_cdr": fraction_positive_in_cdr,
                     "fraction_neg_in_cdr": fraction_negative_in_cdr,
                     "fraction_gln_asn_in_cdr": fraction_gln_asn_in_cdr,
-                    "number_of_salt_bridges": number_of_salt_bridges,
-                    "hyd_score": kyte_doolittle_sum_all,
                 },
             }
         )
@@ -765,7 +744,7 @@ def main():
                         return float(total)
 
                     for motif, key in [("DD", "AspAsp"), ("DE", "AspGlu")]:
-                        sequence_motives[f"sum_sasa_{key}"] = _motif_side_asa_sum(motif)
+                        sequence_motives[f"{key}_all_sasa"] = _motif_side_asa_sum(motif)
 
         def _sanitize_for_json(obj: Any) -> Any:
             if isinstance(obj, dict):

@@ -1,1 +1,1 @@
-# Developability descriptors and CLI (run_developability.py).
+# Developability descriptors and CLI (calculate_descriptors.py).

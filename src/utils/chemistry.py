@@ -10,11 +10,11 @@ if TYPE_CHECKING:
 
 # Relative side-chain SASA threshold (fraction in [0, 1]) above which a residue
 # is considered surface-exposed for clustering, SASA-weighted descriptors, etc.
-# Net-charge-on-surface metrics in ``run_developability`` use
+# Net-charge-on-surface metrics in ``calculate_descriptors`` use
 # ``NET_CHARGE_EXPOSURE_REL_ASA_THRESHOLD`` instead.
 EXPOSURE_REL_ASA_THRESHOLD: float = 0.20
 
-# Rel side-chain SASA cutoff for net-charge-on-surface metrics only (run_developability:
+# Rel side-chain SASA cutoff for net-charge-on-surface metrics only (calculate_descriptors:
 # exposed_net_charge*, exposed_net_charge_*_simple).  Looser than
 # ``EXPOSURE_REL_ASA_THRESHOLD`` so more ionizable side chains count as exposed.
 NET_CHARGE_EXPOSURE_REL_ASA_THRESHOLD: float = 0.05
@@ -171,7 +171,7 @@ CHARGE_FRACTION_POSITIVE_RESIDUES = frozenset({"LYS", "ARG"})
 
 AROMATIC_RESIDUES = frozenset({"PHE", "TYR", "TRP"})
 HYDROPHOBIC_RESIDUES = frozenset(
-    {"ALA", "VAL", "LEU", "ILE", "MET", "PHE", "TRP", "PRO"}
+    {"ALA", "VAL", "LEU", "ILE", "MET", "PHE", "TRP", "PRO", "CYS"}
 )
 
 MAX_HBOND_DISTANCE = 3.2

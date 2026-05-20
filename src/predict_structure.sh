@@ -33,7 +33,7 @@
 #   ./run_structure_prediction.sh --abb3 --runs 5
 #   ./run_structure_prediction.sh --abb2 --runs 5
 # Or several CSVs explicitly (ABB3 example):
-#   python3 run_abb3_batch_from_csv.py --csv data/a.csv --csv data/b.csv --output-root structures
+#   python3 structure/run_abb3_batch_from_csv.py --csv data/a.csv --csv data/b.csv --output-root structures
 
 set -euo pipefail
 
@@ -163,6 +163,7 @@ if [[ "$MINIMIZATION_ONLY" -eq 1 && ${#MINIMIZE_INPUT_DIRS[@]} -eq 0 ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STRUCTURE_DIR="$SCRIPT_DIR/structure"
 
 # ---------------------------------------------------------------------------
 # Helper: minimize one folder -> sibling folder with _minimized suffix
@@ -191,7 +192,7 @@ run_minimization() {
         skip_args=(--skip-existing)
     fi
 
-    $ABB2_PYTHON "$SCRIPT_DIR/minimize_structures_batch.py" \
+    $ABB2_PYTHON "$STRUCTURE_DIR/minimize_structures_batch.py" \
         --input-dir  "$input_dir" \
         --output-dir "$output_dir" \
         --jobs       "$MINIMIZE_JOBS" \
@@ -259,7 +260,7 @@ if [[ "$BACKEND" == "abb3" ]]; then
         exit 1
     fi
 
-    "$PYTHON" "$SCRIPT_DIR/run_abb3_batch_from_csv.py" \
+    "$PYTHON" "$STRUCTURE_DIR/run_abb3_batch_from_csv.py" \
         --data-dir "$DATA_DIR" \
         --output-root "$OUT_DIR" \
         --runs "$RUNS" \
@@ -297,13 +298,13 @@ if [[ "$BACKEND" == "abb3" ]]; then
                     if [[ "$MINIMIZE" -eq 1 ]]; then
                         # Another step follows; renumber into a second temp dir.
                         imgt_tmp="${final_dir}_tmp_${$}_imgt"
-                        $ABB2_PYTHON "$SCRIPT_DIR/src/utils/renumber_abb3_imgt.py" \
+                        $ABB2_PYTHON "$STRUCTURE_DIR/renumber_abb3_imgt.py" \
                             "$current" --out-dir "$imgt_tmp"
                         rm -rf "$current"
                         current="$imgt_tmp"
                     else
                         # Last step; write directly to final_dir.
-                        $ABB2_PYTHON "$SCRIPT_DIR/src/utils/renumber_abb3_imgt.py" \
+                        $ABB2_PYTHON "$STRUCTURE_DIR/renumber_abb3_imgt.py" \
                             "$current" --out-dir "$final_dir"
                         rm -rf "$current"
                         current=""
@@ -313,7 +314,7 @@ if [[ "$BACKEND" == "abb3" ]]; then
                 if [[ "$MINIMIZE" -eq 1 ]]; then
                     echo ""
                     echo "--- Minimizing: ${stem}_abb3_${run} ---"
-                    $ABB2_PYTHON "$SCRIPT_DIR/minimize_structures_batch.py" \
+                    $ABB2_PYTHON "$STRUCTURE_DIR/minimize_structures_batch.py" \
                         --input-dir  "$current" \
                         --output-dir "$final_dir" \
                         --jobs       "$MINIMIZE_JOBS" \
@@ -326,7 +327,7 @@ if [[ "$BACKEND" == "abb3" ]]; then
 
 else
     export ABB2_DEVICE="$ABB2_DEVICE"
-    "$PYTHON" "$SCRIPT_DIR/run_abb2_batch_from_csv.py" \
+    "$PYTHON" "$STRUCTURE_DIR/run_abb2_batch_from_csv.py" \
         --data-dir "$DATA_DIR" \
         --output-root "$OUT_DIR" \
         --runs "$RUNS" \

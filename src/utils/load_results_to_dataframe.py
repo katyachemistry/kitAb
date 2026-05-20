@@ -16,7 +16,7 @@ Usage (from repo root):
 Example (for use with notebook):
   python src/utils/load_results_to_dataframe.py pdgf38_results --base pdgf38 --order-csv data/pdgf38.csv --out data/pdgf38_descriptors.csv
   # Then in notebook: results_df = pd.read_csv("data/pdgf38_descriptors.csv")
-  # Or: from src.utils.load_results_to_dataframe import load_json_results
+  # Or: from utils.load_results_to_dataframe import load_json_results
 """
 
 from __future__ import annotations

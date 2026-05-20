@@ -1,6 +1,5 @@
 import math
 import os
-import weakref
 from collections import defaultdict
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 import logging
@@ -131,7 +130,7 @@ _CONVEX_HULL_CA_VOLUME_CACHE: Dict[str, float] = {}
 
 _HEAVY_ATOM_TREE_CACHE: Dict[
     int,
-    Tuple["weakref.ref", "cKDTree", np.ndarray, List[ResKey4], Dict[ResKey4, List[int]]],
+    Tuple[int, "cKDTree", np.ndarray, List[ResKey4], Dict[ResKey4, List[int]]],
 ] = {}
 
 _CDR_VICINITY_RESIDUE_KEYS_CACHE: Dict[
@@ -147,19 +146,27 @@ def _residue_fractional_charge_at_pH(
     residue_name: str,
     pka_value: Optional[float],
     pH: float,
+    use_fallback: bool = True,
 ) -> float:
     """Fractional charge at pH via Henderson-Hasselbalch. Returns 0.0 for non-titratable residues.
 
-    When ``pka_value`` is ``None``, the standard solution pKa is used as a fallback via
-    ``get_standard_residue_pka``.  This can produce a small but non-zero charge for CYS
-    (standard pKa ~8.3) and TYR (standard pKa ~10.0) at physiological pH — e.g. CYS
-    carries ~−0.09 at pH 7.4.  In structural contexts these residues are almost always
-    protonated, so the effect is typically negligible; however, if a residue-level
-    propKa value is available it should always be passed as ``pka_value`` to override
-    the fallback and avoid this mis-classification.
+    When ``pka_value`` is ``None`` and ``use_fallback`` is True (default), the standard
+    solution pKa is used as a fallback via ``get_standard_residue_pka``.  This is
+    appropriate when no PropKa file is available.
+
+    Set ``use_fallback=False`` when PropKa data *is* available for the structure: a
+    missing pKa entry then means PropKa deliberately skipped the residue (e.g. a
+    disulfide-bonded CYS), and returning 0.0 is the correct behaviour.  With
+    ``use_fallback=True``, a disulfide CYS absent from PropKa data would fall back to
+    pKa 8.37 and carry q ≈ −0.12 at pH 7.5, wrongly classifying it as negative.
     """
     res_name = (residue_name or "").strip().upper()
-    effective_pka = pka_value if pka_value is not None else get_standard_residue_pka(res_name)
+    if pka_value is not None:
+        effective_pka: Optional[float] = pka_value
+    elif use_fallback:
+        effective_pka = get_standard_residue_pka(res_name)
+    else:
+        effective_pka = None
     cache_key = (res_name, effective_pka, float(pH))
     cached = _CHARGE_CACHE.get(cache_key)
     if cached is not None:
@@ -180,12 +187,27 @@ def _residue_fractional_charge_at_pH(
 def get_aromatic_residue_keys(pdb_path: str) -> Set[ResKey4]:
     return get_residue_keys_by_type(pdb_path, AROMATIC_RESIDUES)
 
+MIN_ABS_CHARGE_THRESHOLD: float = 0.05
+"""Minimum |q| for a residue to be considered charged.
+
+Prevents residues like Tyr (pKa ~10.46, q ≈ −0.001 at pH 7.5) from being
+incorrectly classified as negative due to floating-point non-zero charge.
+At pH 7.5 this threshold keeps: ASP/GLU/LYS/ARG (|q| ≈ 1), HIS (|q| ≈ 0.24),
+CYS (|q| ≈ 0.12); and excludes: TYR (|q| ≈ 0.001), CYS above pH ~8+ only.
+"""
+
+
 def _get_charged_residues_at_pH(
     atoms: List[Atom],
     pka_data: Dict[Tuple[str, int, str, str], float],
     pH: float,
+    min_abs_charge: float = MIN_ABS_CHARGE_THRESHOLD,
 ) -> Tuple[Set[Tuple[str, int, str, str]], Set[Tuple[str, int, str, str]]]:
 
+    # Only fall back to standard pKa when no PropKa data is available at all.
+    # If PropKa data exists but a residue (e.g. disulfide CYS) has no entry, it
+    # is uncharged in this structure and should return q = 0.
+    use_fallback = not bool(pka_data)
     positive: Set[Tuple[str, int, str, str]] = set()
     negative: Set[Tuple[str, int, str, str]] = set()
     seen: Set[Tuple[str, int, str, str]] = set()
@@ -194,10 +216,12 @@ def _get_charged_residues_at_pH(
         if res_key in seen:
             continue
         seen.add(res_key)
-        q = _residue_fractional_charge_at_pH(atom.residue_name, pka_data.get(res_key), pH)
-        if q > 0.0:
+        q = _residue_fractional_charge_at_pH(
+            atom.residue_name, pka_data.get(res_key), pH, use_fallback=use_fallback
+        )
+        if q > min_abs_charge:
             positive.add(res_key)
-        elif q < 0.0:
+        elif q < -min_abs_charge:
             negative.add(res_key)
     return positive, negative
 
@@ -250,18 +274,24 @@ def _residue_category_group(
     res_name: str,
     pka_val: Optional[float],
     pH: float,
+    min_abs_charge: float = MIN_ABS_CHARGE_THRESHOLD,
+    use_fallback_pka: bool = True,
 ) -> Optional[str]:
     """
     Classify residue into charge/type group for clustering/Ripley.
     Returns "negative" | "positive" | "aromatic" | "hydrophobic", or None.
-    Titratable residues (ASP, GLU, LYS, ARG, HIS, TYR, CYS) are classified by the
-    sign of their fractional charge at pH; if q==0 they fall through to aromatic/
-    hydrophobic below. Aromatic is checked before hydrophobic.
+    Titratable residues (ASP, GLU, LYS, ARG, HIS, TYR, CYS) are classified by
+    their fractional charge at pH; residues with |q| < min_abs_charge fall through
+    to aromatic/hydrophobic below. Aromatic is checked before hydrophobic.
+
+    Set ``use_fallback_pka=False`` when PropKa data is available so that residues
+    absent from it (e.g. disulfide-bonded CYS) are treated as uncharged rather
+    than getting the standard-solution pKa fallback.
     """
-    q = _residue_fractional_charge_at_pH(res_name, pka_val, pH)
-    if q < 0.0:
+    q = _residue_fractional_charge_at_pH(res_name, pka_val, pH, use_fallback=use_fallback_pka)
+    if q < -min_abs_charge:
         return "negative"
-    if q > 0.0:
+    if q > min_abs_charge:
         return "positive"
     if res_name in AROMATIC_RESIDUES:
         return "aromatic"
@@ -274,16 +304,21 @@ def _residue_category_group_surface_pcf(
     res_name: str,
     pka_val: Optional[float],
     pH: float,
+    min_abs_charge: float = MIN_ABS_CHARGE_THRESHOLD,
+    use_fallback_pka: bool = True,
 ) -> Optional[str]:
     """
     Like :func:`_residue_category_group` but without a separate **aromatic** bucket
     (for exposed pair-correlation clustering). Uncharged Phe/Trp use the hydrophobic
     bucket; other neutral side chains (e.g. Ser, Asn, Tyr) are not classified (None).
+
+    Set ``use_fallback_pka=False`` when PropKa data is available (see
+    :func:`_residue_category_group`).
     """
-    q = _residue_fractional_charge_at_pH(res_name, pka_val, pH)
-    if q < 0.0:
+    q = _residue_fractional_charge_at_pH(res_name, pka_val, pH, use_fallback=use_fallback_pka)
+    if q < -min_abs_charge:
         return "negative"
-    if q > 0.0:
+    if q > min_abs_charge:
         return "positive"
     if res_name in HYDROPHOBIC_RESIDUES:
         return "hydrophobic"
@@ -366,9 +401,9 @@ def get_heavy_atom_tree(
 ) -> Tuple["cKDTree", np.ndarray, List[ResKey4], Dict[ResKey4, List[int]]]:
     """Build (and cache) a KDTree over all heavy atoms of the structure.
 
-    Cache key is ``id(atoms)`` guarded by a ``weakref``. The weakref check
-    detects the (rare) case where a list is garbage-collected and a new list
-    reuses the same memory address, preventing stale cache hits.
+    Cache key is ``id(atoms)``. An identity check against the stored ``id``
+    guards against the rare case where a list is garbage-collected and a new
+    list reuses the same memory address.
 
     Returns
     -------
@@ -384,7 +419,7 @@ def get_heavy_atom_tree(
     """
     cache_key = id(atoms)
     cached = _HEAVY_ATOM_TREE_CACHE.get(cache_key)
-    if cached is not None and cached[0]() is atoms:
+    if cached is not None and cached[0] == id(atoms):
         return cached[1], cached[2], cached[3], cached[4]
 
     coord_list: List[Tuple[float, float, float]] = []
@@ -402,7 +437,7 @@ def get_heavy_atom_tree(
     for i, rk in enumerate(key_list):
         heavy_atoms_by_res.setdefault(rk, []).append(i)
 
-    _HEAVY_ATOM_TREE_CACHE[cache_key] = (weakref.ref(atoms), tree, coords, key_list, heavy_atoms_by_res)
+    _HEAVY_ATOM_TREE_CACHE[cache_key] = (id(atoms), tree, coords, key_list, heavy_atoms_by_res)
     return tree, coords, key_list, heavy_atoms_by_res
 
 

@@ -17,7 +17,6 @@
 #   results/: developability JSON per structure (same as former ${BASE}_results/*.json).
 #
 # Developability-only options (after num_jobs): --pH <value>
-# --force-sasa   Recompute freesasa outputs even if they already exist (default: skip when all 4 outputs present)
 #
 # Examples:
 #   ./run_parallel.sh ./ab21 ./pdgf38 8
@@ -35,17 +34,11 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 EXPLICIT_STRUCTURES=()
 PARENT_DIR_INPUTS=()
 NUM_JOBS=""
-EXTRA_ARGS=()
 PH_VALUE="7.4"
 USER_OUTPUT_DESCRIPTOR_ROOT=""
-FORCE_SASA=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --force-sasa)
-            FORCE_SASA=true
-            shift
-            ;;
         --output-dir)
             if [[ $# -lt 2 ]]; then
                 echo "Usage: $0 [--output-dir DIR] ..." >&2
@@ -66,7 +59,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --pH)
             PH_VALUE="$2"
-            EXTRA_ARGS+=("$1" "$2")
             shift 2
             ;;
         [0-9]*)
@@ -86,12 +78,10 @@ for arg in "${EXPLICIT_STRUCTURES[@]}"; do
         STRUCTURES_DIRS+=("$arg")
         continue
     fi
-    # Relative path without glob: allow repo-root resolution (e.g. run from src/).
     if [[ "$arg" != /* && "$arg" != *[\*\?\[]* && -d "$PROJECT_ROOT/$arg" ]]; then
         STRUCTURES_DIRS+=("$PROJECT_ROOT/$arg")
         continue
     fi
-    # Unmatched shell glob is passed literally; expand with compgen from cwd, then from repo root.
     if [[ "$arg" != *[\*\?\[]* ]]; then
         echo "Error: not a directory: $arg" >&2
         exit 1
@@ -147,7 +137,6 @@ if [[ ${#STRUCTURES_DIRS[@]} -eq 0 ]]; then
     exit 1
 fi
 
-# Deduplicate by resolved path (preserve first-seen order).
 declare -A _seen_structure_dirs=()
 _deduped_structure_dirs=()
 for d in "${STRUCTURES_DIRS[@]}"; do
@@ -167,7 +156,6 @@ unset _seen_structure_dirs
 unset _deduped_structure_dirs
 
 NUM_JOBS=${NUM_JOBS:-$(nproc)}
-# Outputs default next to your shell cwd (not next to each PDB tree); captured before cd to repo root.
 RUN_INVOCATION_DIR="$(pwd -P 2>/dev/null || pwd)"
 if [[ -n "$USER_OUTPUT_DESCRIPTOR_ROOT" ]]; then
     if [[ "$USER_OUTPUT_DESCRIPTOR_ROOT" == /* ]]; then
@@ -183,8 +171,6 @@ fi
 cd "$PROJECT_ROOT"
 export NUM_JOBS SCRIPT_DIR PROJECT_ROOT RUN_INVOCATION_DIR DESCRIPTOR_ROOT
 export PH_VALUE
-export EXTRA_ARGS_STR="${EXTRA_ARGS[*]}"
-export FORCE_SASA
 
 USE_GNU_PARALLEL=false
 command -v parallel &>/dev/null && USE_GNU_PARALLEL=true
@@ -195,7 +181,6 @@ PROPKA_CONDA_ACTIVATE="${PROPKA_CONDA_ACTIVATE:-source /home/kb/miniforge3/bin/a
 RUN_START=$(date +%s)
 TOTAL_STRUCTURES=0
 
-# Fixed pipeline order (developability consumes outputs from the same run).
 PIPELINE_ORDER=(dssp propka freesasa developability)
 
 for STRUCTURES_DIR in "${STRUCTURES_DIRS[@]}"; do
@@ -215,7 +200,6 @@ for STRUCTURES_DIR in "${STRUCTURES_DIRS[@]}"; do
     case "$MODE" in
         dssp)
             OUTPUT_DIR="$DSSP_OUTPUT_DIR"
-            mkdir -p "$OUTPUT_DIR"
             export OUTPUT_DIR
             if [ "$USE_GNU_PARALLEL" = true ]; then
                 process_file() {
@@ -235,7 +219,6 @@ for STRUCTURES_DIR in "${STRUCTURES_DIRS[@]}"; do
                     rm -f "$temp_pdb"
                 }
                 export -f process_file
-                # Only full-structure PDBs (exclude single-chain *_H.pdb, *_L.pdb)
                 find "$STRUCTURES_DIR" -name "*.pdb" -type f ! -name "*_H.pdb" ! -name "*_L.pdb" | parallel -j "$NUM_JOBS" process_file {}
             else
                 export STRUCTURES_DIR
@@ -272,7 +255,6 @@ def process_file(pdb_path):
     except Exception as e:
         return f"✗ {basename} (error: {str(e)[:50]})"
 
-# Only full-structure PDBs (exclude single-chain *_H.pdb, *_L.pdb)
 pdb_files = sorted(p for p in Path(STRUCTURES_DIR).rglob("*.pdb") if not (p.stem.endswith("_H") or p.stem.endswith("_L")))
 with Pool(num_jobs) as pool:
     results = pool.map(process_file, pdb_files)
@@ -288,10 +270,8 @@ DSSP_PY
 
         freesasa)
             SASA_DIR="$SASA_OUTPUT_DIR"
-            mkdir -p "$SASA_DIR"
             export SASA_DIR
             if [ "$USE_GNU_PARALLEL" = true ]; then
-                # Full PDBs only: H/L *_full.sasa for inter_chain_buried_sasa are built inside each job (tmp split), not from *_H.pdb on disk.
                 find "$STRUCTURES_DIR" -name "*.pdb" -type f ! -name "*_H.pdb" ! -name "*_L.pdb" | parallel -j "$NUM_JOBS" '
                     pdbfile={}
                     filename=$(basename "$pdbfile" .pdb)
@@ -300,16 +280,8 @@ DSSP_PY
                     sasa_H="'"$SASA_DIR"'/${filename}_H_full.sasa"
                     sasa_L="'"$SASA_DIR"'/${filename}_L_full.sasa"
 
-                    # If all required outputs already exist, skip work for this PDB
-                    # (unless --force-sasa was passed).
-                    if [ "$FORCE_SASA" != "true" ] && [ -f "$sasa_full" ] && [ -f "$atom_sasa_full" ] && [ -f "$sasa_H" ] && [ -f "$sasa_L" ]; then
-                        exit 0
-                    fi
-
                     tmp_H=$(mktemp)
                     tmp_L=$(mktemp)
-
-                    # Build H-only and L-only PDBs once (preserve non-ATOM/HETATM records)
                     awk '"'"'{
                         if ($1 == "ATOM" || $1 == "HETATM") {
                             chain = substr($0, 22, 1);
@@ -321,34 +293,24 @@ DSSP_PY
                         }
                     }'"'"' "$pdbfile"
 
-                    if [ ! -f "$sasa_full" ]; then
-                        if ! freesasa --shrake-rupley --format=rsa --depth=residue "$pdbfile" > "$sasa_full" 2>/dev/null; then
-                            echo "✗ $filename (full failed)"
-                            rm -f "$sasa_full"
-                        fi
+                    if ! freesasa --shrake-rupley --format=rsa --depth=residue "$pdbfile" > "$sasa_full" 2>/dev/null; then
+                        echo "✗ $filename (full failed)"
+                        rm -f "$sasa_full"
                     fi
 
-                    # Full complex atom-level SASA in compact PDB form:
-                    # keep only what we need later (atom serial -> absolute SASA from B-factor).
-                    # Include hydrogens because the future exposed-atom electrostatic
-                    # patch proxy should account for real proton/terminus atoms too.
-                    if [ ! -f "$atom_sasa_full" ]; then
-                        if ! freesasa --shrake-rupley --format=pdb --depth=atom --hydrogen "$pdbfile" > "$atom_sasa_full" 2>/dev/null; then
-                            echo "✗ $filename (full atom SASA failed)"
-                            rm -f "$atom_sasa_full"
-                        fi
+                    if ! freesasa --shrake-rupley --format=pdb --depth=atom --hydrogen "$pdbfile" > "$atom_sasa_full" 2>/dev/null; then
+                        echo "✗ $filename (full atom SASA failed)"
+                        rm -f "$atom_sasa_full"
                     fi
 
-                    # Heavy-chain-only SASA (if we actually have any H atoms)
-                    if [ ! -f "$sasa_H" ] && grep -q "^ATOM" "$tmp_H"; then
+                    if grep -q "^ATOM" "$tmp_H"; then
                         if ! freesasa --shrake-rupley --format=rsa --depth=residue "$tmp_H" > "$sasa_H" 2>/dev/null; then
                             echo "✗ $filename (H-only failed)"
                             rm -f "$sasa_H"
                         fi
                     fi
 
-                    # Light-chain-only SASA (if we actually have any L atoms)
-                    if [ ! -f "$sasa_L" ] && grep -q "^ATOM" "$tmp_L"; then
+                    if grep -q "^ATOM" "$tmp_L"; then
                         if ! freesasa --shrake-rupley --format=rsa --depth=residue "$tmp_L" > "$sasa_L" 2>/dev/null; then
                             echo "✗ $filename (L-only failed)"
                             rm -f "$sasa_L"
@@ -377,11 +339,6 @@ def process_file(pdb_path):
     sasa_H = Path(SASA_DIR) / f"{basename}_H_full.sasa"
     sasa_L = Path(SASA_DIR) / f"{basename}_L_full.sasa"
 
-    force_sasa = os.environ.get("FORCE_SASA", "false").lower() == "true"
-    if not force_sasa and sasa_full.exists() and atom_sasa_full.exists() and sasa_H.exists() and sasa_L.exists():
-        return None
-
-    # Build temporary H-only and L-only PDBs once
     with open(pdb_file) as src, \
          tempfile.NamedTemporaryFile(mode="w", suffix=".pdb", delete=False) as tmp_H, \
          tempfile.NamedTemporaryFile(mode="w", suffix=".pdb", delete=False) as tmp_L:
@@ -400,38 +357,26 @@ def process_file(pdb_path):
 
     errors = []
 
-    if not sasa_full.exists():
-        r = subprocess.run(
-            ["freesasa", "--shrake-rupley", "--format=rsa", "--depth=residue", str(pdb_file)],
-            capture_output=True, text=True
-        )
-        if r.returncode != 0:
-            errors.append(f"✗ {basename} (full failed)")
-        else:
-            sasa_full.write_text(r.stdout)
+    r = subprocess.run(
+        ["freesasa", "--shrake-rupley", "--format=rsa", "--depth=residue", str(pdb_file)],
+        capture_output=True, text=True
+    )
+    if r.returncode != 0:
+        errors.append(f"✗ {basename} (full failed)")
+    else:
+        sasa_full.write_text(r.stdout)
 
-    # Full complex atom-level SASA in compact PDB form:
-    # keep only what we need later (atom serial -> absolute SASA from B-factor).
-    # Include hydrogens because the future exposed-atom electrostatic
-    # patch proxy should account for real proton/terminus atoms too.
-    if not atom_sasa_full.exists():
-        r = subprocess.run(
-            ["freesasa", "--shrake-rupley", "--format=pdb", "--depth=atom", "--hydrogen", str(pdb_file)],
-            capture_output=True, text=True
-        )
-        if r.returncode != 0:
-            errors.append(f"✗ {basename} (full atom SASA failed)")
-        else:
-            atom_sasa_full.write_text(r.stdout)
+    r = subprocess.run(
+        ["freesasa", "--shrake-rupley", "--format=pdb", "--depth=atom", "--hydrogen", str(pdb_file)],
+        capture_output=True, text=True
+    )
+    if r.returncode != 0:
+        errors.append(f"✗ {basename} (full atom SASA failed)")
+    else:
+        atom_sasa_full.write_text(r.stdout)
 
-    # Heavy-chain-only SASA (only if there are any ATOM records for H)
-    has_H_atoms = False
-    with open(tmp_H_path) as f:
-        for l in f:
-            if l.startswith("ATOM"):
-                has_H_atoms = True
-                break
-    if not sasa_H.exists() and has_H_atoms:
+    has_H_atoms = any(l.startswith("ATOM") for l in tmp_H_path.read_text().splitlines())
+    if has_H_atoms:
         r = subprocess.run(
             ["freesasa", "--shrake-rupley", "--format=rsa", "--depth=residue", str(tmp_H_path)],
             capture_output=True, text=True
@@ -441,14 +386,8 @@ def process_file(pdb_path):
         else:
             sasa_H.write_text(r.stdout)
 
-    # Light-chain-only SASA (only if there are any ATOM records for L)
-    has_L_atoms = False
-    with open(tmp_L_path) as f:
-        for l in f:
-            if l.startswith("ATOM"):
-                has_L_atoms = True
-                break
-    if not sasa_L.exists() and has_L_atoms:
+    has_L_atoms = any(l.startswith("ATOM") for l in tmp_L_path.read_text().splitlines())
+    if has_L_atoms:
         r = subprocess.run(
             ["freesasa", "--shrake-rupley", "--format=rsa", "--depth=residue", str(tmp_L_path)],
             capture_output=True, text=True
@@ -484,7 +423,6 @@ FREESASA_PY
 
         propka)
             OUTPUT_DIR="$PROPKA_OUTPUT_DIR"
-            mkdir -p "$OUTPUT_DIR"
             export OUTPUT_DIR PROPKA_CONDA_ACTIVATE
             if [ "$USE_GNU_PARALLEL" = true ]; then
                 process_file() {
@@ -510,10 +448,9 @@ FREESASA_PY
                     rm -f "${basename}_H_chain.pdb" "${basename}_L_chain.pdb"
                 }
                 export -f process_file
-                # Only full-structure PDBs (exclude single-chain *_H.pdb, *_L.pdb)
                 find "$STRUCTURES_DIR" -name "*.pdb" -type f ! -name "*_H.pdb" ! -name "*_L.pdb" | parallel -j "$NUM_JOBS" process_file {} "$OUTPUT_DIR"
             else
-                export STRUCTURES_DIR NUM_JOBS
+                export STRUCTURES_DIR
                 python3 << 'PROPKA_PY'
 import os
 from pathlib import Path
@@ -531,18 +468,17 @@ def process_file(pdb_path):
     output_dir = Path(OUTPUT_DIR)
     out = []
     try:
-        for label, pdb_in, pka_out, log_out in [
-            ("full", pdb_file, output_dir / f"{basename}_full.pka", output_dir / f"{basename}_full.log"),
-        ]:
-            r = subprocess.run(["bash", "-c", f"{conda_activate} && propka3 '{pdb_in}'"], capture_output=True, text=True, cwd=output_dir)
-            with open(log_out, "w") as f:
-                f.write(r.stdout)
-                f.write(r.stderr)
-            pka = output_dir / f"{basename}.pka"
-            if pka.exists():
-                pka.rename(pka_out)
-            else:
-                out.append(f"✗ {basename} ({label} - failed)")
+        pka_out = output_dir / f"{basename}_full.pka"
+        log_out = output_dir / f"{basename}_full.log"
+        r = subprocess.run(["bash", "-c", f"{conda_activate} && propka3 '{pdb_file}'"], capture_output=True, text=True, cwd=output_dir)
+        with open(log_out, "w") as f:
+            f.write(r.stdout)
+            f.write(r.stderr)
+        pka = output_dir / f"{basename}.pka"
+        if pka.exists():
+            pka.rename(pka_out)
+        else:
+            out.append(f"✗ {basename} (full - failed)")
         for chain, ch in [("H", "H"), ("L", "L")]:
             chain_pdb = output_dir / f"{basename}_{chain}_chain.pdb"
             with open(chain_pdb, "w") as f:
@@ -569,7 +505,6 @@ def process_file(pdb_path):
     except Exception as e:
         return f"✗ {basename} (error: {str(e)[:80]})"
 
-# Only full-structure PDBs (exclude single-chain *_H.pdb, *_L.pdb)
 pdb_files = sorted(p for p in Path(STRUCTURES_DIR).rglob("*.pdb") if not (p.stem.endswith("_H") or p.stem.endswith("_L")))
 with Pool(num_jobs) as pool:
     results = pool.map(process_file, pdb_files)
@@ -590,9 +525,7 @@ PROPKA_PY
             DSSP_DIR="$DSSP_OUTPUT_DIR"
             PKA_DIR="$PROPKA_OUTPUT_DIR"
             OUTPUT_DIR="$DEV_JSON_OUTPUT_DIR"
-            mkdir -p "$OUTPUT_DIR"
             export STRUCTURES_DIR SASA_DIR DSSP_DIR PKA_DIR OUTPUT_DIR
-            export PH_VALUE EXTRA_ARGS_STR
 
             if [ "$USE_GNU_PARALLEL" = true ]; then
                 process_file() {
@@ -602,21 +535,14 @@ PROPKA_PY
                     local dssp_file="${DSSP_DIR}/${basename}.dssp"
                     local pka_file="${PKA_DIR}/${basename}_full.pka"
                     local output_file="${OUTPUT_DIR}/${basename}.json"
-                    # Use relative path and run from SCRIPT_DIR so we don't duplicate "src/src/..."
-                    local cmd=("python3" "developability/run_developability.py" "$pdb_file" "$sasa_file")
-                    local extra_args_array=($EXTRA_ARGS_STR)
+                    local cmd=("python3" "developability/calculate_descriptors.py" "$pdb_file" "$sasa_file")
                     if [ ! -f "$sasa_file" ]; then
                         echo "✗ $basename (SASA file not found)"
                         return
                     fi
                     [ -f "$dssp_file" ] && cmd+=("--dssp-file" "$dssp_file")
                     [ -f "$pka_file" ] && cmd+=("--pka-file" "$pka_file")
-                    has_ph=false
-                    for arg in "${extra_args_array[@]}"; do
-                        [ "$arg" = "--pH" ] && has_ph=true && break
-                    done
-                    [ "$has_ph" = false ] && cmd+=("--pH" "$PH_VALUE")
-                    cmd+=("${extra_args_array[@]}")
+                    cmd+=("--pH" "$PH_VALUE")
                     cmd+=("--output" "$output_file")
                     if ! output=$(cd "$SCRIPT_DIR" && "${cmd[@]}" 2>&1 >/dev/null); then
                         echo "✗ $basename (failed)"
@@ -624,7 +550,7 @@ PROPKA_PY
                     fi
                 }
                 export -f process_file
-                export SASA_DIR DSSP_DIR PKA_DIR OUTPUT_DIR PH_VALUE EXTRA_ARGS_STR
+                export SASA_DIR DSSP_DIR PKA_DIR OUTPUT_DIR PH_VALUE
                 find "$STRUCTURES_DIR" -name "*.pdb" -type f ! -name "*_H.pdb" ! -name "*_L.pdb" | parallel -j "$NUM_JOBS" process_file {}
             else
                 python3 << 'DEV_PY'
@@ -640,7 +566,6 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
 SCRIPT_DIR = os.environ.get("SCRIPT_DIR", ".")
 num_jobs = int(os.environ.get('NUM_JOBS', cpu_count()))
 ph_value = os.environ.get('PH_VALUE', '7.4')
-extra_args = (os.environ.get('EXTRA_ARGS_STR') or '').split()
 
 def process_file(pdb_path):
     pdb_file = Path(pdb_path)
@@ -649,17 +574,14 @@ def process_file(pdb_path):
     dssp_file = Path(DSSP_DIR) / f"{basename}.dssp"
     pka_file = Path(PKA_DIR) / f"{basename}_full.pka"
     output_file = Path(OUTPUT_DIR) / f"{basename}.json"
-    # Use relative path; we run with cwd=SCRIPT_DIR to avoid src/src duplication
     if not sasa_file.exists():
         return f"✗ {basename} (SASA file not found)"
-    cmd = ["python3", "developability/run_developability.py", str(pdb_file), str(sasa_file)]
+    cmd = ["python3", "developability/calculate_descriptors.py", str(pdb_file), str(sasa_file)]
     if dssp_file.exists():
         cmd.extend(["--dssp-file", str(dssp_file)])
     if pka_file.exists():
         cmd.extend(["--pka-file", str(pka_file)])
-    if '--pH' not in extra_args:
-        cmd.extend(["--pH", ph_value])
-    cmd.extend(extra_args)
+    cmd.extend(["--pH", ph_value])
     cmd.extend(["--output", str(output_file)])
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, cwd=SCRIPT_DIR)
