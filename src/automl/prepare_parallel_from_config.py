@@ -1,104 +1,5 @@
 #!/usr/bin/env python3
-"""
-Run prepare_run once per dataset, then **one** GNU parallel over all combinations of:
-
-  dataset (YAML block) × target × fold × selector × selection_model
-
-**Config layout:** a single top-level ``pipeline:`` block (aliases: ``defaults``, ``shared``,
-``global``, ``fit_settings``) holds ``features_frac``, ``eval_models``, optional
-``eval_hyperparameters`` (or pipeline-level ``hyperparameters``: nested mapping per final eval model;
-see ``parse_eval_hyperparameters_mapping`` in ``utils.py``), ``random_state`` (default
-for prepare unless a dataset overrides), and ``selector1``, ``selector2``, … — shared by every
-dataset. Each ``datasetN:`` block lists only dataset-specific fields: ``path``,
-``developability_results_path`` (single) or ``developability_results_paths`` (list / CSV),
-``name_col``, ``target_cols``, optional ``feature_cols``,
-optional ``split_col`` (column on the experimental table with discrete fold ids; leave-one-fold-out
-CV with one fold per distinct value, at least 2 values; ``n_splits`` in YAML is ignored for fold
-count in this mode; omit for shuffled random folds as before),
-optional ``random_state`` / ``random_seeds`` as one int, a YAML list, or comma-separated ints —
-when ``split_col`` is **not** set, multiple seeds expand into separate runs (distinct ``yaml_key``
-suffix ``__rs{N}`` and ``run_dir``); when ``split_col`` is set, only the **first** seed is used
-(a shared multi-seed ``pipeline`` block is allowed; extra seeds are ignored with a warning),
-optional ``developability_features`` / ``developability_feature_groups`` (comma-separated or YAML list,
-or mapping ``{target_col: groups}``; groups are JSON top-level namespaces ``surface``, ``core``,
-``general``, ``sequence_motives`` — filters **developability** columns after merge; orthogonal to
-``feature_cols`` on the experimental table; omit for all developability groups),
-optional ``max_target_nan_frac`` (default ``0.5``, passed to ``prepare_run``; use e.g. ``0.7`` for sparse multi-endpoint tables),
-``n_splits``, and optional ``run_dir`` / preprocessing flags. Omitting ``pipeline`` falls back to
-**legacy** mode where each dataset block repeats those pipeline fields.
-
-Optional **shared prefilter** keys may sit alongside ``selector1``, … on the same mapping (pipeline
-or legacy dataset): ``low_variance_relative_std_threshold`` / ``low_var_threshold``,
-``low_variance_epsilon``, ``intercorr_threshold``, ``intercorr_importance_metric`` /
-``intercorr_metric`` (``spearman`` or ``pearson`` for inter-feature redundancy vs target),
-``intercorr_reduction_mode`` / ``intercorr_mode`` (hyphenated spellings
-accepted). Optional ``correlation_reduction`` (mapping with ``min_n_features``) runs **after**
-intercorrelation and **before** ``stability_reduction``: Spearman |rho(feature, target)| on the
-train fold, descending; elbow on that curve (same geometry as stability-selection elbow); keep
-``max(min_n_features, elbow_n)`` features, capped by the current prefilter size. Omit the block to
-skip the step. Top-level ``correlation_reduction_*`` keys override nested values on the **same**
-mapping (pipeline root or a track block). When **named tracks** are used (nested blocks such as
-``track_linear`` that contain ``selector*`` keys), ``correlation_reduction`` is **not** copied from
-the outer ``pipeline:`` into tracks—configure it inside each track that should run it.
-Optional ``stability_reduction`` (mapping with optional ``n_features`` / ``n`` / ``features``,
-``model``, and optional ``hyperparameters``) runs the same subsampling frequency ranking as the
-stability selector after correlation reduction (when present) and before the active selector; omit entirely for legacy
-runs. If ``n_features`` (or alias ``n`` / ``features``) is set, that many top-by-frequency features
-are kept; if it is omitted and ``model`` is set, the same elbow cutoff as the stability selector
-step chooses how many features to keep, then the count is raised to at least ``min_n_features``
-(if present) via ``max(min_n_features, elbow_n)``, capped by the prefilter size.
-Optional nested ``prereduction`` (mapping with ``n_features`` / ``n`` / ``features``) runs a
-lighter stability top-``n`` pass first (fixed 50 subsamples; sample fraction always
-``1/log10(5+n_train)`` clamped like ``fold_train_log10_const_5``) using the same ``model`` and
-RF/SVM/ElasticNet kwargs as ``stability_reduction``, then the usual ``stability_reduction`` step
-runs on the reduced feature set. Omit ``prereduction`` to skip.
-Top-level ``n_subsamples`` / ``sample_fraction`` / ``subsample_fraction`` (and other stability-style
-keys) are read from the same block and override nested ``hyperparameters`` when both are set.
-For ``subsample_fraction``, use ``fold_train_log10_const_5`` (constant
-``feature_selectors.FOLD_TRAIN_LOG10_CONST_5``) or aliases ``fold_train_log10``, ``log10_decay``,
-``log10_5_plus_n`` to set ``1/log10(5 + n_train)`` per fold, clamped to ``[0.4, 0.8]`` (see
-``stability_reduction_subsample_fraction_fold_train_log10`` in ``feature_selectors.py``).
-For ``n_subsamples``, use ``fold_train_log10_ns_500`` (``feature_selectors.FOLD_TRAIN_LOG10_NS_500``)
-for ``max(100, min(300, round(500/log10(n_train))))`` with ``n_train >= 2``. The same tokens work
-under a selector's ``hyperparameters`` for ``stability_n_subsamples`` / ``stability_sample_fraction``
-when ``type: stability``.
-Pipeline-level ``stability_reduction_features`` is accepted as an alias for ``stability_reduction_n_features``
-(see shared hyperparameter aliases in ``feature_selectors.py``).
-They are merged into every selector job’s hyperparameters before parsing; per-selector
-``hyperparameters:`` entries override the same key.
-
-Optional ``final_floating_sfs`` (mapping with ``max_feature_fraction`` and ``model``) enables a
-post-grid stage after all first-stage worker JSONs are written: per dataset/target/fold, feature
-votes are aggregated across all first-stage grid cells, the top-voted features are capped by that
-fraction of training rows, then floating SFS is run on that capped set before the final eval
-regressors. This stage is omitted when the block is absent.
-
-Phase-1 ``parallel_jobs.txt`` stays 4 columns (fold_dir, k, dataset_stem, pipeline_target_col).
-This script expands it to a **15-column** master TSV (tab-separated): one row per full combo,
-explicit absolute ``--output-json`` paths, column 11 ``correlation_min_abs_rho`` (``none`` or
-float) from YAML ``threshold`` on correlation selectors (``none`` for stability jobs), column 12
-``eval_features_frac`` (float string) for the evaluation feature cap (YAML ``features_frac`` may
-be a comma-separated list; ``prepare_run`` uses ``max`` of those values in ``meta.json``; each
-worker overrides via ``--eval-features-frac``). When expanding the master TSV, two fractions
-are deduplicated only when they yield the **same** discrete cap
-``max(1, int(frac * n_train))`` on **every** fold (``n_train`` per fold from that fold's train
-parquet); among such redundant fractions the largest is kept. If caps differ on any fold, both
-fractions are kept so the grid stays comparable across folds.
-Column 13 JSON for the active selector
-(``{}`` when unused; see ``parse_selector_hyperparameters_mapping`` in ``feature_selectors.py``),
-column 14 JSON for final eval regressors (``{}`` when unused; see
-``parse_eval_hyperparameters_mapping`` in ``utils.py``), and column 15 the pipeline track name
-(empty string when no tracks are configured).
-
-CLI overrides YAML: ``--parallel-jobs``, ``--py``, ``--no-preprocessing-skip``, ``--no-aggregate``,
-``--no-clean-folds``.
-
-After each dataset's ``parallel`` chunk finishes, ``aggregate_batch_results.py`` runs for that
-dataset only (``--only-dataset-yaml-key``) so ``aggregated_*.csv`` appears without waiting for
-later datasets. After optional ``run_final_floating_sfs_batch.py``, aggregation runs again on
-the full manifest (all JSONs) so floating-SFS rows and multi-source combined plots stay correct
-(unless ``--no-aggregate``).
-"""
+"""Prepare folds per dataset, expand to a master TSV, run GNU parallel fold workers."""
 
 from __future__ import annotations
 
@@ -125,6 +26,10 @@ _SRC_DIR = Path(__file__).resolve().parents[1]
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 from automl.feature_selectors import parse_selector_hyperparameters_mapping
+from automl.pipeline_defaults import (
+    DEFAULT_EVAL_MODELS,
+    DEFAULT_FEATURES_FRAC_CSV,
+)
 from automl.utils import parse_eval_hyperparameters_mapping
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -132,8 +37,9 @@ _ALLOWED_SELECTOR_TYPES = frozenset({"stability", "correlation", "sfs", "rfe"})
 _MODEL_HP_BLOCKS = frozenset({"elasticnet", "randomforest", "svm", "knn"})
 _ALLOWED_FLOATING_SFS_MODELS = frozenset({"elasticnet", "randomforest", "svm", "knn"})
 _PIPELINE_ROOT_KEYS = ("pipeline", "defaults", "shared", "global", "fit_settings")
+_AUTOML_CONFIG_KEYS = ("automl_config", "automl-config", "automl")
+_DEFAULT_AUTOML_CONFIG = _REPO_ROOT / "src" / "automl.yaml"
 
-# Keys in the pipeline block that are NOT named tracks (scalar / shared prefilter / nested config).
 _PIPELINE_NON_TRACK_KEYS: frozenset[str] = frozenset({
     "random_state", "random-state", "random_seeds", "random-seeds",
     "features_frac", "features-frac", "features_fracs", "features-fracs",
@@ -154,19 +60,7 @@ _PIPELINE_NON_TRACK_KEYS: frozenset[str] = frozenset({
 })
 
 
-def _eval_frac_slug(f: float) -> str:
-    """Stable filename / row suffix, e.g. 0.15 -> frac015 (hundredths, zero-padded to 3)."""
-    x = float(f)
-    return f"frac{int(round(x * 100)):03d}"
-
-
-def _selection_max_feature_cap_from_frac(*, features_frac: float, n_train: int) -> int:
-    """Same discrete cap as ``run_fold_pipeline_config``: ``max(1, int(features_frac * n_train))``."""
-    return max(1, int(float(features_frac) * int(n_train)))
-
-
 def _parquet_train_row_count(train_pq: Path) -> int:
-    """Row count of ``fold_{k}_train.parquet`` without loading the full table when possible."""
     p = Path(train_pq)
     if not p.is_file():
         raise FileNotFoundError(f"Missing fold train parquet: {p}")
@@ -184,17 +78,6 @@ def _dedupe_features_fracs_across_folds(
     features_fracs: list[float],
     fold_to_n_train: dict[str, int],
 ) -> tuple[list[float], list[float]]:
-    """Drop ``features_frac`` values only when redundant on **all** folds.
-
-    For each fraction ``f`` and fold ``k``, the worker cap is
-    ``max(1, int(f * n_train_k))`` (same as :func:`_selection_max_feature_cap_from_frac`).
-    Two fractions are equivalent iff their cap tuple matches on every fold. Among an
-    equivalence class, keep the **largest** ``frac`` only. If caps differ for any fold,
-    both fractions are kept.
-
-    ``fold_to_n_train`` maps fold index strings (e.g. ``\"0\"``, ``\"3\"``) to train row counts.
-    Returns ``(kept_fracs_desc, dropped_fracs_sorted)``.
-    """
     if not features_fracs:
         return ([], [])
     if not fold_to_n_train:
@@ -207,9 +90,7 @@ def _dedupe_features_fracs_across_folds(
 
     def _cap_signature(fv: float) -> tuple[int, ...]:
         return tuple(
-            _selection_max_feature_cap_from_frac(
-                features_frac=fv, n_train=int(fold_to_n_train[k])
-            )
+            max(1, int(fv * int(fold_to_n_train[k])))
             for k in fold_keys
         )
 
@@ -227,17 +108,16 @@ def _dedupe_features_fracs_across_folds(
 
 
 def _parse_features_fracs(block: dict, yaml_key: str) -> list[float]:
-    """YAML ``features_frac`` / ``features_fracs``: one float, comma-separated string, or list."""
     raw = _get(
         block,
         "features_frac",
         "features-frac",
         "features_fracs",
         "features-fracs",
-        default=0.1,
+        default=DEFAULT_FEATURES_FRAC_CSV,
     )
     if raw is None:
-        raw = 0.1
+        raw = DEFAULT_FEATURES_FRAC_CSV
     out: list[float] = []
     if isinstance(raw, (list, tuple)):
         for x in raw:
@@ -245,7 +125,7 @@ def _parse_features_fracs(block: dict, yaml_key: str) -> list[float]:
     else:
         s = str(raw).strip()
         if not s:
-            s = "0.1"
+            s = DEFAULT_FEATURES_FRAC_CSV
         for part in s.split(","):
             part = part.strip()
             if part:
@@ -328,7 +208,6 @@ def _slug(s: str) -> str:
 
 
 def _developability_run_dir_suffix(dev_paths: tuple[Path, ...]) -> str:
-    """Distinct default ``run_dir`` tag per developability source set."""
     rr = _REPO_ROOT.resolve()
     tokens: list[str] = []
     for p in dev_paths:
@@ -349,11 +228,6 @@ def _developability_run_dir_suffix(dev_paths: tuple[Path, ...]) -> str:
 
 
 def _strip_shared_correlation_reduction_for_tracked_pipeline(shared_base: dict) -> None:
-    """Remove pipeline-level correlation reduction keys so they are not merged into every track.
-
-    Per-track jobs call :func:`_shared_prefilter_raw_from_block` on the merged track mapping; those
-    keys must come from the track sub-block only when named tracks are configured.
-    """
     drop: list[str] = []
     for k in shared_base:
         if not isinstance(k, str):
@@ -366,13 +240,6 @@ def _strip_shared_correlation_reduction_for_tracked_pipeline(shared_base: dict) 
 
 
 def _is_track_key(key: str, value) -> bool:
-    """Return True when ``key`` / ``value`` in a pipeline block represent a named track.
-
-    A key is a track when its value is a non-empty mapping, its name is not one of the
-    known shared pipeline keys, does not start with a ``stability_reduction_`` /
-    ``correlation_reduction_`` override prefix, and the mapping contains at least one
-    ``selector*`` key.
-    """
     if not isinstance(value, dict) or not value:
         return False
     kl = str(key).strip().lower().replace("-", "_")
@@ -386,23 +253,10 @@ def _is_track_key(key: str, value) -> bool:
 def _extract_tracks_from_pipeline(
     block: dict,
 ) -> list[tuple[str | None, dict]]:
-    """Detect named track sub-blocks inside a pipeline mapping.
-
-    A track is a nested mapping under the pipeline block that contains ``selector*`` keys.
-    Shared pipeline keys (prefilters, ``features_frac``, ``eval_models``, …) are merged
-    into every track block as defaults; track-level keys take precedence.
-
-    Returns
-    -------
-    list of (track_name, merged_block) tuples.
-    When no track sub-blocks are found, returns ``[(None, block)]`` so callers can treat
-    the no-track and track cases uniformly.
-    """
     track_items = [(k, v) for k, v in block.items() if _is_track_key(k, v)]
     if not track_items:
         return [(None, block)]
 
-    # Shared (non-track) keys from the outer pipeline block, merged into every track.
     shared_base = {k: v for k, v in block.items() if not _is_track_key(k, v)}
     _strip_shared_correlation_reduction_for_tracked_pipeline(shared_base)
 
@@ -416,7 +270,6 @@ def _extract_tracks_from_pipeline(
 
 
 def _merge_raw_selector_hyperparameters(spec: dict, model: str, stype: str) -> dict:
-    """Shared keys + optional per-model blocks for stability/sfs/rfe; correlation uses shared keys only."""
     raw = _get(spec, "hyperparameters", "hyperparameter")
     if raw is None:
         return {}
@@ -478,11 +331,6 @@ _STABILITY_REDUCTION_NESTED_HP: dict[str, str] = {
 
 
 def _correlation_reduction_raw_from_block(block: dict) -> dict:
-    """Flatten ``correlation_reduction`` on this block (Spearman |rho| vs target, elbow, then cap).
-
-    For YAML with named tracks, the block is the per-track merged mapping; the outer pipeline
-    ``correlation_reduction`` is not merged into tracks (see :func:`_extract_tracks_from_pipeline`).
-    """
     out: dict = {}
     cr = _get(block, "correlation_reduction", "correlation-reduction")
     if not isinstance(cr, dict) or not cr:
@@ -494,7 +342,6 @@ def _correlation_reduction_raw_from_block(block: dict) -> dict:
 
 
 def _stability_reduction_raw_from_block(block: dict) -> dict:
-    """Flatten ``pipeline.stability_reduction`` (nested + optional ``hyperparameters``)."""
     out: dict = {}
     sr = _get(block, "stability_reduction", "stability-reduction")
     if not isinstance(sr, dict) or not sr:
@@ -565,11 +412,6 @@ def _stability_reduction_raw_from_block(block: dict) -> dict:
 
 
 def _shared_prefilter_raw_from_block(block: dict) -> dict:
-    """Pipeline-level defaults for low-variance and intercorrelation prefilters (all selectors).
-
-    Reads only known keys from ``block`` (not nested under ``selector*``). Values are stored under
-    canonical names understood by :func:`parse_selector_hyperparameters_mapping`.
-    """
     out: dict = {}
     v = _get(
         block,
@@ -619,24 +461,7 @@ def _shared_prefilter_raw_from_block(block: dict) -> dict:
     return out
 
 
-def _selector_hp_filename_slug(hp: dict) -> str:
-    """Non-empty only when ``hp`` is non-empty (avoids output JSON collisions)."""
-    if not hp:
-        return ""
-    payload = json.dumps(hp, sort_keys=True, separators=(",", ":"))
-    return "h" + hashlib.sha256(payload.encode()).hexdigest()[:12]
-
-
-def _eval_hp_filename_slug(hp: dict[str, dict]) -> str:
-    """Non-empty when final-eval hyperparameters are set (avoids JSON path collisions)."""
-    if not hp:
-        return ""
-    payload = json.dumps(hp, sort_keys=True, separators=(",", ":"))
-    return "e" + hashlib.sha256(payload.encode()).hexdigest()[:12]
-
-
 def _correlation_min_abs_rho_from_spec(spec: dict, stype: str) -> float | None:
-    """YAML ``threshold`` (or aliases) → min |Spearman rho| for correlation screening; stability ignores."""
     if stype != "correlation":
         return None
     for key in (
@@ -699,7 +524,6 @@ def _selector_job_specs(block: dict, dataset_yaml_key: str, track_name: str | No
 
 
 def _parse_final_floating_sfs_from_block(block: dict, label: str) -> dict | None:
-    """Optional config for the post-grid per-fold floating-SFS stage."""
     raw = _get(block, "final_floating_sfs", "final-floating-sfs")
     if raw is None:
         return None
@@ -751,7 +575,6 @@ def _parse_final_floating_sfs_from_block(block: dict, label: str) -> dict | None
 
 
 def _pop_pipeline_block(raw: dict) -> dict | None:
-    """Remove and return the shared pipeline block (``pipeline``, ``defaults``, …), if present."""
     for key in _PIPELINE_ROOT_KEYS:
         if key not in raw or raw[key] is None:
             continue
@@ -762,24 +585,95 @@ def _pop_pipeline_block(raw: dict) -> dict | None:
     return None
 
 
+def _pop_automl_config_path(raw: dict) -> str | None:
+    for key in _AUTOML_CONFIG_KEYS:
+        if key not in raw or raw[key] is None:
+            continue
+        text = str(raw.pop(key)).strip()
+        if text:
+            return text
+    return None
+
+
+def _default_automl_config_path() -> Path | None:
+    if _DEFAULT_AUTOML_CONFIG.is_file():
+        return _DEFAULT_AUTOML_CONFIG.resolve()
+    return None
+
+
+def _pipeline_block_from_automl_yaml(raw: object, *, source: Path) -> dict:
+    if not isinstance(raw, dict):
+        raise ValueError(f"AutoML config root must be a mapping: {source}")
+    block = dict(raw)
+    pipeline = _pop_pipeline_block(block)
+    if pipeline is not None:
+        return pipeline
+    if block:
+        return block
+    raise ValueError(f"AutoML config is empty: {source}")
+
+
+def _resolve_pipeline_config(
+    run_raw: dict,
+    *,
+    automl_config_cli: Path | None = None,
+) -> dict | None:
+    inline_pipeline = _pop_pipeline_block(run_raw)
+
+    automl_path: Path | None
+    if automl_config_cli is not None:
+        automl_path = (
+            automl_config_cli.resolve()
+            if automl_config_cli.is_absolute()
+            else (_REPO_ROOT / automl_config_cli).resolve()
+        )
+    else:
+        yaml_path_str = _pop_automl_config_path(run_raw)
+        if yaml_path_str:
+            automl_path = _resolve_path(yaml_path_str)
+        else:
+            automl_path = _default_automl_config_path()
+
+    file_pipeline: dict | None = None
+    if automl_path is not None:
+        if not automl_path.is_file():
+            print(f"AutoML config not found: {automl_path}", file=sys.stderr)
+            sys.exit(1)
+        automl_raw = yaml.safe_load(automl_path.read_text())
+        try:
+            file_pipeline = _pipeline_block_from_automl_yaml(
+                automl_raw, source=automl_path
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+        print(
+            f"[batch] AutoML pipeline from {automl_path}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    if inline_pipeline is not None and file_pipeline is not None:
+        print(
+            "Warning: inline 'pipeline' block in the run config is ignored; "
+            f"using AutoML settings from {automl_path}",
+            file=sys.stderr,
+        )
+    elif inline_pipeline is not None:
+        print(
+            "[batch] AutoML pipeline from inline 'pipeline' block in run config (legacy)",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    return file_pipeline if file_pipeline is not None else inline_pipeline
+
+
 def _pipeline_settings_from_block(
     block: dict, label: str
 ) -> tuple[list[float], str, list[dict], dict[str, dict], dict | list | None]:
-    """``features_fracs``, ``eval_models``, ``selector_jobs``, ``eval_hyperparameters``,
-    ``final_floating_sfs``.
-
-    When the block contains named track sub-blocks (mappings with ``selector*`` keys), selector
-    jobs and ``final_floating_sfs`` are collected per track and combined:
-
-    - Every selector job dict gains a ``"track_name"`` key (the track's name string).
-    - ``final_floating_sfs`` is returned as a list of
-      ``{"track_name": ..., "max_feature_fraction": ..., "models": [...]}`` dicts when tracks are
-      present, or as a single dict / ``None`` in the no-track case (backward-compatible).
-    - ``features_fracs``, ``eval_models``, and ``eval_hyperparameters`` are always read from the
-      outer block (not per-track).
-    """
     features_fracs = _parse_features_fracs(block, label)
-    eval_models = str(_get(block, "eval_models", "eval-models", default="all") or "all")
+    eval_models = str(_get(block, "eval_models", "eval-models", default=DEFAULT_EVAL_MODELS) or DEFAULT_EVAL_MODELS)
     eval_hp_raw = _get(
         block,
         "eval_hyperparameters",
@@ -796,11 +690,9 @@ def _pipeline_settings_from_block(
 
     track_entries = _extract_tracks_from_pipeline(block)
     if len(track_entries) == 1 and track_entries[0][0] is None:
-        # No-track mode: single entry with track_name=None — use block directly.
         selector_jobs = _selector_job_specs(block, label, track_name=None)
         final_floating_sfs: dict | list | None = _parse_final_floating_sfs_from_block(block, label)
     else:
-        # Track mode: collect selectors and floating SFS per track.
         selector_jobs = []
         ffs_list: list[dict] = []
         for track_name, track_block in track_entries:
@@ -823,7 +715,6 @@ def _pipeline_settings_from_block(
 
 
 def _coerce_random_seeds(raw: object, *, yaml_key: str) -> list[int]:
-    """Parse ``random_state`` / ``random_seeds`` as one int, YAML list, or comma-separated ints."""
     if raw is None:
         return [42]
     if isinstance(raw, (list, tuple)):
@@ -846,7 +737,6 @@ def _coerce_random_seeds(raw: object, *, yaml_key: str) -> list[int]:
 
 
 def _resolve_random_state_raw(block: dict, pipeline: dict | None) -> object:
-    """Dataset block overrides pipeline; ``random_seeds`` before ``random_state`` per mapping."""
     for src in (block, pipeline or {}):
         for names in (
             ("random_seeds", "random-seeds"),
@@ -859,15 +749,6 @@ def _resolve_random_state_raw(block: dict, pipeline: dict | None) -> object:
 
 
 def _parse_dataset_records(root: dict, pipeline: dict | None) -> list[dict]:
-    """One dict per YAML dataset block (prepare unit), with selector×model pairs.
-
-    If ``pipeline`` is set, ``features_frac``, ``eval_models``, and ``selector*`` come from it
-    (same for every dataset). If ``pipeline`` is omitted, each dataset block must carry those
-    fields (legacy behavior).
-
-    Multiple ``random_state`` values expand to multiple records when ``split_col`` is absent;
-    with ``split_col``, only the first seed is kept (see stderr warning if extras were listed).
-    """
     out: list[dict] = []
     shared: tuple[list[float], str, list[dict], dict[str, dict], dict | None] | None = None
     if pipeline is not None:
@@ -1014,20 +895,13 @@ def _parse_dataset_records(root: dict, pipeline: dict | None) -> list[dict]:
 
 
 def _targets_features_as_lists(targets_csv: str, features_csv: str) -> tuple[list[str], list[str]]:
-    def split_csv(s: str) -> list[str]:
-        return [p.strip() for p in s.split(",") if p.strip()]
-
-    return split_csv(targets_csv), split_csv(features_csv)
+    return (
+        [p.strip() for p in targets_csv.split(",") if p.strip()],
+        [p.strip() for p in features_csv.split(",") if p.strip()],
+    )
 
 
 def _parse_developability_results_paths(block: dict, *, yaml_key: str) -> list[str]:
-    """Resolve developability source path(s) from YAML dataset block.
-
-    Supported:
-      - ``developability_results_path: one/path``
-      - ``developability_results_paths: [path1, path2]``
-      - ``developability_results_paths: path1,path2``
-    """
     single = _get(block, "developability_results_path", "developability-results-path")
     multi = _get(block, "developability_results_paths", "developability-results-paths")
 
@@ -1055,7 +929,6 @@ def _parse_developability_results_paths(block: dict, *, yaml_key: str) -> list[s
 
 
 def _parse_developability_feature_groups(block: dict) -> list[str]:
-    """YAML list or comma-separated string; empty if unset."""
     raw = _get(
         block,
         "developability_features",
@@ -1063,18 +936,7 @@ def _parse_developability_feature_groups(block: dict) -> list[str]:
         "developability_feature_groups",
         "developability-feature-groups",
     )
-    if raw is None:
-        return []
-    if isinstance(raw, (list, tuple)):
-        out = [str(x).strip() for x in raw if str(x).strip()]
-    else:
-        s = str(raw).strip()
-        if not s:
-            return []
-        out = [p.strip() for p in s.split(",") if p.strip()]
-    if not out:
-        return []
-    return out
+    return _parse_developability_groups_value(raw)
 
 
 def _parse_developability_feature_groups_by_target(
@@ -1083,12 +945,6 @@ def _parse_developability_feature_groups_by_target(
     *,
     yaml_key: str,
 ) -> dict[str, list[str]]:
-    """Resolve developability groups per target.
-
-    Supported YAML forms:
-      - scalar/list: applies to all targets
-      - mapping: ``{target_name: groups}`` with optional default key ``default`` or ``*``
-    """
     dev_keys = (
         "developability_features",
         "developability-features",
@@ -1110,7 +966,6 @@ def _parse_developability_feature_groups_by_target(
     if raw is None:
         return {str(t): [] for t in target_cols}
 
-    # Backward-compatible: one shared setting for all targets.
     if not isinstance(raw, dict):
         groups = _parse_developability_feature_groups(block)
         return {str(t): list(groups) for t in target_cols}
@@ -1134,7 +989,6 @@ def _parse_developability_feature_groups_by_target(
 
 
 def _parse_developability_groups_value(raw) -> list[str]:
-    """YAML list or comma-separated string; empty if unset."""
     if raw is None:
         return []
     if isinstance(raw, (list, tuple)):
@@ -1155,7 +1009,6 @@ def _prepare_key(d: dict) -> tuple:
         sorted((str(t), tuple(v or [])) for t, v in dict(grp_by_target).items())
     )
     split_col_k = d.get("split_col") or ""
-    # When split_col is set, fold count comes from data; YAML n_splits must not affect cache key.
     n_splits_key = -1 if split_col_k else int(d["n_splits"])
     return (
         d["dataset_path"],
@@ -1187,11 +1040,6 @@ def _output_json_for_job(
     hp_slug: str = "",
     eval_hp_slug: str = "",
 ) -> Path:
-    """Unique path: batch_root / yaml_key_slug / ...__sel__mod__fracXXX[__h…][__e…].json
-
-    When ``track_name`` is set, it is inserted between ``fold{k}`` and the selector name so
-    result files from different tracks are immediately distinguishable.
-    """
     sub = batch_root / _slug(dataset_yaml_key)
     hp_part = f"__{hp_slug}" if hp_slug else ""
     ev_part = f"__{eval_hp_slug}" if eval_hp_slug else ""
@@ -1204,7 +1052,6 @@ def _output_json_for_job(
 
 
 def _expand_master_lines_for_dataset(drec: dict, batch_root: Path) -> list[str]:
-    """Build 15-column master TSV lines for one dataset record (same as parallel_jobs_master format)."""
     jf = drec["jobs_file"]
     parsed_lines: list[tuple[str, str, str, str, Path]] = []
     fold_to_n_train: dict[str, int] = {}
@@ -1258,13 +1105,17 @@ def _expand_master_lines_for_dataset(drec: dict, batch_root: Path) -> list[str]:
             hp = job.get("hyperparameters") or {}
             track_name: str | None = job.get("track_name") or None
             rho_tok = "none" if rho is None else str(rho)
-            hp_slug = _selector_hp_filename_slug(hp)
             hp_json = json.dumps(hp, sort_keys=True, separators=(",", ":"))
+            hp_slug = ""
+            if hp:
+                hp_slug = "h" + hashlib.sha256(hp_json.encode()).hexdigest()[:12]
             ev_hp = drec["eval_hyperparameters"]
-            eval_hp_slug = _eval_hp_filename_slug(ev_hp)
             eval_hp_json = json.dumps(ev_hp, sort_keys=True, separators=(",", ":"))
+            eval_hp_slug = ""
+            if ev_hp:
+                eval_hp_slug = "e" + hashlib.sha256(eval_hp_json.encode()).hexdigest()[:12]
             for eval_frac in fracs_kept:
-                ef_slug = _eval_frac_slug(eval_frac)
+                ef_slug = f"frac{int(round(float(eval_frac) * 100)):03d}"
                 out_json = _output_json_for_job(
                     batch_root,
                     dataset_yaml_key=drec["yaml_key"],
@@ -1339,6 +1190,15 @@ def main() -> None:
         action="store_true",
         help="Keep fold parquet files after parallel (default: remove them; disables phase-1 cache reuse).",
     )
+    p.add_argument(
+        "--automl-config",
+        type=Path,
+        default=None,
+        help=(
+            "AutoML YAML with the shared pipeline block (overrides automl_config in run config; "
+            "default: src/automl.yaml)."
+        ),
+    )
     args = p.parse_args()
 
     cfg_path = args.config
@@ -1372,7 +1232,7 @@ def main() -> None:
         flush=True,
     )
 
-    pipeline_cfg = _pop_pipeline_block(raw)
+    pipeline_cfg = _resolve_pipeline_config(raw, automl_config_cli=args.automl_config)
 
     parallel_jobs = args.parallel_jobs
     if parallel_jobs is None and yaml_parallel is not None:
@@ -1573,7 +1433,7 @@ def main() -> None:
         "config_path": str(cfg_path),
         "batch_result_root": str(batch_root),
         "master_jobs_tsv": str(master_path),
-        "master_tsv_format": "14col-v1",
+        "master_tsv_format": "15col-v1",
         "master_tsv_columns": [
             "fold_dir",
             "k",
@@ -1589,6 +1449,7 @@ def main() -> None:
             "eval_features_frac",
             "selector_hyperparameters_json",
             "eval_hyperparameters_json",
+            "pipeline_track_name",
         ],
         "job_line_count": len(master_rows),
         "parallel_jobs": parallel_jobs,

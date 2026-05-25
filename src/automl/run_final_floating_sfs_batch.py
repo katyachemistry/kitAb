@@ -1,19 +1,5 @@
 #!/usr/bin/env python3
-"""Run a post-grid per-fold floating-SFS stage from a batch manifest.
-
-This stage is optional and is driven by ``final_floating_sfs`` stored per dataset block
-in ``batch_manifest.json``. For each dataset block / target / outer fold:
-
-1. Read the first-stage worker JSONs listed in the master TSV.
-2. Aggregate feature votes across all first-stage grid cells for that fold.
-3. Keep the top voted features, capped by
-   ``max(1, floor(max_feature_fraction * n_train_rows))``.
-4. MinMax-scale that candidate set on the fold train split.
-5. Run floating SFS on the scaled train fold using only those candidates.
-6. Re-run the existing eval regressors on the resulting feature subset.
-
-One result JSON is written per fold and per configured floating-SFS selection model.
-"""
+"""Post-grid per-fold floating SFS from a batch manifest (optional ``final_floating_sfs`` stage)."""
 
 from __future__ import annotations
 
@@ -22,7 +8,9 @@ import json
 import re
 import sys
 from collections import defaultdict
+from collections.abc import Iterable
 from pathlib import Path
+from typing import Literal
 
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
@@ -33,7 +21,6 @@ if str(_SRC_DIR) not in sys.path:
 
 from automl.feature_selectors import select_features_floating_sfs
 from automl.run_fold_pipeline_config import _evaluate_fold_models, _parse_eval_models
-from automl.selection_grid_stats import aggregate_selected_feature_votes_across_grid
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -49,12 +36,85 @@ def _slug(s: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(s)).strip("_") or "x"
 
 
-def _eval_frac_slug(value: float) -> str:
-    return f"frac{int(round(float(value) * 100)):03d}"
+def _feature_names_from_fold_result(
+    data: dict,
+    *,
+    feature_source: Literal["selected_features", "eval_reported"],
+) -> list[str] | None:
+    if feature_source == "eval_reported":
+        evaluation = data.get("evaluation") or {}
+        for model_result in evaluation.values():
+            if not isinstance(model_result, dict) or model_result.get("error"):
+                continue
+            used = model_result.get("eval_features_used")
+            if isinstance(used, list) and len(used) > 0:
+                return [str(f) for f in used]
+        return None
+
+    feats = data.get("selected_features")
+    if not isinstance(feats, list):
+        return None
+    return [str(f) for f in feats]
+
+
+def aggregate_selected_feature_votes_across_grid(
+    result_json_paths: Iterable[Path | str],
+    *,
+    dataset_stem: str | None = None,
+    target_col: str | None = None,
+    dataset_yaml_key: str | None = None,
+    feature_source: Literal["selected_features", "eval_reported"] = "selected_features",
+    dedupe_features_within_combo: bool = True,
+) -> dict[int, dict[str, int]]:
+    agg: defaultdict[int, defaultdict[str, int]] = defaultdict(lambda: defaultdict(int))
+
+    for raw_path in result_json_paths:
+        path = Path(raw_path)
+        if not path.is_file():
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        if dataset_stem is not None and str(data.get("dataset_stem", "")) != str(
+            dataset_stem
+        ):
+            continue
+        if target_col is not None and str(data.get("target_col", "")) != str(
+            target_col
+        ):
+            continue
+        if dataset_yaml_key is not None and str(data.get("dataset_yaml_key", "")) != str(
+            dataset_yaml_key
+        ):
+            continue
+
+        fi = data.get("fold_index")
+        try:
+            fold_k = int(fi)
+        except (TypeError, ValueError):
+            continue
+
+        feats = _feature_names_from_fold_result(data, feature_source=feature_source)
+        if feats is None:
+            continue
+        if dedupe_features_within_combo:
+            feats = list(dict.fromkeys(feats))
+        for name in feats:
+            agg[fold_k][name] += 1
+
+    out: dict[int, dict[str, int]] = {}
+    for fk in sorted(agg.keys()):
+        inner = agg[fk]
+        out[fk] = {name: inner[name] for name in sorted(inner.keys())}
+    return out
 
 
 def _json_paths_from_master(master_path: Path) -> list[Path]:
-    """Result JSON paths from the master TSV written by prepare_parallel (≥9 columns required)."""
     out: list[Path] = []
     seen: set[Path] = set()
     for raw_line in master_path.read_text().splitlines():
@@ -69,26 +129,6 @@ def _json_paths_from_master(master_path: Path) -> list[Path]:
             seen.add(path)
             out.append(path)
     return out
-
-
-def _final_output_json_path(
-    batch_root: Path,
-    *,
-    dataset_yaml_key: str,
-    dataset_stem: str,
-    fold_dir: Path,
-    fold_index: int,
-    model: str,
-    max_feature_fraction: float,
-    track_name: str | None = None,
-) -> Path:
-    subdir = batch_root / _slug(dataset_yaml_key)
-    track_part = f"__{_slug(track_name)}" if track_name else ""
-    fname = (
-        f"{_slug(dataset_stem)}__{_slug(fold_dir.name)}__fold{fold_index}{track_part}__"
-        f"final_floating_sfs__{_slug(model)}__{_eval_frac_slug(max_feature_fraction)}.json"
-    )
-    return (subdir / fname).resolve()
 
 
 def _load_first_stage_records(json_paths: list[Path]) -> list[tuple[Path, dict]]:
@@ -106,6 +146,27 @@ def _load_first_stage_records(json_paths: list[Path]) -> list[tuple[Path, dict]]
     return records
 
 
+def _final_output_json_path(
+    batch_root: Path,
+    *,
+    dataset_yaml_key: str,
+    dataset_stem: str,
+    fold_dir: Path,
+    fold_index: int,
+    model: str,
+    max_feature_fraction: float,
+    track_name: str | None = None,
+) -> Path:
+    subdir = batch_root / _slug(dataset_yaml_key)
+    track_part = f"__{_slug(track_name)}" if track_name else ""
+    frac_slug = f"frac{int(round(float(max_feature_fraction) * 100)):03d}"
+    fname = (
+        f"{_slug(dataset_stem)}__{_slug(fold_dir.name)}__fold{fold_index}{track_part}__"
+        f"final_floating_sfs__{_slug(model)}__{frac_slug}.json"
+    )
+    return (subdir / fname).resolve()
+
+
 def _make_scaled_fold_frames(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -116,8 +177,6 @@ def _make_scaled_fold_frames(
     test_scaled = test_df.copy()
     if not candidate_features:
         return train_scaled, test_scaled
-    # pandas >= 2.0 raises "Invalid value ... for dtype 'int64'" when assigning
-    # float64 MinMax output into integer-typed columns via .loc.  Cast in-place first.
     for col in candidate_features:
         if col in train_scaled.columns and train_scaled[col].dtype.kind != "f":
             train_scaled[col] = train_scaled[col].astype(float)
@@ -129,25 +188,6 @@ def _make_scaled_fold_frames(
     )
     test_scaled.loc[:, candidate_features] = scaler.transform(test_scaled.loc[:, candidate_features])
     return train_scaled, test_scaled
-
-
-def _sorted_vote_items(vote_map: dict[str, int]) -> list[tuple[str, int]]:
-    return sorted(
-        ((str(name), int(votes)) for name, votes in vote_map.items()),
-        key=lambda item: (-item[1], item[0]),
-    )
-
-
-def _error_evaluation(eval_models: list[str] | None, error: str) -> dict[str, dict] | None:
-    if eval_models is None:
-        return None
-    return {
-        m: {
-            "error": error,
-            "n_features": 0,
-        }
-        for m in eval_models
-    }
 
 
 def _run_one_final_floating_sfs(
@@ -182,7 +222,10 @@ def _run_one_final_floating_sfs(
         track_name=track_name,
     )
 
-    vote_items = _sorted_vote_items(vote_map)
+    vote_items = sorted(
+        ((str(name), int(votes)) for name, votes in vote_map.items()),
+        key=lambda item: (-item[1], item[0]),
+    )
     voted_features_all = [name for name, _ in vote_items]
     voted_feature_counts = {name: votes for name, votes in vote_items}
 
@@ -283,7 +326,10 @@ def _run_one_final_floating_sfs(
             )
     except Exception as e:
         payload["final_floating_sfs_summary"]["error"] = str(e)
-        payload["evaluation"] = _error_evaluation(eval_models, str(e))
+        if eval_models is not None:
+            payload["evaluation"] = {
+                m: {"error": str(e), "n_features": 0} for m in eval_models
+            }
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, indent=2))
@@ -330,7 +376,7 @@ def main() -> None:
 
     records_by_dataset: dict[str, list[tuple[Path, dict]]] = defaultdict(list)
     fold_meta_by_group: dict[tuple[str, str, int], dict] = {}
-    for path, data in records:
+    for _path, data in records:
         ds_key = str(data.get("dataset_yaml_key") or data.get("dataset_stem") or "")
         target_col = str(data.get("target_col") or "")
         try:
@@ -339,11 +385,14 @@ def main() -> None:
             continue
         if not ds_key or not target_col:
             continue
-        records_by_dataset[ds_key].append((path, data))
+        fold_dir = data.get("fold_dir")
+        if not fold_dir:
+            continue
+        records_by_dataset[ds_key].append((_path, data))
         fold_meta_by_group.setdefault(
             (ds_key, target_col, fold_index),
             {
-                "fold_dir": data.get("fold_dir"),
+                "fold_dir": fold_dir,
                 "random_state": data.get("random_state"),
                 "dataset_stem": data.get("dataset_stem"),
             },
@@ -355,9 +404,6 @@ def main() -> None:
         if not raw_cfg:
             continue
 
-        # Normalize to a list of per-track configs.
-        # - No-track / legacy: a single dict → wrap as one entry with track_name=None.
-        # - Track mode: a list of dicts, each having a "track_name" key.
         if isinstance(raw_cfg, dict):
             track_cfgs: list[tuple[str | None, dict]] = [(None, raw_cfg)]
         elif isinstance(raw_cfg, list):
@@ -386,7 +432,6 @@ def main() -> None:
         eval_hp_by_model = dataset_info.get("eval_hyperparameters") or {}
 
         for track_name, track_cfg in track_cfgs:
-            # Filter first-stage records to those belonging to this track (or all when no track).
             if track_name is not None:
                 track_records = [
                     (path, data)

@@ -1,4 +1,4 @@
-from typing import Dict, Iterable, List, Optional, Set, Tuple, Any, Union
+from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
 import os
 import math
 from collections import defaultdict
@@ -7,18 +7,12 @@ from scipy.spatial import cKDTree
 from scipy import optimize
 from sklearn.cluster import DBSCAN
 import logging
-from pathlib import Path
-import re
-import sys
-import pandas as pd
 
 from developability.structure_context import StructureContext, ResKey4
 from developability.descriptor_utils import (
-    CDR_RANGES_CA,
     imgt_residue_sort_key,
     _ATOM_LOOKUP_CACHE,
     _RES_INDEX_TO_KEY_CACHE,
-    get_residue_region,
     iter_unique_residues,
     _get_atoms_for_path,
     _residue_keys_cache_key,
@@ -26,12 +20,10 @@ from developability.descriptor_utils import (
     is_hydrogen_atom,
     atom_sasa_weight,
     get_residue_sasa_weight,
-    residue_side_sasa_abs,
     _get_structure_context,
     _count_residues_in_pdb,
     _get_residue_seq_index,
     _get_charged_residues_at_pH,
-    _residue_category_group,
     _residue_category_group_surface_pcf,
     get_exposed_residues,
     _sasa_lookup,
@@ -48,23 +40,18 @@ from developability.descriptor_utils import (
 
 from utils.parsers import (
     ca_xyz_by_residue,
-    parse_dssp,
     parse_sasa,
     Atom,
     SASAEntry,
     residue_key_from_atom,
 )
 from utils.chemistry import (
-    AA_1_TO_3,
     AROMATIC_RESIDUES,
     CTERM_PKA,
     DBSCAN_EPS_MIN_SAMPLES_BY_CATEGORY_DEFAULT,
     EXPOSURE_REL_ASA_THRESHOLD,
-    get_ff19sb_atom_charge,
     get_ff19sb_atom_charge_with_source,
-    GLN_ASN_RESIDUES,
-    HYDROPHOBIC_RESIDUES,
-    is_backbone_atom,
+    BACKBONE_ATOMS,
     KYTE_DOOLITTLE,
     MAX_HBOND_DISTANCE,
     MAX_SALT_BRIDGE_DISTANCE,
@@ -72,14 +59,12 @@ from utils.chemistry import (
     MIN_HBOND_ANGLE,
     NEGATIVE_ATOMS,
     NEGATIVE_CHARGED_RESIDUES,
-    normalize_hydropathy,
     NTERM_PKA,
     PCF_CLUSTER_BIN_STARTS_DEFAULT,
     PCF_CLUSTER_BIN_WIDTHS_DEFAULT,
     PCF_CLUSTER_N_PERMUTATIONS_DEFAULT,
     POSITIVE_ATOMS,
     POSITIVE_CHARGED_RESIDUES,
-    SCM_MAIN_CHAIN_ATOMS,
     SURFACE_EXPOSED_THRESHOLD_DEFAULT,
     THREE_TO_ONE,
     get_standard_residue_pka,
@@ -87,14 +72,16 @@ from utils.chemistry import (
 
 logger = logging.getLogger(__name__)
 
-_HBOND_PAIRS_CACHE: Dict[Tuple[str, float, float, int], List[Tuple[Atom, Atom]]] = {}
+_HBOND_PAIRS_CACHE: Dict[
+    Tuple[str, float, float, int, Optional[Tuple[str, ...]]],
+    List[Tuple[Atom, Atom]],
+] = {}
 
 _RESIDUE_LOCAL_PLANARITY_CACHE: Dict[
     Tuple[int, ResKey4, float, int, bool],
     Optional[float],
 ] = {}
 _PLANARITY_ATOMS_REFS: Dict[int, int] = {}
-_PDB_SEQUENCE_CACHE: Dict[str, Dict[str, List[str]]] = {}
 
 _IONIZABLE_ATOM_NAMES_BY_RES: Dict[str, Set[str]] = {}
 for _atom_name, _res_name in POSITIVE_ATOMS | NEGATIVE_ATOMS:
@@ -141,7 +128,7 @@ def asymmetry_score_from_pka(
     light_chain: str,
     pH: float = 7.5,
 ) -> Optional[float]:
-    """Product of PropKa net charges on heavy and light chains at ``pH``."""
+    """Heavy × light net charge at pH (from PropKa)."""
     if not pka_data:
         return None
     pka_heavy = {k: v for k, v in pka_data.items() if k[2] == heavy_chain}
@@ -176,13 +163,7 @@ def compute_dipole_moment_magnitude(
     *,
     debug_charge_stats: Optional[Dict[str, int]] = None,
 ) -> Optional[float]:
-    """
-    Dipole moment magnitude ‖μ‖ in e·Å.
-
-    Uses Amber ff19SB atom partial charges from amino19.lib; pH and pKa data are
-    not used. Missing (residue, atom) pairs use charge 0.0.
-    Reference point: geometric centroid of all atoms (uniform weight).
-    """
+    """‖μ‖ in e·Å from ff19SB charges; origin at atom centroid. No pH/pKa. Missing charges → 0."""
 
     if not pdb_atoms:
         return 0.0
@@ -246,42 +227,15 @@ def residue_neighbor_score(
     weight_center_by_sasa: bool = False,
     reduce: str = "neg_abs",
 ) -> Optional[float]:
-    """Generic SASA-weighted residue-pair score using min heavy-atom distance.
+    """SASA-weighted neighbor sum within d_cutoff (min heavy-atom distance).
 
-    For each residue i (center), accumulate contributions from all residues j
-    (sources) whose heavy atoms lie within d_cutoff of any heavy atom of i.
-    Then apply a per-center multiplier and aggregate.
+    Each center i collects weighted contributions from residues j in range, applies
+    center_weight (optionally × sasa(i)), then aggregates via reduce.
 
-    SASA values are total_side_rel (relative side-chain SASA.
-    Distance is the minimum heavy-atom distance.
-
-    Parameters
-    ----------
-    source : charge | hydrophobicity | charge_pos | charge_neg | sasa_weighted_count
-        Property that each source residue j contributes (before optional SASA
-        weighting).  "charge" uses the pH-dependent fractional charge;
-        hydrophobicity uses the Kyte–Doolittle scale; charge_pos /
-        charge_neg use only the positive / negative part of the charge;
-        sasa_weighted_count sets the property to 1 (SASA-weighted neighbor count).
-    sasa_weight_sources : bool
-        If True, source contribution = property(j) × sasa(j); all residues
-        are valid sources.
-        If False, source contribution = property(j) with no SASA multiplier;
-        only exposed residues (sasa > sasa_cutoff) are valid sources.
-    ionizable_only : bool
-        Restrict both centers and sources to residues that contain at least one
-        ionizable atom.
-    center_weight : sasa | hydrophobicity | charge |
-                    charge_pos | charge_neg | none
-        Multiplier applied to each center's accumulated sum before aggregation.
-    weight_center_by_sasa : bool
-        If True, additionally multiply the center weight by sasa(i), so
-        the effective center multiplier becomes center_weight(i) × sasa(i).
-        Used by SAP to make the aggregation symmetric with the source weighting.
-    reduce : neg_abs | pos_abs | sum
-        neg_abs: |Σ_{i: result_i < 0} result_i|  (SCM anionic clustering).
-        pos_abs: Σ_{i: result_i > 0} result_i    (SCM cationic clustering).
-        sum:     Σ_i result_i                     (SAP-style).
+    source: charge | hydrophobicity | charge_pos | charge_neg | sasa_weighted_count
+    sasa_weight_sources: weight j by sasa(j), or only count exposed j when False
+    center_weight: sasa | hydrophobicity | charge | charge_pos | charge_neg | none
+    reduce: neg_abs (|sum of negatives|, SCM anionic) | pos_abs | sum (SAP)
     """
     if not pdb_atoms or not sasa_data:
         return None
@@ -402,9 +356,12 @@ def scm_score_from_pka(
     d_cutoff: float = 10.0,
     sasa_cutoff: float = EXPOSURE_REL_ASA_THRESHOLD,
     reduce: str = "neg_abs",
+    allowed_chains: Optional[Iterable[str]] = None,
 ) -> Optional[float]:
 
-    ctx = _get_structure_context(pdb_path, sasa_path=sasa_path)
+    ctx = _get_structure_context(
+        pdb_path, sasa_path=sasa_path, allowed_chains=allowed_chains
+    )
     atoms = ctx.atoms
     if not atoms:
         return None
@@ -433,10 +390,10 @@ def scm_score_from_pka(
 def scm_score_by_atoms(
     pdb_path: str,
     d_cutoff: float = 10.0,
+    allowed_chains: Optional[Iterable[str]] = None,
 ) -> Optional[Dict[str, float]]:
-    """Atom-level SCM using ff19SB atom partial charges.
-    """
-    atoms = _get_atoms_for_path(pdb_path)
+    """SCM from ff19SB charges in a d_cutoff shell around each atom."""
+    atoms = _get_atoms_for_path(pdb_path, allowed_chains=allowed_chains)
     if not atoms:
         return None
 
@@ -444,10 +401,10 @@ def scm_score_by_atoms(
         coords = np.array([(a.x, a.y, a.z) for a in atoms], dtype=np.float64)
         charges = np.array(
             [
-                get_ff19sb_atom_charge(
+                get_ff19sb_atom_charge_with_source(
                     (a.residue_name or "").strip().upper(),
                     a.name or "",
-                )
+                )[0]
                 for a in atoms
             ],
             dtype=np.float64,
@@ -484,20 +441,10 @@ def compute_sap_shell_synergy_scores(
     pH: float,
     d_cutoff: float = 10.0,
 ) -> Dict[str, float]:
-    """
-    Structure-level SAP metrics using min heavy-atom neighborhood and
-    total_side_rel SASA weights.
+    """SAP-style surface metrics: aromatic/histidine exposure and charge–aromatic synergy.
 
-    For each residue i, accumulates SASA-weighted contributions of neighbors j
-    into channel-specific environment sums (pos_env, neg_env, aro_env, his_env),
-    then scores = Σ_i sasa(i) × f(env_i).
-
-    Active outputs:
-      sap_aromatic_score  : surface aromatic environment exposure.
-      sap_histidine_score : surface histidine environment (pH-sensitive).
-      sap_pos_aro_synergy : cation–π co-clustering (pos charge × aro env).
-      sap_aro_neg_contrast: aromatic–anionic co-clustering (always ≤ 0;
-                            more negative = more co-located).
+    Per residue i, sum SASA-weighted neighbor env (pos, neg, aro, his), then
+    sap_aromatic_score, sap_histidine_score, sap_pos_aro_synergy, sap_aro_neg_contrast.
     """
     out: Dict[str, float] = {
         "sap_aromatic_score": 0.0,
@@ -576,15 +523,10 @@ def average_over_residues(
     residues_for_average: Optional[Union[str, Iterable[ResKey4]]] = None,
     denom_total_residues: int,
 ) -> float:
-    """
-    Average SASA weights over a residue set.
+    """Weighted sum over residues_for_density, divided by a chosen denominator.
 
-    numerator: sum of weights_raw[k] for k in residues_for_density
-               (or all keys in weights_raw if residues_for_density is None).
-    denominator:
-      None: denom_total_residues (total residues in the PDB)
-      no: no division — returns the raw numerator sum
-      iterable: len(set(residues_for_average))
+    residues_for_average: None → total PDB residue count; 'no' → raw sum only;
+    else len(set(...)).
     """
     if not weights_raw:
         return 0.0
@@ -616,11 +558,12 @@ def average_over_residues(
 def compute_residue_density_raw(
     pdb_path: str,
     sasa_path: str,
+    allowed_chains: Optional[Iterable[str]] = None,
 ) -> ResidueDensityRawDict:
-    """
-    compute per-residue raw SASA weight for all residues in the structure
-    """
-    ctx = _get_structure_context(pdb_path, sasa_path=sasa_path)
+    """Relative side-chain SASA weight per residue."""
+    ctx = _get_structure_context(
+        pdb_path, sasa_path=sasa_path, allowed_chains=allowed_chains
+    )
     atoms = ctx.atoms
     if not atoms:
         return {}
@@ -637,29 +580,6 @@ def compute_residue_density_raw(
     return weights
 
 
-def compute_residue_side_abs_density_raw(
-    pdb_path: str,
-    sasa_path: str,
-) -> ResidueDensityRawDict:
-    """
-    Per-residue absolute side-chain SASA, same key space as compute_residue_density_raw.
-    """
-    ctx = _get_structure_context(pdb_path, sasa_path=sasa_path)
-    atoms = ctx.atoms
-    if not atoms:
-        return {}
-    sasa_data = ctx.sasa_residue
-    residue_keys = list(iter_unique_residues(atoms))
-
-    if sasa_path and ("sasa" in getattr(ctx, "parse_errors", {}) or not sasa_data):
-        return {k: float("nan") for k in residue_keys}
-
-    weights: ResidueDensityRawDict = {}
-    for key4 in residue_keys:
-        weights[key4] = float(residue_side_sasa_abs(key4, sasa_data))
-    return weights
-
-
 def calculate_residue_category_density_average(
     pdb_path: str,
     sasa_path: str,
@@ -667,17 +587,17 @@ def calculate_residue_category_density_average(
     residue_category: Optional[Iterable[ResKey4]] = None,
     residues_for_average: Optional[Union[str, Iterable[ResKey4]]] = None,
     density_raw: Optional[ResidueDensityRawDict] = None,
+    allowed_chains: Optional[Iterable[str]] = None,
 ) -> float:
-    """
-    SASA-weighted density average for a residue category.
+    """Mean SASA-weighted density for residue_category.
 
-    residue_category: keys to sum in the numerator (all if None).
-    residues_for_average: denominator — None for total PDB residue count,
-    "no" for undivided sum, or an iterable of keys for len(set(...)).
-    density_raw: pre-computed per-residue SASA weights (optional, re-computed if None).
+    residue_category: keys in the numerator (all if None).
+    residues_for_average: denominator — see average_over_residues.
     """
     if density_raw is None:
-        density_raw = compute_residue_density_raw(pdb_path, sasa_path)
+        density_raw = compute_residue_density_raw(
+            pdb_path, sasa_path, allowed_chains=allowed_chains
+        )
     if not density_raw:
         return 0.0
 
@@ -685,7 +605,7 @@ def calculate_residue_category_density_average(
         weights_raw=density_raw,
         residues_for_density=residue_category,
         residues_for_average=residues_for_average,
-        denom_total_residues=_count_residues_in_pdb(pdb_path),
+        denom_total_residues=_count_residues_in_pdb(pdb_path, allowed_chains=allowed_chains),
     )
 
 def _find_salt_bridge_contacts(
@@ -756,16 +676,18 @@ def detect_salt_bridges(
     sasa_path: str,
     pka_path: Optional[str] = None,
     pH: float = 7.5,
+    allowed_chains: Optional[Iterable[str]] = None,
 ) -> Dict[Tuple[Tuple[str, int, str, str], Tuple[str, int, str, str]], Tuple[float, float]]:
-    """
-    a salt bridge is formed when any charged atom from a positively charged residue
-    is within MAX_SALT_BRIDGE_DISTANCE of any charged atom from
-    a negatively charged residue, according to pKa
+    """Salt bridges from charged atom pairs within MAX_SALT_BRIDGE_DISTANCE at pH.
 
-    each residue pair counts as only one salt bridge, regardless of how many
-    atom-atom contacts exist between them
+    One bridge per residue pair; SASA weights returned for pos and neg keys.
     """
-    ctx = StructureContext(pdb_path, sasa_path=sasa_path, pka_path=pka_path)
+    ctx = StructureContext(
+        pdb_path,
+        sasa_path=sasa_path,
+        pka_path=pka_path,
+        allowed_chains=allowed_chains,
+    )
     atoms = ctx.atoms
     if not atoms:
         return {}
@@ -804,10 +726,13 @@ def calculate_salt_bridge_density_average(
     residues_for_density: Optional[Iterable[Tuple[str, int, str, str]]] = None,
     residues_for_average: Optional[Union[str, Iterable[Tuple[str, int, str, str]]]] = None,
     salt_bridges: Optional[_SaltBridgesDict] = None,
+    allowed_chains: Optional[Iterable[str]] = None,
 ) -> float:
-    """SASA-weighted salt-bridge density averaged over a residue set"""
+    """Average SASA-weighted salt-bridge density over a residue set."""
     if salt_bridges is None:
-        salt_bridges = detect_salt_bridges(pdb_path, sasa_path, pka_path, pH)
+        salt_bridges = detect_salt_bridges(
+            pdb_path, sasa_path, pka_path, pH, allowed_chains=allowed_chains
+        )
     if not salt_bridges:
         return 0.0
 
@@ -820,20 +745,17 @@ def calculate_salt_bridge_density_average(
         weights_raw=dict(residue_weights_raw),
         residues_for_density=residues_for_density,
         residues_for_average=residues_for_average,
-        denom_total_residues=_count_residues_in_pdb(pdb_path),
+        denom_total_residues=_count_residues_in_pdb(pdb_path, allowed_chains=allowed_chains),
     )
 
 
 def get_full_sequence_with_index_map_from_pdb(
-    pdb_path: str, chain_order: Optional[List[str]] = None
+    pdb_path: str,
+    chain_order: Optional[List[str]] = None,
+    allowed_chains: Optional[Iterable[str]] = None,
 ) -> Tuple[str, Dict[Tuple[str, int, str, str], int]]:
-    """
-    concatenate the full sequence string together with a mapping from
-    4-tuple residue keys (res_name, res_num, chain, insertion_code) to
-    0-based indices in that sequence
-    """
-    abs_path = os.path.abspath(pdb_path)
-    atoms = _get_atoms_for_path(pdb_path)
+    """Concatenated sequence plus 0-based index for each (res, num, chain, icode) key."""
+    atoms = _get_atoms_for_path(pdb_path, allowed_chains=allowed_chains)
     if not atoms:
         return "", {}
 
@@ -905,7 +827,9 @@ def compute_residue_DBSCAN_cluster_labels(
 
     for key, xyz in ca_by_res.items():
         res_name = key[0]
-        group = _residue_category_group(res_name, pka_data.get(key), pH, use_fallback_pka=not bool(pka_data))
+        group = _residue_category_group_surface_pcf(
+            res_name, pka_data.get(key), pH, use_fallback_pka=not bool(pka_data)
+        )
         if group == "negative":
             neg_keys.append(key)
             neg_coords.append(xyz)
@@ -988,9 +912,12 @@ def dbscan_cluster_side_abs_sasa_entropy(
     return float(-np.sum(np.where(p > 0.0, p * np.log(p), 0.0)))
 
 def get_pka_for_key(key: ResKey4, pka_output_data: Dict[ResKey4, float]) -> Optional[float]:
-    return pka_output_data.get(key) or pka_output_data.get(
-        (key[0], key[1], key[2], "")
-    )
+    if key in pka_output_data:
+        return pka_output_data[key]
+    fallback_key = (key[0], key[1], key[2], "")
+    if fallback_key in pka_output_data:
+        return pka_output_data[fallback_key]
+    return None
 
 
 def _pcf_shell_numeric_token(x: float) -> str:
@@ -1033,9 +960,7 @@ def compute_exposed_pair_correlation_cluster_scores(
     n_permutations: int = PCF_CLUSTER_N_PERMUTATIONS_DEFAULT,
     random_seed: int = 0,
 ) -> Dict[str, Optional[float]]:
-    """
-    Pair-correlation clustering scores for surface-exposed Cα atoms
-    """
+    """PCF clustering scores for exposed Cα by charge/hydrophobic class and distance shell."""
     result = _empty_pcf_cluster_scores(bin_starts, bin_widths)
     if not sasa_output_data:
         return result
@@ -1112,17 +1037,7 @@ def compute_exposed_pair_correlation_cluster_scores(
 
 
 def _local_pca_planarity_ratio(neighbor_coords: np.ndarray) -> float:
-    """
-    Fraction of total variance along the smallest PCA axis of a 3D point cloud.
-
-    With eigenvalues ``λ₁ ≥ λ₂ ≥ λ₃`` of the (3×3) covariance of centered points,
-    returns ``λ₃ / (λ₁ + λ₂ + λ₃)`` — near 0 for a flat patch, larger when the
-    cloud has substantial thickness along the normal direction.
-
-    ``neighbor_coords`` must be shape ``(N, 3)``. Uses population covariance
-    ``(1/N) XᵀX`` after centering. Non-finite coordinates should be filtered
-    by the caller.
-    """
+    """Smallest PCA eigenvalue / sum — low means locally flat."""
     pts = np.asarray(neighbor_coords, dtype=np.float64)
     if pts.ndim != 2 or pts.shape[1] != 3:
         return 0.0
@@ -1137,7 +1052,7 @@ def _local_pca_planarity_ratio(neighbor_coords: np.ndarray) -> float:
     total = float(np.sum(vals))
     if total <= 1e-18:
         return 0.0
-    # eigh returns ascending order → smallest eigenvalue is index 0 (λ₃).
+    # eigh: ascending eigenvalues; index 0 is the smallest.
     return float(vals[0] / total)
 
 
@@ -1149,17 +1064,9 @@ def residue_mean_local_planarity(
     min_neighbors: int = 4,
     exclude_hydrogens: bool = True,
 ) -> Optional[float]:
-    """
-    Mean local surface planarity over heavy atoms of one residue.
+    """Mean local planarity over heavy atoms of one residue (λ_min / trace in r Å shell).
 
-    For each qualifying atom in ``residue_key``, take all structure atoms within
-    ``neighborhood_radius`` Å (optionally excluding hydrogens), build the 3×3
-    covariance of their positions, and compute ``λ₃ / (λ₁ + λ₂ + λ₃)`` from the
-    eigenvalues (smallest over sum). Average these ratios over all atoms that
-    have at least ``min_neighbors`` points in their neighborhood.
-
-    Returns ``None`` if the residue is missing, has no heavy atoms (when
-    excluding H), or no atom yields a neighborhood large enough to score.
+    None if the residue has no scorable atoms (too few neighbors within radius).
     """
     if neighborhood_radius <= 0.0 or min_neighbors < 1:
         return None
@@ -1272,7 +1179,7 @@ def mean_residue_planarity_over_residues(
     min_neighbors: int = 4,
     exclude_hydrogens: bool = True,
 ) -> float:
-    """Mean per-residue local planarity over ``residue_keys``."""
+    """Mean local planarity over the given residues."""
     keys = list(residue_keys)
     if not keys:
         return 0.0
@@ -1286,7 +1193,7 @@ def mean_residue_planarity_over_residues(
 
 
 def compute_inter_chain_buried_sasa(complex_sasa_path: str) -> Optional[float]:
-    """Inter-chain buried SASA = (H_total + L_total) - complex_total. Uses cached SASA totals from parsers."""
+    """Buried interface SASA: H_total + L_total − complex_total."""
     from pathlib import Path
     path = Path(complex_sasa_path)
     if not path.exists():
@@ -1305,15 +1212,19 @@ def compute_inter_chain_buried_sasa(complex_sasa_path: str) -> Optional[float]:
         return None
     return h_total + l_total - complex_total
 
-def _enumerate_hbonds(pdb_path: str) -> List[Tuple[Atom, Atom]]:
+def _enumerate_hbonds(
+    pdb_path: str,
+    allowed_chains: Optional[Iterable[str]] = None,
+) -> List[Tuple[Atom, Atom]]:
 
     abs_path = os.path.abspath(pdb_path)
-    cache_key = (abs_path, MAX_HBOND_DISTANCE, MIN_HBOND_ANGLE, MIN_BACKBONE_SEPARATION)
+    chains_key = tuple(sorted(allowed_chains)) if allowed_chains is not None else None
+    cache_key = (abs_path, MAX_HBOND_DISTANCE, MIN_HBOND_ANGLE, MIN_BACKBONE_SEPARATION, chains_key)
     cached = _HBOND_PAIRS_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
-    atoms = _get_atoms_for_path(pdb_path)
+    atoms = _get_atoms_for_path(pdb_path, allowed_chains=allowed_chains)
     residue_cache_key = _residue_keys_cache_key(atoms)
     seq_index = _get_residue_seq_index(atoms)
     atom_lookup = _ATOM_LOOKUP_CACHE.get(residue_cache_key)
@@ -1339,7 +1250,7 @@ def _enumerate_hbonds(pdb_path: str) -> List[Tuple[Atom, Atom]]:
             donors.append(atom)
             donor_coords_list.append((atom.x, atom.y, atom.z))
             donor_res_keys.append(residue_key_from_atom(atom))
-            donor_is_backbone.append(is_backbone_atom(atom.name))
+            donor_is_backbone.append(atom.name in BACKBONE_ATOMS)
             donor_max_list.append(donor_max_hbonds(atom))
         if is_acceptor(atom):
             acceptors.append(atom)
@@ -1427,7 +1338,7 @@ def _enumerate_hbonds(pdb_path: str) -> List[Tuple[Atom, Atom]]:
             acceptor_res_key = acceptor_keys[idx]
             if donor_res_key == acceptor_res_key:
                 continue
-            if is_backbone_donor and is_backbone_atom(acceptor.name) and donor.chain == acceptor.chain:
+            if is_backbone_donor and acceptor.name in BACKBONE_ATOMS and donor.chain == acceptor.chain:
                 di = seq_index.get(donor_res_key)
                 ai = seq_index.get(acceptor_res_key)
                 if di is not None and ai is not None:
@@ -1451,7 +1362,7 @@ def _enumerate_hbonds(pdb_path: str) -> List[Tuple[Atom, Atom]]:
         if not np.any(nonzero_mask):
             continue
         dot_products = np.einsum("ij,j->i", da_vecs, base_vec)
-        cos_threshold_sq = 0.25  # (-0.5)**2
+        cos_threshold_sq = 0.25  # cos(angle) <= -0.5
         angle_ok = (
             (dot_products <= 0)
             & (dot_products**2 >= cos_threshold_sq * da_norm_sq * db_norm_sq)
@@ -1514,11 +1425,14 @@ def _aggregate_hbond_pairs_to_raw(
 def compute_hbond_density_raw(
     pdb_path: str,
     sasa_path: str,
+    allowed_chains: Optional[Iterable[str]] = None,
 ) -> _HbondDensityRaw:
-    pairs = _enumerate_hbonds(pdb_path)
+    pairs = _enumerate_hbonds(pdb_path, allowed_chains=allowed_chains)
     if not pairs:
         return {}
-    ctx = _get_structure_context(pdb_path, sasa_path=sasa_path)
+    ctx = _get_structure_context(
+        pdb_path, sasa_path=sasa_path, allowed_chains=allowed_chains
+    )
     sasa_data = ctx.sasa_residue
     weights_raw = _aggregate_hbond_pairs_to_raw(pairs, sasa_data)
     return weights_raw
@@ -1531,9 +1445,12 @@ def calculate_global_hbond_density_average(
     residues_for_density: Optional[Iterable[Tuple[str, int, str, str]]] = None,
     residues_for_average: Optional[Union[str, Iterable[Tuple[str, int, str, str]]]] = None,
     weights_raw: Optional[Dict[Tuple[str, int, str, str], float]] = None,
+    allowed_chains: Optional[Iterable[str]] = None,
 ) -> float:
     if weights_raw is None:
-        weights_raw = compute_hbond_density_raw(pdb_path, sasa_path)
+        weights_raw = compute_hbond_density_raw(
+            pdb_path, sasa_path, allowed_chains=allowed_chains
+        )
     if not weights_raw:
         return 0.0
 
@@ -1541,14 +1458,13 @@ def calculate_global_hbond_density_average(
         weights_raw=weights_raw,
         residues_for_density=residues_for_density,
         residues_for_average=residues_for_average,
-        denom_total_residues=_count_residues_in_pdb(pdb_path),
+        denom_total_residues=_count_residues_in_pdb(pdb_path, allowed_chains=allowed_chains),
     )
 
 
 _DsspHbondEnergyDensityRaw = Dict[Tuple[str, int, str, str], float]
 
-# If DSSP parsing succeeds but essentially no H-bond records align to the structure,
-# treat the descriptor as missing (NaN) rather than a true zero.
+# If almost no DSSP H-bonds line up with the structure, return NaN instead of 0.
 DSSP_HBOND_MIN_ALIGNED_RESIDUE_FRACTION = 0.01
 
 
@@ -1556,9 +1472,15 @@ def compute_dssp_hbond_energy_density_raw(
     pdb_path: str,
     sasa_path: str,
     dssp_path: str,
+    allowed_chains: Optional[Iterable[str]] = None,
 ) -> _DsspHbondEnergyDensityRaw:
 
-    ctx = StructureContext(pdb_path, sasa_path=sasa_path, dssp_path=dssp_path)
+    ctx = StructureContext(
+        pdb_path,
+        sasa_path=sasa_path,
+        dssp_path=dssp_path,
+        allowed_chains=allowed_chains,
+    )
     atoms = ctx.atoms
     sasa_data = ctx.sasa_residue
     dssp_hbonds, dssp_seq_to_pdb = ctx.dssp_hbonds
@@ -1609,10 +1531,11 @@ def calculate_hbond_energy_density_dssp_backbone_only_average(
     residues_for_density: Optional[Iterable[Tuple[str, int, str, str]]] = None,
     residues_for_average: Optional[Union[str, Iterable[Tuple[str, int, str, str]]]] = None,
     dssp_hbond_energy_density_raw: Optional[_DsspHbondEnergyDensityRaw] = None,
+    allowed_chains: Optional[Iterable[str]] = None,
 ) -> float:
     if dssp_hbond_energy_density_raw is None:
         dssp_hbond_energy_density_raw = compute_dssp_hbond_energy_density_raw(
-            pdb_path, sasa_path, dssp_path
+            pdb_path, sasa_path, dssp_path, allowed_chains=allowed_chains
         )
     weights_raw = dssp_hbond_energy_density_raw
     if not weights_raw:
@@ -1635,6 +1558,6 @@ def calculate_hbond_energy_density_dssp_backbone_only_average(
         weights_raw=weights_raw,
         residues_for_density=residues_for_density,
         residues_for_average=residues_for_average,
-        denom_total_residues=_count_residues_in_pdb(pdb_path),
+        denom_total_residues=_count_residues_in_pdb(pdb_path, allowed_chains=allowed_chains),
     )
 

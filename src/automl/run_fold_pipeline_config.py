@@ -1,51 +1,5 @@
 #!/usr/bin/env python3
-"""
-Run feature selection for one outer CV fold, then fit regressors on the train fold
-and predict the test fold using the selected features.
-
-Reads ``meta.json`` plus ``fold_{k}_train.parquet`` / ``fold_{k}_test.parquet`` from
-``prepare_run.py``. Writes one JSON with selection trace, selected feature list, and
-per-eval-model test metrics (``spearman_rho``, ``pearson_r``, and two-sided ``spearman_p``,
-``pearson_p`` from ``scipy.stats`` on test predictions vs. truth; for aggregation).
-GPR additionally writes ``prediction_std`` (per-sample posterior std from ``GaussianProcessRegressor``);
-all other models write ``prediction_std: null``.
-
-From repo root (``developability`` conda env)::
-
-    conda run -n developability python src/automl/run_fold_pipeline_config.py \\
-        --fold-dir runs/exp/target_tm1 --fold 0 \\
-        --selector-name correlation \\
-        --model-to-use elasticnet \\
-        --eval-models all
-
-For correlation-only pipelines, ``--model-to-use`` is still required but ignored for
-selection (use e.g. ``elasticnet``). Evaluation models are controlled by ``--eval-models``.
-
-When folds live under a temp directory, pass ``--result-dir`` so JSON outputs are not
-discarded with the parquets (``prepare_then_parallel.sh`` does this by default).
-
-Phase-1 jobs from ``prepare_run.py`` are 4 tab-separated columns:
-``fold_dir``, ``k``, ``dataset_stem``, ``pipeline_target_col``.
-
-Config-driven batch runs use a **master** TSV (see ``prepare_parallel_from_config.py``) with
-15 columns: through ``correlation_min_abs_rho`` (column 11), ``eval_features_frac`` (column 12),
-``selector_hyperparameters_json`` (column 13; ``{}`` when unused),
-``eval_hyperparameters_json`` (column 14; ``{}`` when unused), and
-``pipeline_track_name`` (column 15; empty string when no tracks are configured).
-Result JSON includes ``target_col`` and ``model_type`` from the selection step (same as ``meta.json`` /
-CLI); ``--pipeline-target-col`` only validates the job line when provided.
-
-At evaluation, ``--eval-features-frac`` overrides ``meta.json`` ``features_frac`` when set; that value
-caps how many columns are used:
-``min(n_selected, max(1, int(features_frac * n_train)))``. Linear / ElasticNet / linear
-SVM / RandomForest: rank by probe fit (|coef_| or importances) using :func:`~automl.utils.make_regressor`
-with sklearn defaults for the probe (only ``random_state`` / ``n_jobs`` set), refit on the top subset.
-Final eval regressors use the same defaults unless ``--eval-hyperparameters`` supplies per-model
-overrides (see ``parse_eval_hyperparameters_mapping`` in ``utils.py``).
-kNN and GPR have no coefficients; ranking uses a one-shot ElasticNet probe the same way,
-then the final model is fit only on that subset. GPR also returns posterior std per test
-sample as ``prediction_std`` in the output JSON (``null`` for all other models).
-"""
+"""One CV fold: feature selection, then optional eval-model fit/predict."""
 
 from __future__ import annotations
 
@@ -70,24 +24,18 @@ from automl.feature_selectors import (
     parse_selector_hyperparameters_mapping,
     run_feature_selection_on_one_fold,
 )
+from automl.pipeline_defaults import DEFAULT_EVAL_MODELS, DEFAULT_RANDOM_STATE
 from automl.utils import fit_regressor, make_regressor, parse_eval_hyperparameters_mapping
 
 _EVAL_MODEL_ORDER = ("linear", "elasticnet", "randomforest", "svm", "knn", "gpr")
 _EVAL_MODEL_SET = frozenset(_EVAL_MODEL_ORDER)
 
+
 def _slug(s: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", s).strip("_") or "cfg"
 
-def _parse_correlation_min_abs_rho(s: str) -> float | None:
-    """Master TSV col 11: ``none`` / empty → no min-|ρ| filter; else float."""
-    t = str(s).strip().lower()
-    if t in ("", "none", "nan", "-", "null"):
-        return None
-    return float(t)
-
 
 def _parse_eval_models(spec: str) -> list[str] | None:
-    """Return ``None`` to skip evaluation; else deduped list preserving a stable order."""
     s = str(spec).strip().lower()
     if s in ("", "none", "skip", "off"):
         return None
@@ -109,6 +57,7 @@ def _parse_eval_models(spec: str) -> list[str] | None:
             out.append(p)
     return out
 
+
 def _json_float(x: float | None) -> float | None:
     if x is None:
         return None
@@ -119,7 +68,6 @@ def _json_float(x: float | None) -> float | None:
 
 
 def _finite_bivariate_variation(y: np.ndarray, yhat: np.ndarray) -> bool:
-    """True only when Spearman/Pearson are defined (avoids scipy ConstantInputWarning / NaNs)."""
     a = np.asarray(y, dtype=np.float64).ravel()
     b = np.asarray(yhat, dtype=np.float64).ravel()
     if a.shape != b.shape or a.size < 2:
@@ -153,15 +101,7 @@ def _pearson_stat_p(y: np.ndarray, yhat: np.ndarray) -> tuple[float | None, floa
     return _json_float(stat), _json_float(pv)
 
 
-def _eval_feature_cap(*, features_frac: float, n_train: int, n_features: int) -> int:
-    """Max features allowed at eval fit: min(n_features, max(1, floor(frac * n_train)))."""
-    raw = int(features_frac * n_train)
-    k = max(1, raw)
-    return min(n_features, k)
-
-
 def _ranking_scores_from_fitted_model(model) -> np.ndarray | None:
-    """Absolute coefficient magnitude or tree importances; shape (n_features,)."""
     if hasattr(model, "coef_") and model.coef_ is not None:
         c = np.asarray(model.coef_, dtype=np.float64)
         if c.ndim == 2:
@@ -183,7 +123,6 @@ def _top_k_column_indices_for_eval(
     random_state: int,
     n_train: int,
 ) -> np.ndarray:
-    """Column indices (into X_tr) to keep; length min(k_max, n_cols)."""
     n_cols = X_tr.shape[1]
     if n_cols <= k_max:
         return np.arange(n_cols, dtype=int)
@@ -229,7 +168,6 @@ def _evaluate_fold_models(
     features_frac: float,
     eval_hp_by_model: dict[str, dict] | None = None,
 ) -> dict[str, dict]:
-    """Fit on train, predict test; cap features at ``features_frac * n_train`` with refit."""
     tcol = str(target_col)
     cols = [c for c in feature_cols if c in train_df.columns and c in test_df.columns]
     if len(cols) == 0:
@@ -251,9 +189,7 @@ def _evaluate_fold_models(
     n_train = int(len(y_tr))
     n_test = int(len(y_te))
     n_feat = len(cols)
-    k_cap = _eval_feature_cap(
-        features_frac=features_frac, n_train=n_train, n_features=n_feat
-    )
+    k_cap = min(n_feat, max(1, int(features_frac * n_train)))
     out: dict[str, dict] = {}
     ev_hp = eval_hp_by_model or {}
 
@@ -383,7 +319,7 @@ def main() -> None:
     )
     p.add_argument(
         "--eval-models",
-        default="all",
+        default=DEFAULT_EVAL_MODELS,
         help=(
             "After selection: fit on train / predict test with each listed model. "
             "Comma- or space-separated: linear, elasticnet, randomforest, svm, knn, gpr; "
@@ -425,13 +361,13 @@ def main() -> None:
         type=float,
         default=None,
         help=(
-            "Minimum CV gain to add a feature in SFS (omit for internal default: 0.01)."
+            "Minimum CV gain to add a feature in SFS (omit for internal default: 0.02)."
         ),
     )
     p.add_argument(
         "--random-state",
         type=int,
-        default=42,
+        default=DEFAULT_RANDOM_STATE,
         help=(
             "RNG seed for selectors and eval models. When meta.json contains random_state "
             "(from prepare_run / YAML), that value is used and this flag is ignored if it differs."
@@ -520,7 +456,6 @@ def main() -> None:
     with open(meta_path) as f:
         meta = json.load(f)
 
-    # Single source of truth for RNG: same value used in prepare_run.cv_shuffled_fold_ilocs.
     cli_rs = int(args.random_state)
     meta_rs = meta.get("random_state")
     if meta_rs is not None:
@@ -565,7 +500,11 @@ def main() -> None:
     candidate_features = [str(c) for c in meta["feature_cols"]]
 
     try:
-        corr_min_rho = _parse_correlation_min_abs_rho(args.correlation_min_abs_rho)
+        rho_t = str(args.correlation_min_abs_rho).strip().lower()
+        if rho_t in ("", "none", "nan", "-", "null"):
+            corr_min_rho = None
+        else:
+            corr_min_rho = float(rho_t)
     except ValueError:
         print(
             f"Invalid --correlation-min-abs-rho: {args.correlation_min_abs_rho!r} "
@@ -577,7 +516,6 @@ def main() -> None:
     train_df = pd.read_parquet(train_pq)
     test_df = pd.read_parquet(test_pq)
 
-    # Cap is vs this fold's train split only (not full dataset N from meta.json).
     n_train = len(train_df)
     selection_max_features = max(1, int(features_frac * n_train))
 

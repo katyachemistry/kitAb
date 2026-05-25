@@ -25,12 +25,10 @@ from developability.descriptors import (
     scm_score_from_pka,
     scm_score_by_atoms,
     compute_sap_shell_synergy_scores,
-    parse_dssp,
     calculate_hbond_energy_density_dssp_backbone_only_average,
     compute_residue_DBSCAN_cluster_labels,
     summarize_dbscan_clusters,
     dbscan_cluster_side_abs_sasa_entropy,
-    _get_atoms_for_path,
     compute_exposed_pair_correlation_cluster_scores,
     compute_dipole_moment_magnitude,
     compute_inter_chain_buried_sasa,
@@ -44,7 +42,7 @@ from utils.chemistry import (
     AROMATIC_RESIDUES,
     EXPOSURE_REL_ASA_THRESHOLD,
     GLN_ASN_RESIDUES,
-    HYDROPHOBIC_RESIDUES,
+    NONPOLAR_RESIDUES,
     KYTE_DOOLITTLE,
     get_ff19sb_residue_region_charges,
 )
@@ -62,12 +60,9 @@ from developability.descriptors import (
     sum_residue_mean_local_planarity,
     mean_residue_planarity_over_residues,
 )
-from utils.parsers import parse_pka, get_pka_file_path, residue_key_from_atom
+from utils.parsers import residue_key_from_atom
 
 NET_CHARGE_PHS = [3, 7.5]
-
-def _to_4(key):
-    return (key[0], key[1], key[2], key[3]) if len(key) == 4 else (key[0], key[1], key[2], "")
 
 def _scalar_or_dict_sum(value: Any) -> Optional[float]:
     if value is None:
@@ -139,7 +134,7 @@ def main():
         '--pka-file',
         type=str,
         default=None,
-        help='Path to pKa file (optional). If provided, salt bridge detection will use pH-dependent charge states. If not provided, will try to auto-detect from PDB path (GINKGO_propka/{basename}_full.pka).'
+        help='Path to pKa file (optional). If omitted, auto-detect tries: sibling propka/ next to the SASA file (pipeline layout), {dataset}_propka/, or developability_descriptors/{dataset}/propka/.'
     )
     
     parser.add_argument(
@@ -187,29 +182,21 @@ def main():
         print(f"Error: SASA file not found: {args.sasa_file}", file=sys.stderr)
         sys.exit(1)
     
-    pdb_atoms = _get_atoms_for_path(args.pdb_file)
-    residue_atom_names_by_key: Dict[ResKey4, Set[str]] = defaultdict(set)
-    for atom in pdb_atoms:
-        residue_atom_names_by_key[residue_key_from_atom(atom)].add(
-            (atom.name or "").strip().upper()
-        )
-    
-    dssp_data = {}
-    if args.dssp_file:
-        if not Path(args.dssp_file).exists():
-            print(f"Warning: DSSP file not found: {args.dssp_file}. Continuing without DSSP data.", file=sys.stderr)
-        else:
-            dssp_data = parse_dssp(args.dssp_file, pdb_atoms)
-            if dssp_data:
-                print(f"Parsed DSSP data for {len(dssp_data)} residues", file=sys.stderr)
-    
+    allowed_chains = [args.heavy_chain, args.light_chain]
+
     try:
-            
         ctx = StructureContext(
             args.pdb_file,
+            allowed_chains=allowed_chains,
             sasa_path=args.sasa_file,
             pka_path=args.pka_file,
         )
+        pdb_atoms = ctx.atoms
+        residue_atom_names_by_key: Dict[ResKey4, Set[str]] = defaultdict(set)
+        for atom in pdb_atoms:
+            residue_atom_names_by_key[residue_key_from_atom(atom)].add(
+                (atom.name or "").strip().upper()
+            )
 
         pka_output_data = ctx.pka_residue
         if pka_output_data:
@@ -235,9 +222,7 @@ def main():
             exposed_flags = get_exposed_residues(ctx.sasa_residue, EXPOSURE_REL_ASA_THRESHOLD)
             exposed_keys = {key for key, is_exposed in exposed_flags.items() if is_exposed}
 
-        # pH-aware positive/negative residue sets (replaces static CHARGE_FRACTION_* sets).
-        # Covers HIS, TYR, CYS in addition to ARG/LYS and ASP/GLU when their
-        # PropKa-derived fractional charge is non-zero at args.pH.
+        # Charged sets from PropKa at args.pH (includes HIS/TYR/CYS when |q| > threshold).
         positive_charged_keys, negative_charged_keys = _get_charged_residues_at_pH(
             pdb_atoms, pka_output_data, args.pH
         )
@@ -274,7 +259,7 @@ def main():
         ) = (0.0,) * 6
 
         def _total_side_rel_weight(k: Tuple[str, int, str, str]) -> float:
-            """Relative side-chain SASA (fraction in [0, 1] from ``parse_sasa``)."""
+            """Relative side-chain SASA fraction [0, 1] from parse_sasa."""
             return float(getattr(ctx.sasa_residue[k], "total_side_rel", 0.0)) or 0.0
 
         kyte_doolittle_sum_all = (
@@ -304,14 +289,20 @@ def main():
         )
 
         hydrophobic_keys = get_residue_keys_by_type(
-            args.pdb_file, HYDROPHOBIC_RESIDUES
+            args.pdb_file, NONPOLAR_RESIDUES, allowed_chains=allowed_chains
         )
         negative_keys = negative_charged_keys
         positive_keys = positive_charged_keys
-        aromatic_keys = get_aromatic_residue_keys(args.pdb_file)
+        aromatic_keys = get_aromatic_residue_keys(
+            args.pdb_file, allowed_chains=allowed_chains
+        )
 
         salt_bridges = detect_salt_bridges(
-            args.pdb_file, args.sasa_file, args.pka_file, pH=args.pH
+            args.pdb_file,
+            args.sasa_file,
+            args.pka_file,
+            pH=args.pH,
+            allowed_chains=allowed_chains,
         )
         number_of_salt_bridges = len(salt_bridges)
 
@@ -323,6 +314,7 @@ def main():
             residues_for_density=cdr_vicinity_keys,
             residues_for_average=cdr_vicinity_keys,
             salt_bridges=salt_bridges,
+            allowed_chains=allowed_chains,
         )
 
         avg_hbond_energy = calculate_hbond_energy_density_dssp_backbone_only_average(
@@ -331,6 +323,7 @@ def main():
             args.dssp_file,
             residues_for_density=None,
             residues_for_average=None,
+            allowed_chains=allowed_chains,
         )
 
         avg_hbond_energy_dssp_weighted = avg_hbond_energy
@@ -383,6 +376,7 @@ def main():
                 args.sasa_file,
                 residue_category=aromatic_cdr_vicinity_keys,
                 residues_for_average="no",
+                allowed_chains=allowed_chains,
             )
             if aromatic_cdr_vicinity_keys
             else 0.0
@@ -394,6 +388,7 @@ def main():
                 args.sasa_file,
                 residue_category=hydrophobic_cdr_vicinity_keys,
                 residues_for_average="no",
+                allowed_chains=allowed_chains,
             )
             if hydrophobic_cdr_vicinity_keys
             else 0.0
@@ -405,6 +400,7 @@ def main():
                 args.sasa_file,
                 residue_category=negative_cdr_vicinity_keys,
                 residues_for_average="no",
+                allowed_chains=allowed_chains,
             )
             if negative_cdr_vicinity_keys
             else 0.0
@@ -415,6 +411,7 @@ def main():
                 args.sasa_file,
                 residue_category=positive_cdr_vicinity_keys,
                 residues_for_average="no",
+                allowed_chains=allowed_chains,
             )
             if positive_cdr_vicinity_keys
             else 0.0
@@ -423,18 +420,18 @@ def main():
         exposed_flags = get_exposed_residues(ctx.sasa_residue, EXPOSURE_REL_ASA_THRESHOLD)
         exposed_keys = {key for key, is_exposed in exposed_flags.items() if is_exposed}
 
-        neg_exposed_cluster_labels, pos_exposed_cluster_labels, hydro_exposed_cluster_labels = compute_residue_DBSCAN_cluster_labels(
+        neg_cluster_labels, pos_cluster_labels, hydro_cluster_labels = compute_residue_DBSCAN_cluster_labels(
             pdb_atoms, pka_output_data, args.pH
         )
 
-        neg_exposed_clusters_total_side_abs_sasa = summarize_dbscan_clusters(
-            neg_exposed_cluster_labels, ctx.sasa_output
+        neg_clusters_total_side_abs_sasa = summarize_dbscan_clusters(
+            neg_cluster_labels, ctx.sasa_output
         )
-        pos_exposed_clusters_total_side_abs_sasa = summarize_dbscan_clusters(
-            pos_exposed_cluster_labels, ctx.sasa_output
+        pos_clusters_total_side_abs_sasa = summarize_dbscan_clusters(
+            pos_cluster_labels, ctx.sasa_output
         )
-        hydro_exposed_clusters_total_side_abs_sasa = summarize_dbscan_clusters(
-            hydro_exposed_cluster_labels, ctx.sasa_output
+        hydro_clusters_total_side_abs_sasa = summarize_dbscan_clusters(
+            hydro_cluster_labels, ctx.sasa_output
         )
 
         pdb_atoms_for_cdr_clustering = [
@@ -460,10 +457,10 @@ def main():
         )
 
         neg_cluster_side_abs_sasa_entropy = dbscan_cluster_side_abs_sasa_entropy(
-            neg_exposed_cluster_labels, ctx.sasa_output
+            neg_cluster_labels, ctx.sasa_output
         )
         pos_cluster_side_abs_sasa_entropy = dbscan_cluster_side_abs_sasa_entropy(
-            pos_exposed_cluster_labels, ctx.sasa_output
+            pos_cluster_labels, ctx.sasa_output
         )
 
         pcf_cluster = compute_exposed_pair_correlation_cluster_scores(
@@ -474,13 +471,16 @@ def main():
             surface_exposed_threshold=EXPOSURE_REL_ASA_THRESHOLD,
         )
 
-        weights_raw = compute_hbond_density_raw(args.pdb_file, args.sasa_file)
+        weights_raw = compute_hbond_density_raw(
+            args.pdb_file, args.sasa_file, allowed_chains=allowed_chains
+        )
         avg_hbond_cdr_vicinity = calculate_global_hbond_density_average(
             args.pdb_file,
             args.sasa_file,
             weights_raw=weights_raw,
             residues_for_density=cdr_vicinity_keys,
             residues_for_average=cdr_vicinity_keys,
+            allowed_chains=allowed_chains,
         )
 
         inter_chain_buried_sasa = compute_inter_chain_buried_sasa(args.sasa_file)
@@ -493,8 +493,17 @@ def main():
             
         weighted_scm_score_by_pH = {}
         for ph in NET_CHARGE_PHS:
-            weighted_scm_score_by_pH[ph] = scm_score_from_pka(args.pdb_file, args.sasa_file, pka_output_data, ph, d_cutoff=10.0)
-        scm_by_atoms = scm_score_by_atoms(args.pdb_file, d_cutoff=10.0) or {}
+            weighted_scm_score_by_pH[ph] = scm_score_from_pka(
+                args.pdb_file,
+                args.sasa_file,
+                pka_output_data,
+                ph,
+                d_cutoff=10.0,
+                allowed_chains=allowed_chains,
+            )
+        scm_by_atoms = scm_score_by_atoms(
+            args.pdb_file, d_cutoff=10.0, allowed_chains=allowed_chains
+        ) or {}
         scm_neg_ff19sb = scm_by_atoms.get("scm_neg_ff19sb")
         scm_pos_ff19sb = scm_by_atoms.get("scm_pos_ff19sb")
 
@@ -514,10 +523,7 @@ def main():
             )
             return float(backbone_q + sidechain_q)
 
-        # FF19SB partial charges assume canonical protonation states as encoded in the
-        # PDB (HID/HIE = neutral HIS, HIP = charged). If the input PDB represents HIS
-        # as neutral (most folding tools default to HID/HIE), this value will differ
-        # from net_charge_by_pH[7.5] for structures with histidines.
+        # ff19SB charges follow PDB protonation (HID/HIE vs HIP); may differ from net_charge_by_pH.
         net_charge_ff19sb = sum(_ff19sb_total_charge_for_residue(k) for k in residue_keys_all)
 
         hyd_asa_total = sum(
@@ -530,7 +536,7 @@ def main():
         )
 
         def _name_side_abs_sum(residue_keys: Set[ResKey4], res_set: Set[str]) -> float:
-            """Sum absolute side-chain SASA for residues whose name is in res_set."""
+            """Sum side-chain abs SASA for residues with name in res_set."""
             return sum(
                 float(getattr(_sasa[k], "total_side_abs", 0.0)) or 0.0
                 for k in residue_keys
@@ -538,7 +544,7 @@ def main():
             )
 
         def _key_side_abs_sum(residue_keys: Set[ResKey4], key_set: Set[ResKey4]) -> float:
-            """Sum absolute side-chain SASA for residues whose key is in key_set."""
+            """Sum side-chain abs SASA for keys in key_set."""
             return sum(
                 float(getattr(_sasa[k], "total_side_abs", 0.0)) or 0.0
                 for k in residue_keys
@@ -546,7 +552,7 @@ def main():
             )
 
         def _side_abs_sum(residue_keys: Set[ResKey4]) -> float:
-            """Sum absolute side-chain SASA for an already-filtered key set."""
+            """Sum side-chain abs SASA over residue_keys."""
             return sum(
                 float(getattr(_sasa[k], "total_side_abs", 0.0)) or 0.0
                 for k in residue_keys
@@ -555,16 +561,16 @@ def main():
 
         all_sasa_keys: Set[ResKey4] = set(_sasa.keys())
         total_side_abs_sums: Dict[str, float] = {
-            # whole-antibody scope
+            # whole antibody
             "aro_exposed_sasa": _name_side_abs_sum(exposed_keys, AROMATIC_RESIDUES),
             "aro_all_sasa":     _name_side_abs_sum(all_sasa_keys, AROMATIC_RESIDUES),
             "neg_exposed_sasa": _key_side_abs_sum(exposed_keys, negative_charged_keys),
             "neg_all_sasa":     _key_side_abs_sum(all_sasa_keys, negative_charged_keys),
             "pos_exposed_sasa": _key_side_abs_sum(exposed_keys, positive_charged_keys),
             "pos_all_sasa":     _key_side_abs_sum(all_sasa_keys, positive_charged_keys),
-            "hyd_exposed_sasa": _name_side_abs_sum(exposed_keys, HYDROPHOBIC_RESIDUES),
-            "hyd_all_sasa":     _name_side_abs_sum(all_sasa_keys, HYDROPHOBIC_RESIDUES),
-            # CDR vicinity scope (exposed ∩ CDR vicinity ∩ category — keys pre-filtered)
+            "hyd_exposed_sasa": _name_side_abs_sum(exposed_keys, NONPOLAR_RESIDUES),
+            "hyd_all_sasa":     _name_side_abs_sum(all_sasa_keys, NONPOLAR_RESIDUES),
+            # CDR vicinity (keys already filtered to exposed ∩ vicinity ∩ category)
             "aro_sasa_cdr":     _side_abs_sum(aromatic_cdr_vicinity_keys),
             "neg_sasa_cdr":     _side_abs_sum(negative_cdr_vicinity_keys),
             "pos_sasa_cdr":     _side_abs_sum(positive_cdr_vicinity_keys),
@@ -577,9 +583,9 @@ def main():
             args.pH,
             d_cutoff=10.0,
         )
-        pos_patch_area = pos_exposed_clusters_total_side_abs_sasa
-        neg_patch_area = neg_exposed_clusters_total_side_abs_sasa
-        hyd_patch_area = hydro_exposed_clusters_total_side_abs_sasa
+        pos_patch_area = pos_clusters_total_side_abs_sasa
+        neg_patch_area = neg_clusters_total_side_abs_sasa
+        hyd_patch_area = hydro_clusters_total_side_abs_sasa
         pos_patch_area_cdr = pos_cdr_vicinity_clusters_total_side_abs_sasa
         neg_patch_area_cdr = neg_cdr_vicinity_clusters_total_side_abs_sasa
         hyd_patch_area_cdr = hydro_cdr_vicinity_clusters_total_side_abs_sasa
@@ -595,19 +601,19 @@ def main():
                     "neg_planarity_cdr": normalized_local_planarity_negative_cdr_vicinity,
                     "pos_planarity_cdr": normalized_local_planarity_positive_cdr_vicinity,
                     "aro_planarity_cdr": normalized_local_planarity_aromatic_cdr_vicinity,
-                    "hyd_planarity_cdr": normalized_local_planarity_hydrophobic_cdr_vicinity,
+                    "nonpolar_planarity_cdr": normalized_local_planarity_hydrophobic_cdr_vicinity,
                     "pos_patch": pos_patch_area,
                     "neg_patch": neg_patch_area,
-                    "hyd_patch": hyd_patch_area,
+                    "nonpolar_patch": hyd_patch_area,
                     "pos_patch_cdr": pos_patch_area_cdr,
                     "neg_patch_cdr": neg_patch_area_cdr,
-                    "hyd_patch_cdr": hyd_patch_area_cdr,
+                    "nonpolar_patch_cdr": hyd_patch_area_cdr,
                     **total_side_abs_sums,
                     "aro_exposure_cdr": sum_aromatic_weighted_rel_side_asa_cdr_vicinity,
-                    "hyd_exposure_cdr": sum_hydrophobic_weighted_rel_side_asa_cdr_vicinity,
+                    "nonpolar_exposure_cdr": sum_hydrophobic_weighted_rel_side_asa_cdr_vicinity,
                     "neg_exposure_cdr": sum_negative_weighted_rel_side_asa_cdr_vicinity,
                     "pos_exposure_cdr": sum_positive_weighted_rel_side_asa_cdr_vicinity,
-                    "exposure_weighted_hyd_score_cdr": avg_kd_times_total_side_rel_cdr_vicinity_over_cdr_vicinity,
+                    "exposure_weighted_nonpolar_score_cdr": avg_kd_times_total_side_rel_cdr_vicinity_over_cdr_vicinity,
                     "exposure_weighted_salt_bridge_score_cdr": avg_salt_cdr_vicinity_over_cdr_vicinity,
                     "hbond_density_cdr": avg_hbond_cdr_vicinity,
                     "weighted_scm": weighted_scm_score_by_pH,
@@ -628,7 +634,7 @@ def main():
                     "charge_symmetry": asymmetry_score,
                     "hyd_score": kyte_doolittle_sum_all,
                     "number_of_salt_bridges": number_of_salt_bridges,
-                    "hyd_asa_total": hyd_asa_total,
+                    "nonpolar_asa_total": hyd_asa_total,
                     "polar_asa_total": hph_asa_total,
                     "fraction_gly_in_cdr": fraction_gly_in_cdr,
                     "fraction_pro_in_cdr": fraction_pro_in_cdr,
@@ -643,7 +649,11 @@ def main():
         chain_order = [args.heavy_chain, args.light_chain]
         chain_seqs_and_maps: List[Tuple[str, str, Dict[Tuple[str, int, str, str], int]]] = []
         for ch in chain_order:
-            seq_ch, map_ch = get_full_sequence_with_index_map_from_pdb(args.pdb_file, chain_order=[ch])
+            seq_ch, map_ch = get_full_sequence_with_index_map_from_pdb(
+                args.pdb_file,
+                chain_order=[ch],
+                allowed_chains=allowed_chains,
+            )
             if seq_ch:
                 chain_seqs_and_maps.append((ch, seq_ch, map_ch))
 
@@ -653,10 +663,7 @@ def main():
                 def _contiguous_fragments_for_keyset_per_chain(
                     key_set,
                 ) -> Dict[str, List[str]]:
-                    """
-                    Return per-chain contiguous fragments (1-letter strings) for residues in key_set.
-                    Fragment boundaries follow gaps in original chain indices.
-                    """
+                    """Per-chain 1-letter fragments for key_set; split on index gaps."""
                     if not key_set:
                         return {}
                     out: Dict[str, List[str]] = {}

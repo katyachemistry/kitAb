@@ -1,0 +1,36 @@
+# Version only src/ (pipeline code). Everything else at repo root stays local:
+# data/, runs/, structures/, analysis/, may_be_useful/, descriptors_*, etc.
+
+/*
+!.gitignore
+
+!/src/
+!/src/**
+
+!datasets/**
+!datasets/
+!configs/**
+!configs/
+
+# --- Python artifacts (under src/) ---
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/*.egg-info/
+**/.ipynb_checkpoints/
+
+# --- Environments / secrets ---
+**/.env
+**/.env.*
+**/.venv/
+**/venv/
+
+!fastab.sh
+!install.sh
+!environment.yml
+!environment-abb2.yml
+!fastab.env.example
+!README.md

@@ -1,8 +1,6 @@
-"""Structure prediction and post-processing (ABB2/ABB3, IMGT renumber, OpenMM minimize)."""
+"""Structure prediction and post-processing."""
 
 __all__ = [
-    "minimize_structures_batch",
-    "renumber_abb3_imgt",
-    "run_abb2_batch_from_csv",
-    "run_abb3_batch_from_csv",
+    "postprocess_structures",
+    "run_abb_batch_from_csv",
 ]

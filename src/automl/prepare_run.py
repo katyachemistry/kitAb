@@ -1,44 +1,5 @@
 #!/usr/bin/env python3
-"""
-Prepare parallel automl runs: merge developability once, then for each target write
-CV fold train/test parquet files and ``meta.json`` for fold workers.
-
-Loads experimental table, requires no NaNs in ID (targets may be NaN).
-
-**Experimental vs developability features:** The united developability table is loaded
-first; candidate developability feature columns are chosen from its schema (optionally
-restricted by ``--developability-feature-groups``). Experimental columns are chosen from
-the experimental table (``--feature-cols``). Only those columns are inner-merged on ID,
-so the join is never a full Cartesian column explosion. Optional ``--feature-cols`` are
-**in addition to** developability features. Group flags follow JSON top-level namespaces
-from ``calculate_descriptors`` (``surface``, ``core``, ``general``, ``sequence_motives``).
-Omit group flags to use all developability columns. Ignored for Propermab ``.csv``
-(with a warning).
-
-If ``--feature-cols`` is omitted or empty, ML features are **only** the selected
-developability columns.
-Inner-merges developability (JSON folder or propermab CSV), one-hot-encodes
-listed non-numeric features, then per target drops invalid target rows, renames columns
-builds the pipeline table (same column naming as fold workers), and splits with either
-``cv_shuffled_fold_ilocs`` (default) or leave-one-fold-out from ``--split-col`` on the
-experimental table (fold count = number of distinct labels, at least 2).
-
-From repo root (``developability`` conda env)::
-
-    conda run -n developability python src/automl/prepare_run.py data/exp.csv \\
-        --name-col name --target-cols tm1 aggregation \\
-        --feature-cols hc_subtype lc_subtype some_descriptor \\
-        --developability-results path/to/json_or_csv \\
-        --output-dir runs/myexp
-
-Optional ``--jobs-file`` appends one tab-separated line per fold:
-``fold_dir<TAB>k<TAB>dataset_stem<TAB>pipeline_target_col`` for GNU parallel.
-
-For disposable fold parquets, use a temp directory under the repository root (e.g.
-``<repo>/tmp/...``); ``src/prepare_then_parallel.sh`` defaults to ``mktemp`` there.
-
-``src`` is prepended to ``sys.path`` like ``calculate_descriptors.py``.
-"""
+"""Merge developability + experimental data, write CV fold parquets and meta.json per target."""
 
 from __future__ import annotations
 
@@ -55,7 +16,13 @@ _src_dir = Path(__file__).resolve().parent.parent
 if str(_src_dir) not in sys.path:
     sys.path.insert(0, str(_src_dir))
 
+from automl.dataset_validation import (
+    require_no_nans_except_columns,
+    require_no_nans_in_dataframe,
+    validate_experimental_dataset,
+)
 from automl.feature_selectors import cv_shuffled_fold_ilocs, cv_split_col_ilocs
+from automl.pipeline_defaults import DEFAULT_FEATURES_FRAC, DEFAULT_RANDOM_STATE
 from utils.load_results_to_dataframe import load_json_results
 
 
@@ -65,7 +32,6 @@ def drop_invalid_target_rows(
     *,
     max_nan_frac: float = 0.5,
 ) -> pd.DataFrame:
-    """Fail if fraction of NaN in ``target_col`` is ≥ ``max_nan_frac``; else warn and drop NaN rows."""
     if not (0.0 < float(max_nan_frac) <= 1.0):
         raise ValueError("max_nan_frac must be in (0, 1].")
     target_col = str(target_col)
@@ -97,38 +63,6 @@ def drop_invalid_target_rows(
     return df.loc[y.notna()].copy()
 
 
-def require_no_nans_in_dataframe(df: pd.DataFrame, *, context: str) -> None:
-    """Raise if any column in ``df`` contains NaN."""
-    if df.empty:
-        return
-    issues: list[str] = []
-    for c in df.columns:
-        if df[c].isna().any():
-            n_nan = int(df[c].isna().sum())
-            issues.append(f"{str(c)!r} ({n_nan} NaN)")
-    if not issues:
-        return
-    detail = ", ".join(issues[:15])
-    more = f" … and {len(issues) - 15} more column(s)" if len(issues) > 15 else ""
-    raise ValueError(
-        f"{context}: NaN values in {len(issues)} column(s): {detail}{more}"
-    )
-
-
-def require_no_nans_except_columns(
-    df: pd.DataFrame,
-    *,
-    skip_columns: set[str],
-    context: str,
-) -> None:
-    """Raise if any column outside ``skip_columns`` has NaN."""
-    skip = {str(c) for c in skip_columns}
-    sub = df[[c for c in df.columns if str(c) not in skip]]
-    if sub.empty:
-        return
-    require_no_nans_in_dataframe(sub, context=context)
-
-
 def standardize_pipeline_column_names(
     merged_df: pd.DataFrame,
     *,
@@ -136,7 +70,6 @@ def standardize_pipeline_column_names(
     target_col: str,
     feature_cols: list[str],
 ) -> tuple[pd.DataFrame, str, list[str]]:
-    """Rename ID to ``name``, response to ``target_*``, features to ``feature_*``."""
     name_col = str(name_col)
     target_col = str(target_col)
     feats_in = [str(c) for c in feature_cols]
@@ -160,29 +93,14 @@ def standardize_pipeline_column_names(
     return out, new_target, new_feats
 
 
-def _read_table(path: Path) -> pd.DataFrame:
-    path = Path(path)
-    suf = path.suffix.lower()
-    if suf in (".parquet", ".pq"):
-        return pd.read_parquet(path)
-    if suf in (".csv", ".txt") or suf == "":
-        return pd.read_csv(path)
-    raise ValueError(f"Unsupported dataset extension {path.suffix!r}; use .csv or .parquet.")
-
-
-def _name_from_pdb_file_column(series: pd.Series) -> pd.Series:
-    s = series.astype(str).str.replace("\\", "/", regex=False)
-    return s.str.split("/").str[-1].str.split(".").str[0]
-
-
 def load_propermab_features_csv(features_path: Path) -> pd.DataFrame:
     features_path = Path(features_path)
     feat_df = pd.read_csv(features_path)
     feat_df = feat_df.copy()
     if "pdb_file" in feat_df.columns:
-        feat_df["name"] = _name_from_pdb_file_column(feat_df["pdb_file"])
+        s = feat_df["pdb_file"].astype(str).str.replace("\\", "/", regex=False)
+        feat_df["name"] = s.str.split("/").str[-1].str.split(".").str[0]
     elif "name" in feat_df.columns:
-        # Also support generic feature CSVs that already carry merge key ``name``.
         feat_df["name"] = feat_df["name"].astype(str)
     else:
         raise ValueError(
@@ -229,11 +147,6 @@ def _normalize_merge_keys(left: pd.DataFrame, name_col: str, right: pd.DataFrame
 def load_developability_dataframe(
     developability_source: Path,
 ) -> tuple[pd.DataFrame, str]:
-    """
-    Load the united developability table (JSON directory or Propermab CSV).
-
-    Returns ``(df_dev, id_hint)`` where ``df_dev`` has a ``name`` column for merging.
-    """
     src = Path(developability_source)
     if src.is_dir():
         df_dev = load_json_results(src)
@@ -261,10 +174,6 @@ def merge_experimental_with_developability_subset(
     id_hint: str,
     developability_columns: list[str],
 ) -> pd.DataFrame:
-    """
-    Inner-merge experimental rows to developability features using only
-    ``developability_columns`` from the developability frame (plus ``name``).
-    """
     name_col = str(name_col)
     if name_col not in experimental_df.columns:
         raise ValueError(f"name_col {name_col!r} not in experimental dataset columns.")
@@ -324,18 +233,11 @@ def build_pipeline_dataframe(
     return merged_df.loc[:, cols].copy()
 
 
-def _safe_dir_segment(name: str) -> str:
-    s = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(name)).strip("_")
-    return s or "target"
-
-
 def _jobs_file_token(s: str) -> str:
-    """Strip characters that would break tab-separated GNU parallel job lines."""
     return str(s).replace("\t", " ").replace("\n", " ").replace("\r", "")
 
 
 def _subset_columns(df: pd.DataFrame, cols: list[str], *, context: str) -> pd.DataFrame:
-    """Keep only ``cols`` (deduped, order preserved); raise if any column is missing."""
     order = list(dict.fromkeys(cols))
     missing = [c for c in order if c not in df.columns]
     if missing:
@@ -350,7 +252,6 @@ def _validate_experimental_column_roles(
     *,
     split_col: str | None = None,
 ) -> None:
-    """``dict.fromkeys`` subsets would drop duplicates; require disjoint roles."""
     name_col = str(name_col)
     tset = {str(t) for t in targets}
     fset = {str(f) for f in feats}
@@ -383,8 +284,6 @@ def _validate_experimental_column_roles(
             )
 
 
-# Top-level object keys in calculate_descriptors aggregated JSON (after flatten, columns are
-# ``{group}_{...}`` with this separator).
 _KNOWN_DEVELOPABILITY_JSON_GROUPS = frozenset(
     {"surface", "core", "general", "sequence_motives"}
 )
@@ -402,7 +301,6 @@ _DEVELOPABILITY_EXCLUDE_META = frozenset(
 
 
 def _developability_feature_column_candidates(df_dev: pd.DataFrame) -> list[str]:
-    """Column names on the developability table that may be used as ML features (not ``name`` / meta)."""
     out: list[str] = []
     for c in df_dev.columns:
         cs = str(c)
@@ -421,7 +319,6 @@ def _filter_developability_columns_by_groups(
     developability_is_json_dir: bool,
     context: str,
 ) -> list[str]:
-    """Keep columns whose name equals a group or starts with ``group_`` (JSON flatten layout)."""
     gn = [str(g).strip() for g in groups if str(g).strip()]
     if not gn:
         return list(columns)
@@ -464,8 +361,15 @@ def load_merge_and_expand(
     developability_feature_groups: list[str] | None = None,
     split_col: str | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
-    """Read experimental + developability table(s), pick feature columns, merge, one-hot."""
-    exp = _read_table(Path(dataset_path))
+    path = Path(dataset_path)
+    suf = path.suffix.lower()
+    if suf in (".parquet", ".pq"):
+        exp = pd.read_parquet(path)
+    elif suf in (".csv", ".txt") or suf == "":
+        exp = pd.read_csv(path)
+    else:
+        raise ValueError(f"Unsupported dataset extension {path.suffix!r}; use .csv or .parquet.")
+
     name_col = str(name_col)
     feats = [str(c) for c in feature_cols]
     targets = [str(c) for c in target_cols]
@@ -496,6 +400,13 @@ def load_merge_and_expand(
         name_col, targets, feats, split_col=str(split_col) if split_col else None
     )
 
+    validate_experimental_dataset(
+        exp,
+        name_col=name_col,
+        allow_nan_in_columns=targets,
+        context=f"Experimental table {Path(dataset_path)!s}",
+    )
+
     merged_dev: pd.DataFrame | None = None
     merged_id_hint_parts: list[str] = []
     dev_cols_all: list[str] = []
@@ -503,7 +414,6 @@ def load_merge_and_expand(
     used_suffixes: set[str] = set()
 
     def _safe_source_suffix(src: Path) -> str:
-        """Stable suffix used to disambiguate developability columns by source."""
         s = Path(src)
         if s.is_dir():
             raw = s.name
@@ -687,14 +597,12 @@ def write_folds_for_target(
     max_target_nan_frac: float = 0.5,
     split_col: str | None = None,
 ) -> tuple[Path, list[str]]:
-    """Drop target NaNs, build pipeline frame, split, write parquet + meta. Returns (fold_dir, job_lines)."""
     name_col = str(name_col)
     user_target_col = str(user_target_col)
 
     m = drop_invalid_target_rows(
         merged, user_target_col, max_nan_frac=max_target_nan_frac
     )
-    # Other targets may still be NaN per row (multi-target experimental table).
     other_targets = {str(t) for t in all_target_cols if str(t) != user_target_col}
     require_no_nans_except_columns(
         m,
@@ -737,7 +645,8 @@ def write_folds_for_target(
         split_scheme = "shuffled"
         meta_n_splits = int(n_splits)
 
-    fold_root = Path(output_dir) / _safe_dir_segment(pipe_target)
+    target_dir = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(pipe_target)).strip("_") or "target"
+    fold_root = Path(output_dir) / target_dir
     fold_root.mkdir(parents=True, exist_ok=True)
 
     sfs_row_basis = int(pipe_df.shape[0])
@@ -858,12 +767,12 @@ def main() -> None:
     parser.add_argument(
         "--random-state",
         type=int,
-        default=42,
+        default=DEFAULT_RANDOM_STATE,
     )
     parser.add_argument(
         "--features-frac",
         type=float,
-        default=0.1,
+        default=DEFAULT_FEATURES_FRAC,
         dest="features_frac",
         help=(
             "Maximum fraction of row-count basis for how many features selection may keep; "

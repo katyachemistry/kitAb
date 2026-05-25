@@ -1,0 +1,13 @@
+input_csvs_folder: datasets
+split_randomly: ab21.csv,hutchinson2023enhancement_top200tm1_igg.csv,jetha2019homology_RT.csv,pdgf38.csv
+
+result_folder: scenario4
+
+# n_cpu: 4 # number of CPUs to use for descriptors calculation and AutoML, default all available
+
+calculate_descriptors: False
+
+predefined_descriptors:
+  folder: descriptors_reproducibility_finalization
+  allowed_suffixes:
+    - _abb2_4

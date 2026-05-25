@@ -1,0 +1,56 @@
+# FASTAb unified descriptor environment
+# --------------------------------------
+# Covers: developability (calculate_descriptors), utils parsers, and automl under src/
+# (excluding structure prediction ABB2/ABB3 and OpenMM minimization — separate envs later).
+#
+# CLI tools on PATH after activate:
+#   mkdssp   (conda package `dssp`, modern DSSP)
+#   freesasa (conda package `freesasa-c`)
+#   propka3  (conda package `propka`)
+#   mmseqs   (conda package `mmseqs2` from bioconda — sequence clustering for CV folds)
+#
+# Create (mamba recommended):
+#   ./install.sh
+#   mamba activate fastab
+#
+# Verify:
+#   python scripts/compare_dssp_binaries.py
+#   which mkdssp freesasa propka3
+#
+# Versions pinned from the existing `developability` conda env (2026-05).
+# Optional system tools (not in this file): GNU parallel for src/get_descriptors.sh.
+
+name: fastab
+
+channels:
+  - conda-forge
+  - bioconda
+
+channel_priority: strict
+
+dependencies:
+  # --- Python ---
+  - python=3.14.2
+
+  # --- External structure/biophysics CLIs (used by src/get_descriptors.sh) ---
+  - dssp=4.6.1          # provides `mkdssp` (set DSSP_BIN=mkdssp in pipeline)
+  - freesasa-c=2.1.2    # provides `freesasa`
+  - propka=3.5.1        # provides `propka3`
+  - mmseqs2             # provides `mmseqs` (sequence-identity clustering for AutoML CV folds)
+
+  # --- Core scientific Python (developability + automl) ---
+  - numpy=2.4.2
+  - scipy=1.17.1
+  - pandas=3.0.1
+  - scikit-learn=1.8.0
+
+  # --- Automl / batch orchestration (src/automl) ---
+  - pyyaml=6.0.3        # prepare_parallel_from_config.py
+  - pyarrow=23.0.1      # optional parquet fold I/O in prepare_parallel_from_config.py
+
+  # --- Optional plotting (soft imports in aggregate_batch_results.py, automl/utils.py) ---
+  - matplotlib=3.10.8
+
+  # scikit-learn runtime deps (also pulled transitively; explicit for reproducibility)
+  - joblib=1.5.3
+  - threadpoolctl=3.6.0

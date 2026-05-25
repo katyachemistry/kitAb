@@ -1,20 +1,15 @@
-from typing import Dict, List, Tuple, Optional, Iterable
+from typing import Dict, List, Tuple, Optional, Iterable, Iterator
 from dataclasses import dataclass
-import math
 import re
+import shlex
 from pathlib import Path
 import logging
 
 from utils.chemistry import AA_1_TO_3
 
-_RESNUM_PATTERN = re.compile(r"^(\d+)([A-Za-z])?$") # residue number with insertion code (e.g. 111A)
-hbond_pattern = re.compile(r"(-?\d+),\s*(-?\d+\.?\d*)") # hbond pattern from dssp
+_RESNUM_PATTERN = re.compile(r"^(-?\d+)([A-Za-z])?$")
+hbond_pattern = re.compile(r"(-?\d+),\s*(-?\d+\.?\d*)")
 
-# Residues we extract pKa values for from PropKa output.
-#
-# Note: this is intentionally broader than the residue/atom sets used for
-# geometric salt-bridge detection. Charge/pI counting and salt-bridge
-# geometry are handled separately elsewhere in the pipeline.
 CHARGED_RESIDUE_TYPES = frozenset({"ASP", "GLU", "LYS", "ARG", "HIS", "TYR", "CYS", "N+", "C-"})
 
 _PKA_CACHE: Dict[Tuple[str, int], Dict[Tuple[str, int, str, str], float]] = {}
@@ -48,9 +43,6 @@ def _write_per_file_log(source_path: str, message: str) -> None:
         return
 
 def parse_residue_number_field(s: str) -> Optional[Tuple[int, str]]:
-    """
-    "111" -> (111, ""), "111A" -> (111, "A"). Returns None if not parseable.
-    """
     s = (s or "").strip()
     if not s:
         return None
@@ -63,21 +55,19 @@ def parse_residue_number_field(s: str) -> Optional[Tuple[int, str]]:
 
 @dataclass(frozen=True)
 class Atom:
-    """Atom from a PDB file. Frozen so Atom instances can be used as dict keys (e.g. in H-bond counting)."""
-    serial: int 
-    name: str  # CA
-    residue_name: str  # 3-letter
+    serial: int
+    name: str
+    residue_name: str
     chain: str
     residue_number: int
-    insertion_code: str  # PDB column 27; '' when none (e.g. residues 111B, 112A)
+    insertion_code: str
     x: float
     y: float
     z: float
-    element: str  # C
+    element: str
 
 @dataclass
 class SASAEntry:
-    """SASA data for a residue"""
     residue_name: str
     chain: str
     residue_number: int
@@ -93,21 +83,16 @@ class SASAEntry:
 
 @dataclass(frozen=True)
 class SASAParseResult:
-    """Result of parsing a FreeSASA-style SASA file: per-residue entries plus required TOTAL."""
-
     entries: Dict[Tuple[str, int, str, str], SASAEntry]
     total_sasa: float
 
 
 @dataclass(frozen=True)
 class SASARawRecord:
-    """
-    Raw SASA record as parsed from the file.
-    """
     residue_name: str
     chain: str
     residue_number: int
-    insertion_code: str  # '' when not present
+    insertion_code: str
     total_side_abs: str
     total_side_rel: str
     main_chain_abs: str
@@ -119,9 +104,7 @@ class SASARawRecord:
 
 _SASA_RAW_CACHE: Dict[str, List[SASARawRecord]] = {}
 _SASA_CACHE: Dict[str, SASAParseResult] = {}
-_ATOM_SASA_CACHE: Dict[Tuple[str, int], Dict[int, float]] = {}
 
-# format: ATOM  serial  name  alt  res  chain  resnum  x  y  z  occ  temp  element
 def parse_pdb(
     pdb_path: str,
     allowed_chains: Optional[Iterable[str]] = None,
@@ -186,38 +169,67 @@ def parse_pdb(
 
     return atoms
 
-def _split_cif_line(line: str) -> List[str]:
+def _clean_cif_optional(value: str) -> str:
+    value = value.strip()
+    return "" if value in {"", ".", "?"} else value
 
-    values: List[str] = []
-    i = 0
-    n = len(line)
-    while i < n:
-        while i < n and line[i] in " \t":
+
+def _iter_cif_loop_rows(
+    lines: List[str],
+    start_idx: int,
+    n_cols: int,
+) -> Iterator[Tuple[List[str], int]]:
+    i = start_idx
+    pending: List[str] = []
+
+    while i < len(lines):
+        raw = lines[i]
+        stripped = raw.strip()
+
+        if not stripped:
             i += 1
-        if i >= n:
-            break
-        if line[i] in "\"'":
-            quote = line[i]
-            i += 1
-            start = i
-            while i < n and line[i] != quote:
-                if line[i] == "\\":
-                    i += 1
-                i += 1
-            values.append(line[start:i].strip())
-            if i < n:
-                i += 1 
             continue
-        start = i
-        while i < n and line[i] not in " \t":
-            i += 1
-        values.append(line[start:i].strip())
-    return values
+
+        if stripped.startswith("#") or stripped.startswith("_") or stripped == "loop_":
+            if pending:
+                yield pending, i
+            yield [], i
+            return
+
+        try:
+            lexer = shlex.shlex(raw.rstrip("\n"), posix=True)
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            tokens = list(lexer)
+        except ValueError:
+            tokens = []
+
+        i += 1
+        if not tokens:
+            continue
+
+        pending.extend(tokens)
+        while len(pending) >= n_cols:
+            row = pending[:n_cols]
+            pending = pending[n_cols:]
+            yield row, i
+
+    if pending:
+        yield pending, i
 
 
-def parse_cif(cif_path: str, allowed_chains: Optional[Iterable[str]] = None) -> List[Atom]:
-
-    chains = frozenset(allowed_chains) if allowed_chains is not None else ALLOWED_CHAINS
+def parse_cif(
+    cif_path: str,
+    allowed_chains: Optional[Iterable[str]] = None,
+    *,
+    all_chains: bool = False,
+) -> List[Atom]:
+    if all_chains:
+        chain_filter: Optional[frozenset] = None
+    elif allowed_chains is not None:
+        chain_filter = frozenset(allowed_chains)
+    else:
+        chain_filter = ALLOWED_CHAINS
     atoms: List[Atom] = []
 
     try:
@@ -230,16 +242,17 @@ def parse_cif(cif_path: str, allowed_chains: Optional[Iterable[str]] = None) -> 
         logger.warning("Failed to read CIF file %r: %s; returning empty atom list", cif_path, e)
         return atoms
 
-    # find atom_site loop: loop_ followed by _atom_site.* column names, then data
+    # prefer auth_* columns (DSSP/PropKa/SASA use author residue numbering)
     i = 0
     col_indices: Optional[Dict[str, int]] = None
     required = {
-        "group_PDB", "id", "type_symbol", "label_atom_id", "label_alt_id",
+        "group_PDB", "id", "type_symbol", "label_atom_id",
         "label_comp_id", "label_asym_id", "label_seq_id",
         "Cartn_x", "Cartn_y", "Cartn_z",
     }
     n_total = 0
     n_skipped = 0
+    first_model: Optional[str] = None
 
     while i < len(lines):
         line = lines[i]
@@ -268,42 +281,53 @@ def parse_cif(cif_path: str, allowed_chains: Optional[Iterable[str]] = None) -> 
         resnum_col = "auth_seq_id" if "auth_seq_id" in col_indices else "label_seq_id"
         ins_code_col = "pdbx_PDB_ins_code" if "pdbx_PDB_ins_code" in col_indices else None
         atom_name_col = "auth_atom_id" if "auth_atom_id" in col_indices else "label_atom_id"
+        alt_loc_col = "label_alt_id" if "label_alt_id" in col_indices else None
+        model_col = "pdbx_PDB_model_num" if "pdbx_PDB_model_num" in col_indices else None
         max_col_idx = max(col_indices.values())
-        while i < len(lines):
-            data_line = lines[i].rstrip("\n")
-            i += 1
-            if not data_line.strip():
-                continue
-            if data_line.startswith("#") or data_line.startswith("_") or data_line.startswith("loop_"):
-                i -= 1
+        for parts, next_i in _iter_cif_loop_rows(lines, i, len(col_names)):
+            if not parts:
+                i = next_i
                 break
-            parts = _split_cif_line(data_line)
             if len(parts) <= max_col_idx:
+                n_skipped += 1
                 continue
             try:
                 n_total += 1
                 group = parts[col_indices["group_PDB"]].strip()
                 if group != "ATOM":
                     continue
-                serial = int(parts[col_indices["id"]].strip() or "0")
-                element = (parts[col_indices["type_symbol"]].strip() or "") or (parts[col_indices[atom_name_col]].strip()[:1] or "?")
-                name = parts[col_indices[atom_name_col]].strip()
-                alt_loc = (parts[col_indices["label_alt_id"]].strip() or "").replace(".", "")
-                residue_name = parts[col_indices[resname_col]].strip()
-                chain = parts[col_indices[chain_col]].strip()
-                if chain not in chains or residue_name not in STANDARD_AA:
+                if model_col is not None:
+                    model = _clean_cif_optional(parts[col_indices[model_col]])
+                    if model:
+                        if first_model is None:
+                            first_model = model
+                        elif model != first_model:
+                            continue
+                serial_text = _clean_cif_optional(parts[col_indices["id"]])
+                serial = int(serial_text or "0")
+                name = _clean_cif_optional(parts[col_indices[atom_name_col]])
+                element = _clean_cif_optional(parts[col_indices["type_symbol"]]) or (name[:1] or "?")
+                alt_loc = ""
+                if alt_loc_col is not None:
+                    alt_loc = _clean_cif_optional(parts[col_indices[alt_loc_col]])
+                residue_name = _clean_cif_optional(parts[col_indices[resname_col]]).upper()
+                chain = _clean_cif_optional(parts[col_indices[chain_col]])
+                if chain_filter is not None and chain not in chain_filter:
                     continue
-                resnum_str = parts[col_indices[resnum_col]].strip().replace("?", "")
-                if not resnum_str:
+                if residue_name not in STANDARD_AA:
                     continue
-                residue_number = int(resnum_str)
-                insertion_code = ""
+                resnum_str = _clean_cif_optional(parts[col_indices[resnum_col]])
+                parsed_resnum = parse_residue_number_field(resnum_str)
+                if parsed_resnum is None:
+                    continue
+                residue_number, insertion_code = parsed_resnum
                 if ins_code_col and ins_code_col in col_indices:
-                    ins = parts[col_indices[ins_code_col]].strip().replace("?", "").replace(".", "")
-                    insertion_code = ins if ins else ""
-                x = float(parts[col_indices["Cartn_x"]].strip().replace("?", "0"))
-                y = float(parts[col_indices["Cartn_y"]].strip().replace("?", "0"))
-                z = float(parts[col_indices["Cartn_z"]].strip().replace("?", "0"))
+                    ins = _clean_cif_optional(parts[col_indices[ins_code_col]])
+                    if ins:
+                        insertion_code = ins
+                x = float(_clean_cif_optional(parts[col_indices["Cartn_x"]]) or "0")
+                y = float(_clean_cif_optional(parts[col_indices["Cartn_y"]]) or "0")
+                z = float(_clean_cif_optional(parts[col_indices["Cartn_z"]]) or "0")
                 if alt_loc and alt_loc != "A":
                     continue
                 atoms.append(
@@ -323,10 +347,12 @@ def parse_cif(cif_path: str, allowed_chains: Optional[Iterable[str]] = None) -> 
             except (ValueError, IndexError, KeyError):
                 n_skipped += 1
                 continue
-        break  # one atom_site loop per file
+        else:
+            i = len(lines)
+        break
 
     if n_total > 0 and not atoms:
-        logger.warning("Parsed 0 ATOM records from CIF %r (chains=%r)", cif_path, chains)
+        logger.warning("Parsed 0 ATOM records from CIF %r (chain_filter=%r)", cif_path, chain_filter)
     elif n_total > 0 and n_skipped / n_total > 0.1:
         logger.warning(
             "Skipped %d of %d atom_site records while parsing CIF %r",
@@ -343,9 +369,70 @@ def parse_structure(
     allowed_chains: Optional[Iterable[str]] = None,
 ) -> List[Atom]:
 
-    if path.lower().endswith(".cif"):
+    if path.lower().endswith((".cif", ".mmcif")):
         return parse_cif(path, allowed_chains=allowed_chains)
     return parse_pdb(path, allowed_chains=allowed_chains)
+
+
+def _format_atom_pdb_line(serial: int, atom: Atom) -> str:
+    icode = (atom.insertion_code or "").strip()
+    icode_c = icode[0] if icode else " "
+    _stripped = atom.name.strip()
+    name_field = _stripped[:4] if len(_stripped) >= 4 else f" {_stripped:<3}"[:4]
+    resname = atom.residue_name[:3].upper()
+    element = (atom.element or "").strip()[:2] or name_field.strip()[:1]
+    element = f"{element:>2s}"[:2]
+    line = (
+        f"ATOM  {serial:5d} {name_field:4s} {resname:>3} {atom.chain:1s}"
+        f"{atom.residue_number:4d}{icode_c:1s}   {atom.x:8.3f}{atom.y:8.3f}{atom.z:8.3f}"
+        f"  1.00  0.00          {element:>2s}\n"
+    )
+    return line if len(line) >= 80 else line.rstrip("\n").ljust(80) + "\n"
+
+
+def write_structure_pdb(
+    atoms: List[Atom],
+    output_path: str,
+    *,
+    remark: Optional[str] = None,
+) -> None:
+    if not atoms:
+        raise ValueError(f"No atoms to write to {output_path!r}")
+
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    with out.open("w", encoding="utf-8") as handle:
+        if remark:
+            handle.write(f"REMARK   1 {remark}\n")
+        serial = 1
+        prev_chain: Optional[str] = None
+        prev_residue: Optional[Tuple[int, str, str]] = None
+
+        for atom in atoms:
+            residue = (atom.residue_number, atom.insertion_code, atom.residue_name)
+            if prev_chain is not None and atom.chain != prev_chain:
+                assert prev_residue is not None
+                resname, resnum, icode = prev_residue[2], prev_residue[0], prev_residue[1]
+                icode_c = (icode.strip() or " ")[:1]
+                handle.write(
+                    f"TER   {serial:5d}      {resname:>3} {prev_chain:1s}"
+                    f"{resnum:4d}{icode_c:1s}\n"
+                )
+                serial += 1
+            handle.write(_format_atom_pdb_line(serial, atom))
+            serial += 1
+            prev_chain = atom.chain
+            prev_residue = residue
+
+        if prev_chain is not None and prev_residue is not None:
+            resname, resnum, icode = prev_residue[2], prev_residue[0], prev_residue[1]
+            icode_c = (icode.strip() or " ")[:1]
+            handle.write(
+                f"TER   {serial:5d}      {resname:>3} {prev_chain:1s}"
+                f"{resnum:4d}{icode_c:1s}\n"
+            )
+        handle.write("END\n")
 
 
 def residue_key_from_atom(atom: Atom) -> Tuple[str, int, str, str]:
@@ -355,13 +442,6 @@ def residue_key_from_atom(atom: Atom) -> Tuple[str, int, str, str]:
 def ca_xyz_by_residue(
     atoms: List[Atom],
 ) -> Dict[Tuple[str, int, str, str], Tuple[float, float, float]]:
-    """
-    One Cα coordinate per residue for surface clustering (DBSCAN, Ripley, PCF,
-    ANN, WCN).
-
-    The first ``CA`` seen per residue key is kept (alternate conformations: order
-    follows ``atoms``).
-    """
     ca: Dict[Tuple[str, int, str, str], Tuple[float, float, float]] = {}
     for atom in atoms:
         name = (atom.name or "").strip().upper()
@@ -373,7 +453,6 @@ def ca_xyz_by_residue(
     return ca
 
 
-# format: RES resName chain resNum (original residue number, may have letter)
 def load_sasa_raw(sasa_path: str) -> List[SASARawRecord]:
     abs_path = str(Path(sasa_path).resolve())
     cached = _SASA_RAW_CACHE.get(abs_path)
@@ -409,10 +488,6 @@ def load_sasa_raw(sasa_path: str) -> List[SASARawRecord]:
                     if parsed is None:
                         continue
                     residue_number, insertion_code = parsed
-                    # FreeSASA residue format (split parts):
-                    # RES <resName> <chain> <num> <all_abs> <all_rel> <side_abs> <side_rel>
-                    #     <main_abs> <main_rel> <non_polar_abs> <non_polar_rel>
-                    #     <all_polar_abs> <all_polar_rel>
                     total_side_abs = parts[6] if len(parts) > 6 else ""
                     total_side_rel = parts[7] if len(parts) > 7 else ""
                     main_chain_abs = parts[8] if len(parts) > 8 else ""
@@ -441,12 +516,7 @@ def load_sasa_raw(sasa_path: str) -> List[SASARawRecord]:
                     n_skipped += 1
                     continue
     except FileNotFoundError:
-        msg = f"SASA file {sasa_path!r} not found; returning empty records list"
-        logger.info(msg)
-        _write_per_file_log(sasa_path, msg)
-        _SASA_RAW_CACHE[abs_path] = []
-        _SASA_TOTAL_CACHE[abs_path] = None
-        return []
+        raise FileNotFoundError(f"SASA file not found: {sasa_path!r}")
     except Exception as e:
         msg = f"Failed to read SASA file {sasa_path!r}: {e}; returning partial/empty records"
         logger.warning(msg)
@@ -553,80 +623,6 @@ def parse_sasa(sasa_path: str) -> SASAParseResult:
     return result
 
 
-def atom_sasa_path_from_residue_sasa_path(sasa_path: str) -> str:
-    """
-    Companion file path for atom-level SASA generated from the same structure.
-
-    Current pipeline convention:
-      ``foo_full.sasa`` -> ``foo_full_atom_sasa.pdb``
-    """
-    p = Path(sasa_path)
-    name = p.name
-    if name.endswith(".sasa"):
-        return str(p.with_name(name[:-5] + "_atom_sasa.pdb"))
-    return str(p.with_name(name + "_atom_sasa.pdb"))
-
-
-def parse_atom_sasa(
-    atom_sasa_path: str,
-    pdb_atoms: Optional[List[Atom]] = None,
-) -> Dict[int, float]:
-    """
-    Parse FreeSASA ``--format=pdb --depth=atom`` output.
-
-    Only the atom serial and absolute atom SASA are retained, because the original
-    structure already provides coordinates, atom names, residue IDs, and element types.
-    The FreeSASA output stores atom SASA in the PDB temp-factor column.
-    """
-    abs_path = str(Path(atom_sasa_path).resolve())
-    atoms_id = id(pdb_atoms) if pdb_atoms is not None else 0
-    cache_key = (abs_path, atoms_id)
-    cached = _ATOM_SASA_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    allowed_serials: Optional[set[int]] = None
-    if pdb_atoms is not None:
-        allowed_serials = {int(atom.serial) for atom in pdb_atoms}
-
-    atom_sasa: Dict[int, float] = {}
-    n_total = 0
-    n_skipped = 0
-    try:
-        with open(atom_sasa_path, "r") as f:
-            for line in f:
-                if not line.startswith(("ATOM", "HETATM")):
-                    continue
-                n_total += 1
-                try:
-                    serial = int(line[6:11].strip())
-                    if allowed_serials is not None and serial not in allowed_serials:
-                        continue
-                    sasa_abs = float(line[60:66].strip())
-                    atom_sasa[serial] = sasa_abs
-                except (ValueError, IndexError):
-                    n_skipped += 1
-                    continue
-    except FileNotFoundError:
-        raise FileNotFoundError(f"Atom SASA file not found: {atom_sasa_path!r}")
-
-    if n_total > 0 and n_skipped / n_total > 0.1:
-        msg = (
-            f"Skipped {n_skipped} of {n_total} atom SASA records while parsing "
-            f"{atom_sasa_path!r}"
-        )
-        logger.warning(msg)
-        _write_per_file_log(atom_sasa_path, msg)
-
-    _ATOM_SASA_CACHE[cache_key] = atom_sasa
-    return atom_sasa
-
-
-def get_sasa_total(sasa_path: str) -> float:
-    """Total SASA (Å²) from the SASA file ``TOTAL`` line. Uses ``parse_sasa`` cache."""
-    return parse_sasa(sasa_path).total_sasa
-
-
 def parse_pka(
     pka_path: str,
     pdb_atoms: Optional[List[Atom]] = None
@@ -676,11 +672,7 @@ def parse_pka(
                     if len(line) < 15:
                         continue
 
-                    # PropKa output has fixed-width columns, but whitespace
-                    # padding differs between residue types and pKa magnitudes.
-                    # Using split() avoids column-slicing errors like:
-                    #   99.99 -> 9.99 and 11.87 -> 1.87
-                    # which severely distorts titration/charge calculations.
+                    # split() not fixed columns — slicing can truncate pKa values
                     parts = line.split()
                     if len(parts) < 4:
                         continue
@@ -712,8 +704,6 @@ def parse_pka(
 
                     residue_key = (residue_name, residue_number, chain, insertion_code)
 
-                    # Terminus pseudo-residues (N+, C-) have no atom-level key,
-                    # so skip the pdb_residue_set filter for them.
                     if pdb_atoms and residue_name not in ("N+", "C-") and residue_key not in pdb_residue_set:
                         continue
 
@@ -751,22 +741,6 @@ def parse_pka(
     _PKA_CACHE[cache_key] = pka_data
     return pka_data
 
-
-def get_pka_file_path(pdb_path: str) -> Optional[str]:
-    """
-    pdgf38/AB-001.pdb -> pdgf38_propka/AB-001_full.pka
-    """
-    pdb_path_obj = Path(pdb_path)
-    pdb_basename = pdb_path_obj.stem 
-    pdb_dir = pdb_path_obj.parent
-
-    pka_dir = pdb_dir.parent / f"{pdb_dir.name}_propka"
-    pka_path = pka_dir / f"{pdb_basename}_full.pka"
-    
-    if pka_path.exists():
-        return str(pka_path)
-    
-    return None
 
 def load_dssp_lines(dssp_path: str) -> Tuple[List[str], Optional[int]]:
     abs_path = str(Path(dssp_path).resolve())
@@ -822,20 +796,10 @@ def _parse_dssp_hbond_pair(hbond_str: str) -> Optional[Tuple[int, float]]:
         return None
 
 
-def _parse_hbond_energy(hbond_str: str) -> Optional[float]:
-    pair = _parse_dssp_hbond_pair(hbond_str)
-    return pair[1] if pair is not None else None
-
-
 def parse_dssp(
     dssp_path: str,
     pdb_atoms: Optional[List[Atom]] = None,
 ) -> Dict[Tuple[str, int, str, str], Dict[str, Optional[float]]]:
-    """
-    - secondary structure 
-    - donor H-bond energies
-    - acceptor H-bond energies
-    """
     abs_path = str(Path(dssp_path).resolve())
     atoms_id = id(pdb_atoms) if pdb_atoms is not None else 0
     cache_key = (abs_path, atoms_id)
@@ -891,7 +855,6 @@ def parse_dssp(
             if pdb_atoms and residue_key not in pdb_residue_set:
                 continue
 
-            # per-residue map from seq index to key (needed for hbonds)
             dssp_seq_str = line[0:5].strip()
             if dssp_seq_str:
                 try:
@@ -917,7 +880,6 @@ def parse_dssp(
                     nh_o_1_str = f"{matches[0].group(1)},{matches[0].group(2)}"
                     oh_n_1_str = f"{matches[1].group(1)},{matches[1].group(2)}"
 
-                # H-bond offset/energy pairs for this residue (sequential-index-based)
                 hbond_pairs: List[Tuple[int, float]] = []
                 for m in matches:
                     hbond_str = f"{m.group(1)},{m.group(2)}"
@@ -927,10 +889,14 @@ def parse_dssp(
                 if hbond_pairs:
                     hbond_data[residue_key] = hbond_pairs
 
-            nh_o_1_energy = _parse_hbond_energy(nh_o_1_str)
-            oh_n_1_energy = _parse_hbond_energy(oh_n_1_str)
-            nh_o_2_energy = _parse_hbond_energy(nh_o_2_str)
-            oh_n_2_energy = _parse_hbond_energy(oh_n_2_str)
+            _nh_o_1 = _parse_dssp_hbond_pair(nh_o_1_str)
+            nh_o_1_energy = _nh_o_1[1] if _nh_o_1 is not None else None
+            _oh_n_1 = _parse_dssp_hbond_pair(oh_n_1_str)
+            oh_n_1_energy = _oh_n_1[1] if _oh_n_1 is not None else None
+            _nh_o_2 = _parse_dssp_hbond_pair(nh_o_2_str)
+            nh_o_2_energy = _nh_o_2[1] if _nh_o_2 is not None else None
+            _oh_n_2 = _parse_dssp_hbond_pair(oh_n_2_str)
+            oh_n_2_energy = _oh_n_2[1] if _oh_n_2 is not None else None
 
             dssp_data[residue_key] = {
                 "secondary_structure": secondary_structure,
@@ -962,29 +928,7 @@ def parse_dssp_hbonds(
         return hbond_data, dssp_seq_to_pdb
 
     _ = parse_dssp(dssp_path, pdb_atoms)
-    _, hbond_data, dssp_seq_to_pdb = _DSSP_FULL_CACHE.get(cache_key, ({}, {} ,{}))
+    _, hbond_data, dssp_seq_to_pdb = _DSSP_FULL_CACHE.get(
+        cache_key, ({}, {}, {})
+    )
     return hbond_data, dssp_seq_to_pdb
-
-
-def parse_motif_to_3letter(motif: str, aa_map: Optional[Dict[str, str]] = None) -> List[str]:
-
-    if aa_map is None:
-        aa_map = AA_1_TO_3
-
-    parts = [p.strip() for p in motif.split("-") if p.strip()]
-    if not parts:
-        raise ValueError(f"Invalid motif: {motif!r}")
-    result: List[str] = []
-    for p in parts:
-        u = p.upper()
-        if len(u) == 1:
-            three = aa_map.get(u)
-            if three is None:
-                raise ValueError(f"Unknown 1-letter code in motif: {p!r}")
-            result.append(three)
-        elif len(u) == 3:
-            result.append(u)
-        else:
-            raise ValueError(f"Residue in motif must be 1- or 3-letter: {p!r}")
-    return result
-

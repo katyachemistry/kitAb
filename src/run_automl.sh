@@ -1,89 +1,25 @@
 #!/usr/bin/env bash
-# Prepare CV fold parquet files, then fan out fold workers with GNU parallel.
-#
-# Requires: conda env ``developability`` (or set --py), GNU parallel, pyarrow for parquet.
-#
-# Usage (from repo root):
-#   ./src/prepare_then_parallel.sh --config run_config.yaml [EXTRA_ARGS...]
-#     EXTRA_ARGS override YAML (e.g. --parallel-jobs 16, --py ..., --no-preprocessing-skip).
-#     After each dataset's parallel chunk, that dataset's aggregated_*.csv is written; after the
-#     full batch (and optional floating-SFS), aggregation runs again for all datasets (see
-#     batch_manifest.json). Pass --no-aggregate to skip aggregation entirely.
-#   ./src/prepare_then_parallel.sh [OPTIONS] DATASET DEVELOPABILITY TARGETS_CSV FEATURES_CSV [RUN_DIR]
-#     Legacy mode (no --config).
-#
-# Phase 1 (prepare_run.py) can be skipped if RUN_DIR already contains a valid jobs file
-# and fold parquets (reuse cache). Pass --no-preprocessing-skip to always re-run phase 1.
-# With a fresh mktemp RUN_DIR, phase 1 always runs (nothing to reuse).
-#
-# Default RUN_DIR (omit last positional): temporary directory under <repo>/tmp/ (no cache reuse).
-# JSON output default: runs/<dataset_stem>_fold_results (--result-root overrides).
-#
-# TARGETS_CSV / FEATURES_CSV are comma-separated column names (spaces after commas are OK).
-#
-# Example:
-#   ./src/prepare_then_parallel.sh --parallel-jobs 16 \\
-#     --selector-name correlation --model-to-use elasticnet \\
-#     data/pdgf38.csv pdgf38_propermab/features.csv 'target_viscosity' 'hyd_asa,net_charge' \\
-#     runs/pdgf38_cv_prepare
+# CV fold prep + parallel fold workers (GNU parallel). Usage: run_automl.sh --config YAML | legacy args (see --help).
 
 set -euo pipefail
 
-# Log pipeline stage to stderr (stdout stays clean for piping).
 _stage() {
-  echo >&2 "[prepare_then_parallel] $*"
+  echo >&2 "[run_automl] $*"
 }
 
 usage() {
   cat >&2 <<EOF
-Prepare CV folds (prepare_run.py), then run fold workers (feature selection + eval) in parallel.
-
-Usage (YAML):
-  $0 --config PATH/TO/config.yaml [CLI_OVERRIDES...]
-
-  CLI overrides (not set in YAML): e.g. --parallel-jobs N, --py 'conda run -n developability python',
-  --no-preprocessing-skip, --no-aggregate, --no-clean-folds. Optional in YAML root: parallel_jobs, py.
-  YAML: use a top-level pipeline: block for shared features_frac, eval_models, selectors;
-  each datasetN: block lists path, developability_results_path, name_col, target_cols, n_splits,
-  optional split_col (experimental fold column; omit for shuffled CV), etc.
-  After each dataset's parallel chunk, aggregate_batch_results.py runs for that dataset; after
-  the full batch (and optional floating-SFS), it runs again for the whole manifest.
-
-Usage (legacy, no --config):
+Usage:
+  $0 --config PATH/config.yaml [CLI overrides: --parallel-jobs, --py, --no-preprocessing-skip, ...]
   $0 [OPTIONS] DATASET DEVELOPABILITY TARGETS_CSV FEATURES_CSV [RUN_DIR]
 
-  Positional:
-    DATASET, DEVELOPABILITY — experimental CSV and developability JSON dir or propermab CSV
-    TARGETS_CSV, FEATURES_CSV — comma-separated column names (spaces after commas OK)
-    RUN_DIR — optional; default: mktemp under <repo>/tmp/cv_prepare.XXXXXX (use a fixed path to reuse phase 1 cache)
-
-  Options (defaults in parentheses):
-    --name-col NAME             ID column for merge (name)
-    --n-splits N                outer CV splits (5)
-    --random-state N            (42)
-    --features-frac F           max feature count as fraction of row-count basis; stored in meta (0.1)
-    --jobs-file PATH            tab-separated job list (RUN_DIR/parallel_jobs.txt)
-    --parallel-jobs N           GNU parallel job slots (nproc or 4)
-    --py CMD                    Python invocation (conda run -n developability python)
-    --selector-name NAME        single selector: stability or correlation
-    --model-to-use MODEL        selection model: elasticnet|randomforest|svm|knn (elasticnet)
-    --eval-models SPEC          passed to run_fold_pipeline_config (all)
-    --result-root DIR           JSON output dir (runs/<dataset_stem>_fold_results)
-    --no-preprocessing-skip     always run phase 1 (ignore existing fold parquets / jobs file)
-    --no-clean-folds            keep fold parquet files after parallel (default: remove them)
-    -h, --help                  this message
-
-  Jobs file (phase 1): each line is TAB-separated:
-    fold_dir  k  dataset_stem  pipeline_target_col
-  Cache: if --no-preprocessing-skip is not set and JOBS_FILE passes validation, phase 1 is skipped.
-
-Example:
-  $0 --parallel-jobs 16 --selector-name correlation \\
-    data/exp.csv dev/features.csv 'tm1' 'hyd_asa,net_charge' runs/my_prepare
+Legacy options: --name-col, --n-splits, --random-state, --features-frac, --jobs-file,
+  --parallel-jobs, --py, --selector-name (required), --model-to-use, --eval-models,
+  --result-root, --no-preprocessing-skip, --no-clean-folds
+  -h, --help
 EOF
 }
 
-# Trim leading/trailing whitespace (bash parameter expansion).
 _trim() {
   local s="$1"
   s="${s#"${s%%[![:space:]]*}"}"
@@ -91,7 +27,6 @@ _trim() {
   printf '%s' "$s"
 }
 
-# Split "a, b ,c" into bash array TARGET_ARR / FEATURE_ARR names passed as $2
 _csv_to_array() {
   local _csv=$1
   local -n _dest=$2
@@ -106,8 +41,6 @@ _csv_to_array() {
   done
 }
 
-# Return 0 if jobs file exists, has lines, each line is tab-separated with 4 fields
-# (fold_dir, k, dataset_stem, pipeline_target_col), and fold_dir has expected artifacts.
 _phase1_cache_ok() {
   local jf="$1"
   [[ -f "${jf}" ]] || return 1
@@ -129,7 +62,19 @@ _phase1_cache_ok() {
   return 0
 }
 
-# Repo root = parent of src/
+_py_to_array() {
+  local _py_cmd="$1"
+  local -n _out=$2
+  _out=()
+  mapfile -t _out < <(python3 -c 'import shlex,sys
+for part in shlex.split(sys.argv[1]):
+    print(part)' "$_py_cmd")
+  if [[ ${#_out[@]} -eq 0 ]]; then
+    echo "Error: --py command is empty." >&2
+    exit 1
+  fi
+}
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
@@ -141,8 +86,7 @@ if [[ "${1:-}" == "--config" ]]; then
   fi
   CONFIG_FILE="$1"
   shift
-  _stage "Config mode — YAML: ${CONFIG_FILE} (repo: ${REPO_ROOT})"
-  _stage "Running prepare_parallel_from_config.py (phase 1 per dataset, master TSV, GNU parallel, per-dataset then final aggregate); see stderr below."
+  _stage "Config mode: ${CONFIG_FILE}"
   PY="${PY:-conda run -n developability python}"
   run_py_cfg() {
     # shellcheck disable=SC2086
@@ -152,14 +96,13 @@ if [[ "${1:-}" == "--config" ]]; then
   exit $?
 fi
 
-# Defaults (overridden by flags)
 NAME_COL="name"
 N_SPLITS="5"
 RANDOM_STATE="42"
 FEATURES_FRAC="0.1"
 JOBS_FILE=""
 PARALLEL_JOBS=""
-PY="conda run -n developability python"
+PY=""
 SELECTOR_NAME=""
 MODEL_TO_USE="elasticnet"
 EVAL_MODELS="all"
@@ -239,6 +182,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+PY="${PY:-conda run -n developability python}"
+
 if [[ $# -lt 4 ]]; then
   usage
   exit 1
@@ -273,6 +218,10 @@ if [[ -z "${JOBS_FILE}" ]]; then
 fi
 if [[ -z "${PARALLEL_JOBS}" ]]; then
   PARALLEL_JOBS="$(nproc 2>/dev/null || echo 4)"
+fi
+if ! [[ "${PARALLEL_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Error: --parallel-jobs must be a positive integer, got: ${PARALLEL_JOBS}" >&2
+  exit 1
 fi
 if [[ -z "${RESULT_ROOT}" ]]; then
   RESULT_ROOT="${REPO_ROOT}/runs/${_stem}_fold_results"
@@ -336,8 +285,9 @@ _stage "Phase 1 complete — $(wc -l < "${JOBS_FILE}") job line(s) in ${JOBS_FIL
 _stage "(2/3) Phase 2 — fold workers (run_fold_pipeline_config.py via GNU parallel -> ${RESULT_ROOT})"
 
 mkdir -p "${RESULT_ROOT}"
+_py_to_array "${PY}" PY_ARR
 parallel --jobs "${PARALLEL_JOBS}" --line-buffer --colsep $'\t' \
-  ${PY} src/automl/run_fold_pipeline_config.py \
+  "${PY_ARR[@]}" src/automl/run_fold_pipeline_config.py \
     --fold-dir {1} \
     --fold {2} \
     --dataset-stem {3} \

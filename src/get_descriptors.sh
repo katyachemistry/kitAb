@@ -1,30 +1,6 @@
 #!/bin/bash
-# Full developability descriptor pipeline (parallel over PDBs): DSSP -> PropKa -> freesasa -> developability.
-# Usage: ./run_parallel.sh [--output-dir DIR] STRUCTURES_DIR [STRUCTURES_DIR ...] [num_jobs] [options]
-#    or: ./run_parallel.sh [--output-dir DIR] --parent-dir DIR [more --parent-dir DIR ...] [STRUCTURES_DIR ...] [num_jobs] [options]
-#
-# STRUCTURES_DIR    One or more folders containing PDB files (processed in sequence; each folder parallelized internally).
-#                   Relative paths and globs (e.g. structures/*abb3*) resolve from your cwd first; if that finds nothing,
-#                   the script retries under the repository root (parent of src/), so running from src/ still works.
-# --parent-dir DIR  Each immediate subdirectory of DIR that contains at least one *.pdb is treated as a STRUCTURES_DIR
-#                   (non-recursive: only DIR/<name>/). Hidden directories (name starting with .) are skipped.
-# num_jobs          Optional. Default: nproc
-#
-# Output layout (default: under your shell cwd when you launched the script, before cd to repo root):
-#   ./developability_descriptors/${BASE}/{dssp,propka,sasa,results}/
-#   Override the parent of per-dataset folders with --output-dir DIR -> DIR/${BASE}/{dssp,propka,sasa,results}/
-#   dssp/propka/sasa: tool outputs (same filenames as before, e.g. *.dssp, *_full.sasa, *_full.pka).
-#   results/: developability JSON per structure (same as former ${BASE}_results/*.json).
-#
-# Developability-only options (after num_jobs): --pH <value>
-#
-# Examples:
-#   ./run_parallel.sh ./ab21 ./pdgf38 8
-#   ./run_parallel.sh ./garbinski2023 4
-#   ./run_parallel.sh --parent-dir ./structures
-#   ./run_parallel.sh --parent-dir /storage/antibody_data/PairedStructures/FASTAb/structures 16
-#   ./run_parallel.sh --output-dir ./my_descriptor_runs ./ab21
-#   bash src/run_parallel.sh 'structures/*abb3*'   # quoted glob: expand here if shell did not
+# mkdssp, propka, freesasa -> developability (parallel over PDB folders).
+# Usage: get_descriptors.sh [--output-dir DIR] [--parent-dir DIR ...] STRUCTURES_DIR ... [num_jobs] [--pH VALUE]
 
 set -e
 
@@ -34,7 +10,7 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 EXPLICIT_STRUCTURES=()
 PARENT_DIR_INPUTS=()
 NUM_JOBS=""
-PH_VALUE="7.4"
+PH_VALUE="7.5"
 USER_OUTPUT_DESCRIPTOR_ROOT=""
 
 while [[ $# -gt 0 ]]; do
@@ -58,6 +34,11 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --pH)
+            if [[ $# -lt 2 ]]; then
+                echo "Usage: $0 ... [--pH VALUE]" >&2
+                echo "  Error: --pH requires a value." >&2
+                exit 1
+            fi
             PH_VALUE="$2"
             shift 2
             ;;
@@ -131,7 +112,7 @@ done
 
 if [[ ${#STRUCTURES_DIRS[@]} -eq 0 ]]; then
     echo "Usage: $0 [--output-dir DIR] [--parent-dir DIR ...] STRUCTURES_DIR [STRUCTURES_DIR ...] [num_jobs] [options]" >&2
-    echo "  Runs dssp -> propka -> freesasa -> developability for each folder (default: ./developability_descriptors/<basename>/)." >&2
+    echo "  Runs mkdssp -> propka -> freesasa -> developability for each folder (default: ./developability_descriptors/<basename>/)." >&2
     echo "  --output-dir DIR: write per-dataset outputs under DIR/<basename>/ instead of ./developability_descriptors/<basename>/." >&2
     echo "  --parent-dir: run on every immediate subdirectory of DIR that contains at least one .pdb file." >&2
     exit 1
@@ -156,6 +137,10 @@ unset _seen_structure_dirs
 unset _deduped_structure_dirs
 
 NUM_JOBS=${NUM_JOBS:-$(nproc)}
+if ! [[ "$NUM_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: num_jobs must be a positive integer, got: ${NUM_JOBS:-<empty>}" >&2
+    exit 1
+fi
 RUN_INVOCATION_DIR="$(pwd -P 2>/dev/null || pwd)"
 if [[ -n "$USER_OUTPUT_DESCRIPTOR_ROOT" ]]; then
     if [[ "$USER_OUTPUT_DESCRIPTOR_ROOT" == /* ]]; then
@@ -169,14 +154,34 @@ else
     DESCRIPTOR_ROOT="${RUN_INVOCATION_DIR}/developability_descriptors"
 fi
 cd "$PROJECT_ROOT"
-export NUM_JOBS SCRIPT_DIR PROJECT_ROOT RUN_INVOCATION_DIR DESCRIPTOR_ROOT
+export NUM_JOBS SCRIPT_DIR
 export PH_VALUE
+
+pipeline_pdb_paths() {
+    local dir="$1"
+    find "$dir" -name "*.pdb" -type f ! -name "*_H.pdb" ! -name "*_L.pdb" -print0 | while IFS= read -r -d '' pdb; do
+        local stem="${pdb##*/}"
+        stem="${stem%.pdb}"
+        case "$stem" in
+            *_H|*_L) ;;
+            *) printf '%s\0' "$pdb" ;;
+        esac
+    done
+}
+
+count_pipeline_pdbs() {
+    local n=0 _p
+    while IFS= read -r -d '' _p; do
+        n=$((n + 1))
+    done < <(pipeline_pdb_paths "$1")
+    echo "$n"
+}
 
 USE_GNU_PARALLEL=false
 command -v parallel &>/dev/null && USE_GNU_PARALLEL=true
 
-# PropKa conda environment (edit if needed)
 PROPKA_CONDA_ACTIVATE="${PROPKA_CONDA_ACTIVATE:-source /home/kb/miniforge3/bin/activate developability}"
+DSSP_BIN="${DSSP_BIN:-mkdssp}"
 
 RUN_START=$(date +%s)
 TOTAL_STRUCTURES=0
@@ -186,7 +191,7 @@ PIPELINE_ORDER=(dssp propka freesasa developability)
 for STRUCTURES_DIR in "${STRUCTURES_DIRS[@]}"; do
     STRUCTURES_DIR="$(cd "$STRUCTURES_DIR" && pwd)"
     BASE_NAME="$(basename "$STRUCTURES_DIR")"
-    N_PDB=$(find "$STRUCTURES_DIR" -name "*.pdb" -type f | wc -l)
+    N_PDB=$(count_pipeline_pdbs "$STRUCTURES_DIR")
     TOTAL_STRUCTURES=$((TOTAL_STRUCTURES + N_PDB))
 
     DATASET_DESCRIPTOR_DIR="${DESCRIPTOR_ROOT}/${BASE_NAME}"
@@ -213,15 +218,20 @@ for STRUCTURES_DIR in "${STRUCTURES_DIRS[@]}"; do
                         echo "CRYST1    1.000    1.000    1.000  90.00  90.00  90.00 P 1           1          "
                         awk '!/^REMARK/ && !/^CRYST1/' "$pdb_file"
                     } > "$temp_pdb"
-                    if ! dssp "$temp_pdb" "$output_file" &>/dev/null; then
+                    if ! "$DSSP_BIN" "$temp_pdb" "$output_file" &>/dev/null; then
                         echo "✗ $basename (failed)"
+                        rm -f "$output_file"
+                    elif [[ ! -s "$output_file" ]]; then
+                        echo "✗ $basename (no DSSP output)"
+                        rm -f "$output_file"
                     fi
                     rm -f "$temp_pdb"
                 }
                 export -f process_file
-                find "$STRUCTURES_DIR" -name "*.pdb" -type f ! -name "*_H.pdb" ! -name "*_L.pdb" | parallel -j "$NUM_JOBS" process_file {}
+                export DSSP_BIN
+                pipeline_pdb_paths "$STRUCTURES_DIR" | parallel -0 -j "$NUM_JOBS" process_file {}
             else
-                export STRUCTURES_DIR
+                export STRUCTURES_DIR DSSP_BIN
                 python3 << 'DSSP_PY'
 import os
 from pathlib import Path
@@ -231,6 +241,7 @@ import tempfile
 STRUCTURES_DIR = os.environ.get("STRUCTURES_DIR", ".")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
 SCRIPT_DIR = os.environ.get("SCRIPT_DIR", ".")
+DSSP_BIN = os.environ.get("DSSP_BIN", "mkdssp")
 num_jobs = int(os.environ.get("NUM_JOBS", str(cpu_count())))
 
 def process_file(pdb_path):
@@ -247,10 +258,14 @@ def process_file(pdb_path):
                     if not line.startswith('REMARK') and not line.startswith('CRYST1'):
                         tf.write(line)
             path = tf.name
-        r = subprocess.run(["dssp", path, str(output_file)], capture_output=True, text=True, cwd=SCRIPT_DIR)
+        r = subprocess.run([DSSP_BIN, path, str(output_file)], capture_output=True, text=True, cwd=SCRIPT_DIR)
         Path(path).unlink(missing_ok=True)
         if r.returncode != 0:
+            output_file.unlink(missing_ok=True)
             return f"✗ {basename} (failed)"
+        if not output_file.is_file() or output_file.stat().st_size == 0:
+            output_file.unlink(missing_ok=True)
+            return f"✗ {basename} (no DSSP output)"
         return None
     except Exception as e:
         return f"✗ {basename} (error: {str(e)[:50]})"
@@ -272,11 +287,10 @@ DSSP_PY
             SASA_DIR="$SASA_OUTPUT_DIR"
             export SASA_DIR
             if [ "$USE_GNU_PARALLEL" = true ]; then
-                find "$STRUCTURES_DIR" -name "*.pdb" -type f ! -name "*_H.pdb" ! -name "*_L.pdb" | parallel -j "$NUM_JOBS" '
+                pipeline_pdb_paths "$STRUCTURES_DIR" | parallel -0 -j "$NUM_JOBS" '
                     pdbfile={}
                     filename=$(basename "$pdbfile" .pdb)
                     sasa_full="'"$SASA_DIR"'/${filename}_full.sasa"
-                    atom_sasa_full="'"$SASA_DIR"'/${filename}_full_atom_sasa.pdb"
                     sasa_H="'"$SASA_DIR"'/${filename}_H_full.sasa"
                     sasa_L="'"$SASA_DIR"'/${filename}_L_full.sasa"
 
@@ -296,11 +310,6 @@ DSSP_PY
                     if ! freesasa --shrake-rupley --format=rsa --depth=residue "$pdbfile" > "$sasa_full" 2>/dev/null; then
                         echo "✗ $filename (full failed)"
                         rm -f "$sasa_full"
-                    fi
-
-                    if ! freesasa --shrake-rupley --format=pdb --depth=atom --hydrogen "$pdbfile" > "$atom_sasa_full" 2>/dev/null; then
-                        echo "✗ $filename (full atom SASA failed)"
-                        rm -f "$atom_sasa_full"
                     fi
 
                     if grep -q "^ATOM" "$tmp_H"; then
@@ -335,7 +344,6 @@ def process_file(pdb_path):
     pdb_file = Path(pdb_path)
     basename = pdb_file.stem
     sasa_full = Path(SASA_DIR) / f"{basename}_full.sasa"
-    atom_sasa_full = Path(SASA_DIR) / f"{basename}_full_atom_sasa.pdb"
     sasa_H = Path(SASA_DIR) / f"{basename}_H_full.sasa"
     sasa_L = Path(SASA_DIR) / f"{basename}_L_full.sasa"
 
@@ -363,17 +371,12 @@ def process_file(pdb_path):
     )
     if r.returncode != 0:
         errors.append(f"✗ {basename} (full failed)")
+        sasa_full.unlink(missing_ok=True)
     else:
         sasa_full.write_text(r.stdout)
-
-    r = subprocess.run(
-        ["freesasa", "--shrake-rupley", "--format=pdb", "--depth=atom", "--hydrogen", str(pdb_file)],
-        capture_output=True, text=True
-    )
-    if r.returncode != 0:
-        errors.append(f"✗ {basename} (full atom SASA failed)")
-    else:
-        atom_sasa_full.write_text(r.stdout)
+        if sasa_full.stat().st_size == 0:
+            errors.append(f"✗ {basename} (full failed)")
+            sasa_full.unlink(missing_ok=True)
 
     has_H_atoms = any(l.startswith("ATOM") for l in tmp_H_path.read_text().splitlines())
     if has_H_atoms:
@@ -448,7 +451,7 @@ FREESASA_PY
                     rm -f "${basename}_H_chain.pdb" "${basename}_L_chain.pdb"
                 }
                 export -f process_file
-                find "$STRUCTURES_DIR" -name "*.pdb" -type f ! -name "*_H.pdb" ! -name "*_L.pdb" | parallel -j "$NUM_JOBS" process_file {} "$OUTPUT_DIR"
+                pipeline_pdb_paths "$STRUCTURES_DIR" | parallel -0 -j "$NUM_JOBS" process_file {} "$OUTPUT_DIR"
             else
                 export STRUCTURES_DIR
                 python3 << 'PROPKA_PY'
@@ -458,7 +461,6 @@ from multiprocessing import Pool, cpu_count
 import subprocess
 STRUCTURES_DIR = os.environ.get("STRUCTURES_DIR", ".")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
-SCRIPT_DIR = os.environ.get("SCRIPT_DIR", ".")
 num_jobs = int(os.environ.get("NUM_JOBS", str(cpu_count())))
 conda_activate = os.environ.get("PROPKA_CONDA_ACTIVATE", "source /home/kb/miniforge3/bin/activate developability")
 
@@ -513,9 +515,10 @@ for r in results:
         for line in r.split("\n"):
             if line.strip():
                 print(line)
-failed = sum(1 for r in results if r)
-if failed:
-    print(f"Completed: {len(pdb_files)*3 - sum(r and r.count('✗') or 0 for r in results)}/{len(pdb_files)*3} successful")
+propka_runs = len(pdb_files) * 3
+propka_failed = sum(r.count('✗') for r in results if r)
+if propka_failed:
+    print(f"Completed: {propka_runs - propka_failed}/{propka_runs} successful ({propka_failed} failed)")
 PROPKA_PY
             fi
             ;;
@@ -544,14 +547,14 @@ PROPKA_PY
                     [ -f "$pka_file" ] && cmd+=("--pka-file" "$pka_file")
                     cmd+=("--pH" "$PH_VALUE")
                     cmd+=("--output" "$output_file")
-                    if ! output=$(cd "$SCRIPT_DIR" && "${cmd[@]}" 2>&1 >/dev/null); then
+                    if ! output=$(cd "$SCRIPT_DIR" && "${cmd[@]}" 2>&1); then
                         echo "✗ $basename (failed)"
                         printf '%s\n' "$output"
                     fi
                 }
                 export -f process_file
                 export SASA_DIR DSSP_DIR PKA_DIR OUTPUT_DIR PH_VALUE
-                find "$STRUCTURES_DIR" -name "*.pdb" -type f ! -name "*_H.pdb" ! -name "*_L.pdb" | parallel -j "$NUM_JOBS" process_file {}
+                pipeline_pdb_paths "$STRUCTURES_DIR" | parallel -0 -j "$NUM_JOBS" process_file {}
             else
                 python3 << 'DEV_PY'
 import os
@@ -565,7 +568,7 @@ PKA_DIR = os.environ.get("PKA_DIR", ".")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
 SCRIPT_DIR = os.environ.get("SCRIPT_DIR", ".")
 num_jobs = int(os.environ.get('NUM_JOBS', cpu_count()))
-ph_value = os.environ.get('PH_VALUE', '7.4')
+ph_value = os.environ.get('PH_VALUE', '7.5')
 
 def process_file(pdb_path):
     pdb_file = Path(pdb_path)

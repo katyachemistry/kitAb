@@ -1,0 +1,76 @@
+# Shared AutoML / pipeline settings for all run configs.
+# Default path: src/automl.yaml (override with automl_config: in run config or --automl-config).
+
+pipeline:
+  random_state: 42, 100, 0
+  # One value or comma-separated / YAML list, e.g. 0.15,0.10,0.08 or [0.15, 0.10, 0.08]
+  features_frac: 0.15,0.10,0.08,0.06,0.04,0.02
+  eval_models: all
+  # Final eval regressors (optional; omit for sklearn defaults). Use eval_hyperparameters (nested
+  # per model). Pipeline-level hyperparameters: is also accepted if nested by eval model name only.
+  eval_hyperparameters:
+    elasticnet:
+      alpha: 0.01
+    knn:
+      weights: distance
+    gpr:
+      alpha: 0.1
+  # Shared prefilter for every selector (optional; per-selector hyperparameters: override same keys)
+  low_variance_relative_std_threshold: 0.01
+  # low_variance_epsilon: 1e-8
+  intercorr_threshold: 0.9
+  intercorr_importance_metric: pearson
+  intercorr_reduction_mode: pairwise
+  track_linear:
+    # Train-fold Spearman |rho(feature, target)|; elbow on the descending curve; keep
+    # max(min_n_features, elbow_n), capped by intercorr prefilter size. Runs before stability_reduction.
+    correlation_reduction:
+      min_n_features: 25
+    selector1:
+      type: stability
+      model: svm,elasticnet
+      hyperparameters:
+        stability_n_subsamples: fold_train_log10_ns_500
+        stability_sample_fraction: fold_train_log10_const_5
+    selector2:
+      type: correlation
+    selector3:
+      type: rfe
+      model: svm,elasticnet
+      hyperparameters:
+        rfe_step: 1
+    selector4:
+      type: sfs
+      model: svm,elasticnet
+      hyperparameters:
+        sfs_min_improvement: 0.02
+    final_floating_sfs:
+      max_feature_fraction: 0.15
+      model: elasticnet,svm
+  track_nonlinear:
+    stability_reduction:
+      model: randomforest
+      min_n_features: 25 # max(min_n_features, elbow_n)
+      subsample_fraction: fold_train_log10_const_5
+      n_subsamples: fold_train_log10_ns_500
+    selector1:
+      type: stability
+      model: randomforest
+      hyperparameters:
+        stability_n_subsamples: fold_train_log10_ns_500
+        stability_sample_fraction: fold_train_log10_const_5
+    selector2:
+      type: correlation
+    selector3:
+      type: rfe
+      model: randomforest
+      hyperparameters:
+        rfe_step: 1
+    selector4:
+      type: sfs
+      model: randomforest,knn
+      hyperparameters:
+        sfs_min_improvement: 0.02
+    final_floating_sfs:
+      max_feature_fraction: 0.15
+      model: randomforest,knn

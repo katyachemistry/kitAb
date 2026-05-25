@@ -1,71 +1,5 @@
 #!/usr/bin/env python3
-"""
-Aggregate fold-level JSON outputs from ``prepare_parallel_from_config`` / ``parallel``.
-
-For each YAML dataset block (``dataset_yaml_key``), writes one CSV under the batch root
-(default) with columns:
-
-  Track, Target-Selector-Model, Target_col, Dataset_stem, Developability_source,
-  Spearman, Pearson, R2, Prediction_std_mean,
-  Spearman_relative_error_across_folds, Pearson_relative_error_across_folds,
-  R2_relative_error_across_folds,
-  Prediction_std_relative_error_across_folds,
-  Pipeline_time_sum_s (sum of ``pipeline_time_seconds`` over folds for that row),
-  Pipeline_time_std_s (sample std of per-fold ``pipeline_time_seconds``),
-  selected_features_by_fold,
-  then ``fold_<k>_spearman``, ``fold_<k>_pearson``, ``fold_<k>_r2``, and ``fold_<k>_prediction_std_mean``
-  for each fold present in that batch (sorted by fold index; missing folds empty).
-
-``Track`` is ``pipeline_track_name`` from each result JSON (e.g. ``track_linear``; empty when
-no named tracks). It is part of the aggregation key so overlapping selector/model/eval/frac
-cells on different tracks stay distinct rows.
-
-Row labels are ``{target_col}-{selector_name}-{model_type}-{eval_model}-{frac_slug}`` where
-``frac_slug`` encodes ``eval_features_frac`` from each result JSON (e.g. ``0.15`` → ``frac015``)
-and ``eval_model`` is one key from that JSON's ``evaluation`` mapping (``linear``,
-``elasticnet``, …). There is **one row per eval model** per selector/selection-model/frac
-cell (no averaging of eval models). Spearman / Pearson / R2 / prediction_std_mean are that
-eval model's values: mean **across folds** only (R2 from each fold's ``evaluation[model].r2`` in
-the result JSON). **Relative error across folds** is the
-sample coefficient of variation: ``std(fold values) / |mean(fold values)|`` (``None`` if
-fewer than two folds or mean is ~0). ``selected_features_by_fold`` is a **JSON object** mapping
-``fold_<k>`` (1-based fold number, i.e. ``fold_index + 1`` from each result JSON) to a list
-of feature names.
-
-After writing each ``aggregated_*.csv``, writes ``times.csv`` in the output directory (one file
-per run): one row per ``(dataset_yaml_key, Target_col)`` with ``total_pipeline_time_s``, the sum
-of each result JSON’s ``pipeline_time_seconds`` (one contribution per JSON, so eval-model
-duplicate rows in the aggregate CSV do not inflate this total). Per-row ``Pipeline_time_sum_s``
-in the aggregate CSVs is unchanged. With ``--only-dataset-yaml-key``, ``times.csv`` reflects
-only JSONs included in that pass (re-run a full aggregation for batch-wide totals).
-
-Then writes one PNG per YAML **dataset block** under ``<output-dir>/plots/<dataset_key>/``:
-best mean Spearman combo (Spearman per fold only) and best mean Pearson combo (Pearson per fold only).
-
-When a **batch manifest** is provided, also writes combined PNGs under
-``<output-dir>/plots/combined/``: same experimental CSV (``Dataset_stem``) and
-``Target_col``; **all developability sources’ best-Spearman slots first**, then **all
-sources’ best-Pearson slots** (each slot shows only the matching metric). Use ``--no-plots`` to skip.
-
-Usage (repo root, developability env)::
-
-    conda run -n developability python src/automl/aggregate_batch_results.py \\
-        --manifest runs/batch_run_config/batch_manifest.json
-
-If the manifest still points at an old ``batch_result_root`` but JSONs live under a
-renamed directory, pass ``--batch-root`` to the real directory. Absolute paths in
-``parallel_jobs_master.tsv`` that sit under the manifest root are rewritten to sit under
-``--batch-root``; the master TSV read defaults to ``<batch-root>/parallel_jobs_master.tsv``.
-
-    conda run -n developability python src/automl/aggregate_batch_results.py \\
-        --manifest runs/batch_run_config_folded_with_tracks_1/batch_manifest.json \\
-        --batch-root runs/batch_run_config_folded_with_tracks_1
-
-Optional ``--only-dataset-yaml-key`` restricts aggregation to JSONs under that dataset's
-directory under the batch root (same layout as ``prepare_parallel_from_config``). Used for
-incremental CSVs after each dataset's parallel chunk; run again without the flag after the full
-batch (and optional floating-SFS stage) for complete tables and combined plots.
-"""
+"""Aggregate fold-level result JSONs from batch parallel runs into CSVs, times.csv, and plots."""
 
 from __future__ import annotations
 
@@ -79,6 +13,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+from automl.pipeline_defaults import DEFAULT_FEATURES_FRAC
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -121,12 +57,6 @@ def _nanmean(vals: list[float]) -> float | None:
 
 
 def _strict_mean(vals: list[float], n_expected: int) -> float | None:
-    """Mean only when ALL ``n_expected`` folds contributed a finite value.
-
-    Returns ``None`` if any fold is missing or had a non-finite (error/NaN) value,
-    ensuring that rows with partial fold coverage are excluded from best-metric
-    selection.
-    """
     if n_expected <= 0 or len(vals) != n_expected:
         return None
     a = np.asarray(vals, dtype=np.float64)
@@ -136,7 +66,6 @@ def _strict_mean(vals: list[float], n_expected: int) -> float | None:
 
 
 def _sort_fold_key(k: str) -> tuple[int, int | str]:
-    """Sort key for ``fold_1``, ``fold_2``, …, then unknown / non-numeric."""
     if k.startswith("fold_") and k != "fold_unknown":
         suf = k[5:]
         try:
@@ -151,7 +80,6 @@ def _sort_fold_key(k: str) -> tuple[int, int | str]:
 def _fold_eval_lists(
     fm: dict[str, dict],
 ) -> tuple[list[float], list[float], list[float], list[float]]:
-    """Finite fold-level Spearman / Pearson / R2 / uncertainty lists."""
     sp_list: list[float] = []
     pe_list: list[float] = []
     r2_list: list[float] = []
@@ -177,7 +105,6 @@ def _fold_eval_lists(
 
 
 def _optional_float_cell(x: object) -> float | None:
-    """CSV cell for a fold metric; ``None`` if missing or non-finite."""
     if x is None:
         return None
     try:
@@ -188,7 +115,6 @@ def _optional_float_cell(x: object) -> float | None:
 
 
 def _relative_error_across_folds(vals: list[float]) -> float | None:
-    """Sample std of per-fold metrics divided by |mean| (CV); needs ≥2 finite values."""
     if not vals:
         return None
     a = np.asarray(vals, dtype=np.float64)
@@ -206,26 +132,15 @@ def _fold_eval_one_model(
     evaluation: dict | None,
     eval_model: str,
 ) -> tuple[float | None, float | None, float | None, float | None]:
-    """Spearman / Pearson / R2 / uncertainty for a single eval model on one fold."""
     if not evaluation or not isinstance(evaluation, dict):
         return None, None, None, None
     v = evaluation.get(eval_model)
     if not isinstance(v, dict) or v.get("error"):
         return None, None, None, None
-
-    def _finite_float(x: object) -> float | None:
-        if x is None:
-            return None
-        try:
-            xf = float(x)
-        except (TypeError, ValueError):
-            return None
-        return float(xf) if math.isfinite(xf) else None
-
-    spearman = _finite_float(v.get("spearman_rho"))
-    pearson = _finite_float(v.get("pearson_r"))
-    r2 = _finite_float(v.get("r2"))
-    uncertainty = _finite_float(v.get("prediction_std_mean"))
+    spearman = _optional_float_cell(v.get("spearman_rho"))
+    pearson = _optional_float_cell(v.get("pearson_r"))
+    r2 = _optional_float_cell(v.get("r2"))
+    uncertainty = _optional_float_cell(v.get("prediction_std_mean"))
     return spearman, pearson, r2, uncertainty
 
 
@@ -240,16 +155,6 @@ def _fold_key_from_json(data: dict) -> str:
 
 
 def _get_reported_features(data: dict, eval_model: str | None = None) -> list[str] | None:
-    """Return the features actually used at eval time for this fold result.
-
-    When the eval-time feature cap reduced the selection output further, the
-    evaluation entry for each model contains ``eval_features_used``.  We prefer
-    that over the raw ``selected_features`` list, which may be larger than what
-    any model actually trained on (e.g. when the correlation selector was
-    skipped and returned the full prefilter pool uncapped in older result files).
-    When ``eval_model`` is set, use that model's ``eval_features_used``; otherwise
-    use the first non-error model's list (legacy).
-    """
     evaluation = data.get("evaluation") or {}
     if eval_model:
         mr = evaluation.get(eval_model)
@@ -269,24 +174,9 @@ def _get_reported_features(data: dict, eval_model: str | None = None) -> list[st
     return None
 
 
-def _features_by_fold_json(features_by_fold: dict[str, list[str]]) -> str:
-    """Stable JSON string: keys sorted by numeric fold index when ``fold_<n>``."""
-
-    ordered = {
-        k: features_by_fold[k] for k in sorted(features_by_fold.keys(), key=_sort_fold_key)
-    }
-    return json.dumps(ordered, ensure_ascii=False)
-
-
 def _safe_filename_segment(s: str) -> str:
     t = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(s)).strip("_")
     return t or "dataset"
-
-
-def _batch_subdir_slug_for_yaml_key(dataset_yaml_key: str) -> str:
-    """Match ``prepare_parallel_from_config._slug`` (output JSON subdir under batch root)."""
-    t = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(dataset_yaml_key)).strip("_")
-    return t or "x"
 
 
 def _filter_json_paths_to_dataset_yaml_key(
@@ -294,9 +184,9 @@ def _filter_json_paths_to_dataset_yaml_key(
     batch_root: Path,
     dataset_yaml_key: str,
 ) -> list[Path]:
-    """Keep paths under ``batch_root / _slug(dataset_yaml_key)`` (resolved)."""
+    slug = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(dataset_yaml_key)).strip("_") or "x"
     try:
-        sub = (batch_root.resolve() / _batch_subdir_slug_for_yaml_key(dataset_yaml_key)).resolve()
+        sub = (batch_root.resolve() / slug).resolve()
     except OSError:
         return []
     out: list[Path] = []
@@ -321,29 +211,18 @@ _HEX_HASH_RE = re.compile(r"[0-9a-f]{8,}")
 def _developability_label_from_run_dir(
     run_dir: str, dev_paths: list[str] | None = None
 ) -> str:
-    """Short label from manifest ``run_dir`` (identifies developability feature source).
-
-    When the derived label is hash-based (no meaningful keyword such as ``propermab`` or
-    ``results``), fall back to constructing a descriptive label from the first entry of
-    ``dev_paths`` (the ``developability_results_paths`` list in the manifest block).
-    This handles cases where the run directory encodes only a filename hash rather than
-    the full path (e.g. multi-seed runs with a generic ``features.csv`` input).
-    """
     name = Path(run_dir).name.replace(".csv", "")
     if "__" in name:
         label = name.split("__", 1)[-1]
     else:
         label = name or "unknown"
 
-    # If the label contains a hex hash but lacks descriptive keywords, use the
-    # developability results path parent directory + file stem instead.
     if dev_paths and _HEX_HASH_RE.search(label):
         p = Path(str(dev_paths[0]))
         parent = p.parent.name
         if parent and parent not in (".", ""):
-            stem = p.stem  # e.g. "features" or descriptive name without extension
+            stem = p.stem
             new_label = f"{parent}_{stem}"
-            # Preserve a trailing seed suffix (__rs*) when present in the hash label.
             seed_match = re.search(r"__(rs\d+)$", label)
             if seed_match:
                 new_label += f"__{seed_match.group(1)}"
@@ -353,7 +232,6 @@ def _developability_label_from_run_dir(
 
 
 def _yaml_key_to_developability_label(manifest: dict) -> dict[str, str]:
-    """Map ``dataset_yaml_key`` → developability label from each dataset block."""
     out: dict[str, str] = {}
     for block in manifest.get("datasets") or []:
         yk = block.get("dataset_yaml_key")
@@ -366,7 +244,6 @@ def _yaml_key_to_developability_label(manifest: dict) -> dict[str, str]:
 
 
 def _target_col_for_plot(row: pd.Series) -> str:
-    """``Target_col`` when present; else infer from ``Target-Selector-Model`` tail."""
     tc = row.get("Target_col")
     if tc is not None and not (isinstance(tc, float) and math.isnan(tc)):
         s = str(tc).strip()
@@ -383,7 +260,6 @@ def _target_col_for_plot(row: pd.Series) -> str:
 
 
 def _selector_model_frac_label(row: pd.Series) -> str:
-    """X-axis text: optional ``Track`` line, then selector–model–eval–frac (no ``Target_col`` prefix)."""
     t = str(row.get("Target_col", "")).strip()
     full = str(row.get("Target-Selector-Model", ""))
     if t and full.startswith(t + "-"):
@@ -397,7 +273,6 @@ def _selector_model_frac_label(row: pd.Series) -> str:
 
 
 def _fmt_plot_cell(x: object) -> str:
-    """Finite float for plot annotation, else ``n/a``."""
     try:
         if x is None or pd.isna(x):
             return "n/a"
@@ -413,7 +288,6 @@ def _fmt_plot_cell(x: object) -> str:
 
 
 def _per_fold_metric(row: pd.Series, metric: str) -> list[float]:
-    """Ordered finite values from ``fold_*_{metric}`` columns."""
     suf = f"_{metric}"
     cols = [
         c
@@ -442,22 +316,14 @@ def _per_fold_metric(row: pd.Series, metric: str) -> list[float]:
     return out
 
 
-def _best_spearman_slot(grp: pd.DataFrame) -> tuple[pd.Series, str] | None:
-    """Row with best mean Spearman in ``grp`` and its combination x-tick label."""
-    gsp = grp.dropna(subset=["Spearman"])
-    if len(gsp) == 0:
+def _best_metric_slot(
+    grp: pd.DataFrame, metric_col: str
+) -> tuple[pd.Series, str] | None:
+    g = grp.dropna(subset=[metric_col])
+    if len(g) == 0:
         return None
-    best = gsp.loc[gsp["Spearman"].idxmax()]
-    return (best, _selector_model_frac_label(best))
-
-
-def _best_pearson_slot(grp: pd.DataFrame) -> tuple[pd.Series, str] | None:
-    """Row with best mean Pearson in ``grp`` and its combination x-tick label."""
-    gpe = grp.dropna(subset=["Pearson"])
-    if len(gpe) == 0:
-        return None
-    best = gpe.loc[gpe["Pearson"].idxmax()]
-    return (best, _selector_model_frac_label(best))
+    best = g.loc[g[metric_col].idxmax()]
+    return best, _selector_model_frac_label(best)
 
 
 def _suptitle_line2_single_dataset(slots: list[tuple[pd.Series, str, str]]) -> str:
@@ -494,10 +360,6 @@ def _draw_best_combo_figure(
     suptitle_line2: str,
     out_png: Path,
 ) -> None:
-    """Draw fold scatter for ``slots``: ``(row, x_tick_label, metric)`` with
-    ``metric`` ``\"spearman\"`` or ``\"pearson\"`` — only that metric’s per-fold
-    points and mean are drawn for that column.
-    """
     try:
         import matplotlib
 
@@ -607,7 +469,6 @@ def _plot_best_combo_fold_scatters(
     dataset_key: str,
     out_plot_dir: Path,
 ) -> None:
-    """One PNG per ``Target_col``: best mean Spearman & best mean Pearson combos, fold metrics on y."""
     pair_cols = [
         c
         for c in df.columns
@@ -626,10 +487,10 @@ def _plot_best_combo_fold_scatters(
 
     for target_col, grp in work.groupby("Target_col", sort=False):
         slots: list[tuple[pd.Series, str, str]] = []
-        bs = _best_spearman_slot(grp)
+        bs = _best_metric_slot(grp, "Spearman")
         if bs:
             slots.append((bs[0], bs[1], "spearman"))
-        bp = _best_pearson_slot(grp)
+        bp = _best_metric_slot(grp, "Pearson")
         if bp:
             slots.append((bp[0], bp[1], "pearson"))
         if not slots:
@@ -649,7 +510,6 @@ def _plot_combined_by_experimental_target(
     *,
     out_plot_dir: Path,
 ) -> None:
-    """One PNG per ``(Dataset_stem, Target_col)`` when multiple developability sources overlap."""
     if len(tables) < 2:
         return
 
@@ -666,12 +526,12 @@ def _plot_combined_by_experimental_target(
         slots: list[tuple[pd.Series, str, str]] = []
         for dev in sources_sorted:
             sub = grp[grp["Developability_source"] == dev]
-            bs = _best_spearman_slot(sub)
+            bs = _best_metric_slot(sub, "Spearman")
             if bs:
                 slots.append((bs[0], f"{dev}\n{bs[1]}", "spearman"))
         for dev in sources_sorted:
             sub = grp[grp["Developability_source"] == dev]
-            bp = _best_pearson_slot(sub)
+            bp = _best_metric_slot(sub, "Pearson")
             if bp:
                 slots.append((bp[0], f"{dev}\n{bp[1]}", "pearson"))
 
@@ -687,11 +547,6 @@ def _plot_combined_by_experimental_target(
             suptitle_line2=_suptitle_line2_combined(slots),
             out_png=out_png,
         )
-
-
-def _eval_frac_slug(f: float) -> str:
-    x = float(f)
-    return f"frac{int(round(x * 100)):03d}"
 
 
 def _resolve(p: Path) -> Path:
@@ -724,7 +579,6 @@ def _remap_json_paths_batch_root(
     manifest_batch_root: Path,
     effective_batch_root: Path,
 ) -> list[Path]:
-    """If the batch was copied/renamed, rewrite absolute paths under the manifest root."""
     man_r = manifest_batch_root.resolve()
     eff_r = effective_batch_root.resolve()
     if man_r == eff_r:
@@ -930,11 +784,11 @@ def main() -> None:
         mod = str(data.get("model_type", "unknown"))
         ev_raw = data.get("eval_features_frac")
         if ev_raw is None:
-            ev_raw = data.get("features_frac", 0.1)
+            ev_raw = data.get("features_frac", DEFAULT_FEATURES_FRAC)
         try:
             eval_frac = float(ev_raw)
         except (TypeError, ValueError):
-            eval_frac = 0.1
+            eval_frac = DEFAULT_FEATURES_FRAC
 
         fk = _fold_key_from_json(data)
         evaluation = data.get("evaluation")
@@ -963,6 +817,8 @@ def main() -> None:
             dataset_target_pipeline_s[(ds_key, target)] += pt_val
 
         for eval_model in eval_models:
+            if eval_model == "none":
+                continue
             ev = evaluation if isinstance(evaluation, dict) else {}
             sp, pe, r2, ps = _fold_eval_one_model(ev, eval_model)
             key = (ds_key, track, target, sel, mod, eval_model, eval_frac)
@@ -973,9 +829,7 @@ def main() -> None:
                 "prediction_std_mean": ps,
             }
 
-            feats = _get_reported_features(
-                data, eval_model if eval_model != "none" else None
-            )
+            feats = _get_reported_features(data, eval_model)
             if feats is not None:
                 acc[key]["features_by_fold"][fk] = feats
 
@@ -985,22 +839,17 @@ def main() -> None:
     by_ds: dict[str, list[dict]] = defaultdict(list)
     fold_keys_by_ds: dict[str, set[str]] = defaultdict(set)
 
-    # Pre-pass: determine the complete set of fold keys per dataset before building
-    # aggregate rows.  This is needed so that _strict_mean can check all folds at once
-    # rather than against a partially-built set.
+    # Pre-pass: complete fold-key set per dataset (for _strict_mean).
     for (ds_key, _track, _tgt, _sel, _mod, _em, _ef), bucket in acc.items():
         fold_keys_by_ds[ds_key].update(bucket["fold_metrics"].keys())
 
     for (ds_key, track, target, sel, mod, eval_model, eval_frac), bucket in acc.items():
-        fs = _eval_frac_slug(eval_frac)
+        fs = f"frac{int(round(float(eval_frac) * 100)):03d}"
         row_name = f"{target}-{sel}-{mod}-{eval_model}-{fs}"
         fbf = bucket["features_by_fold"]
         fm = bucket["fold_metrics"]
         n_expected = len(fold_keys_by_ds[ds_key])
         sp_list, pe_list, r2_list, sd_list = _fold_eval_lists(fm)
-        # Spearman / Pearson / R2: require ALL expected folds to have a finite value.
-        # Rows where any fold failed (error, constant predictions, …) get None so they
-        # are excluded from best-metric selection in analysis/analyze_results.py.
         sp_mean = _strict_mean(sp_list, n_expected)
         pe_mean = _strict_mean(pe_list, n_expected)
         r2_mean = _strict_mean(r2_list, n_expected)
@@ -1039,7 +888,17 @@ def main() -> None:
                 ),
                 "Pipeline_time_sum_s": pt_sum,
                 "Pipeline_time_std_s": pt_std,
-                "selected_features_by_fold": _features_by_fold_json(fbf) if fbf else "{}",
+                "selected_features_by_fold": (
+                    json.dumps(
+                        {
+                            k: fbf[k]
+                            for k in sorted(fbf.keys(), key=_sort_fold_key)
+                        },
+                        ensure_ascii=False,
+                    )
+                    if fbf
+                    else "{}"
+                ),
                 "_fold_metrics": fm,
                 "_sort": (track, target, sel, mod, eval_model, fs),
             }

@@ -1,39 +1,8 @@
 #!/usr/bin/env bash
-# Run AbodyBuilder3 or ABodyBuilder2 on every top-level CSV in data/.
-# Required columns: name, heavy, light -> <name>.pdb (| in name -> '_').
-# Output: structures/<dataset>_abb3_<run>/ or structures/<dataset>_abb2_<run>/ for run in 1..N (--runs).
-#
-# Usage:
-#   ./run_structure_prediction.sh [--abb3|--abb2] [--data-dir DIR] [--output-root DIR]
-#       [--runs N] [--skip-existing] [--no-minimize] [--minimize-jobs N]
-#   ./run_structure_prediction.sh --minimization-only \
-#       --input-dir structures/ds_abb3_1 [--input-dir structures/ds_abb3_2 ...] \
-#       [--minimize-jobs N]
-#   ABB3_CHECKPOINT=/path/to.ckpt ./run_structure_prediction.sh --abb3 --runs 3
-# Default backend: --abb3. Default --runs 1. PYTHON=… for interpreter.
-# Default --data-dir: <repo>/data. Default --output-root: <repo>/structures.
-#
-# Device / batch (ABB3): ABB3_DEVICE (default cuda:1), ABB3_BATCH_SIZE (default 4).
-# ABB2 uses the same defaults via ABB2_DEVICE / ABB2_BATCH_SIZE when unset
-# (they fall back to ABB3_*). --batch-size is passed through for CLI parity; ABB2
-# still predicts one sequence at a time (see run_abb2_batch_from_csv.py).
-#
-# IMGT renumbering (ANARCI, abb2 conda env):
-#   After ABB3, each output folder is renumbered into a sibling <folder>_imgt/
-#   by default.  Pass --no-renumber to skip.
-#
-# Minimization (OpenMM, amber14, same pipeline as ABB2 ImmuneBuilder refinement):
-#   After renumbering (or directly after ABB3 if --no-renumber), each folder is
-#   minimized into a sibling <folder>_minimized/ by default.
-#   Pass --no-minimize to skip.  --minimization-only runs only this step on
-#   explicitly provided --input-dir folders (abb2 conda env used).
-#   ABB2_PYTHON overrides the python used for both steps (default: conda run -n abb2 python3).
-#
-# All datasets in data/ (one model load):
-#   ./run_structure_prediction.sh --abb3 --runs 5
-#   ./run_structure_prediction.sh --abb2 --runs 5
-# Or several CSVs explicitly (ABB3 example):
-#   python3 structure/run_abb3_batch_from_csv.py --csv data/a.csv --csv data/b.csv --output-root structures
+# Predict structures from CSVs (name, heavy, light); output structures/<stem>_abb3_<n> or _abb2_<n>.
+# Usage: predict_structure.sh [--abb3|--abb2] [--data-dir DIR] [--output-root DIR] [--runs N]
+#   [--skip-existing] [--no-renumber] [--no-minimize] [--minimize-jobs N]
+#   [--renumber-only|--minimization-only] [--structures-dir DIR] [--allow-partial-domain]
 
 set -euo pipefail
 
@@ -43,7 +12,6 @@ ABB3_BATCH_SIZE="${ABB3_BATCH_SIZE:-4}"
 ABB2_DEVICE="${ABB2_DEVICE:-$ABB3_DEVICE}"
 ABB2_BATCH_SIZE="${ABB2_BATCH_SIZE:-$ABB3_BATCH_SIZE}"
 PYTHON="${PYTHON:-python3}"
-# Python used for minimization — must have openmm/pdbfixer/scipy (abb2 env).
 ABB2_PYTHON="${ABB2_PYTHON:-conda run -n abb2 python3}"
 
 BACKEND=abb3
@@ -53,10 +21,12 @@ RUNS=1
 SKIP_EXISTING=0
 DATA_DIR_CLI=""
 OUT_DIR_CLI=""
-RENUMBER=1           # IMGT-renumber after ABB3 by default
-MINIMIZE=1           # minimize after ABB3 (after renumbering) by default
-MINIMIZATION_ONLY=0  # skip prediction; only minimize --input-dir folders
-MINIMIZE_INPUT_DIRS=()
+RENUMBER=1
+MINIMIZE=1
+MINIMIZATION_ONLY=0
+RENUMBER_ONLY=0
+STRUCTURES_DIRS=()
+ALLOW_PARTIAL_DOMAIN=0
 MINIMIZE_JOBS=8
 
 while [[ $# -gt 0 ]]; do
@@ -73,7 +43,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --runs)
             if [[ $# -lt 2 ]]; then
-                echo "Missing value for --runs" >&2
+                echo "missing value for --runs" >&2
                 exit 1
             fi
             RUNS="$2"
@@ -85,7 +55,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --data-dir)
             if [[ $# -lt 2 ]]; then
-                echo "Missing value for --data-dir" >&2
+                echo "missing value for --data-dir" >&2
                 exit 1
             fi
             DATA_DIR_CLI="$2"
@@ -93,7 +63,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --output-root)
             if [[ $# -lt 2 ]]; then
-                echo "Missing value for --output-root" >&2
+                echo "missing value for --output-root" >&2
                 exit 1
             fi
             OUT_DIR_CLI="$2"
@@ -111,17 +81,25 @@ while [[ $# -gt 0 ]]; do
             MINIMIZATION_ONLY=1
             shift
             ;;
-        --input-dir)
+        --renumber-only)
+            RENUMBER_ONLY=1
+            shift
+            ;;
+        --allow-partial-domain)
+            ALLOW_PARTIAL_DOMAIN=1
+            shift
+            ;;
+        --structures-dir)
             if [[ $# -lt 2 ]]; then
-                echo "Missing value for --input-dir" >&2
+                echo "missing value for --structures-dir" >&2
                 exit 1
             fi
-            MINIMIZE_INPUT_DIRS+=("$2")
+            STRUCTURES_DIRS+=("$2")
             shift 2
             ;;
         --minimize-jobs)
             if [[ $# -lt 2 ]]; then
-                echo "Missing value for --minimize-jobs" >&2
+                echo "missing value for --minimize-jobs" >&2
                 exit 1
             fi
             MINIMIZE_JOBS="$2"
@@ -132,15 +110,11 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         *)
-            echo "Unknown option: $1 (try --help)" >&2
+            echo "unknown option: $1 (try --help)" >&2
             exit 1
             ;;
     esac
 done
-
-# ---------------------------------------------------------------------------
-# Validation
-# ---------------------------------------------------------------------------
 
 if [[ "$HAVE_ABB3" -eq 1 && "$HAVE_ABB2" -eq 1 ]]; then
     echo "Use only one of --abb3 or --abb2" >&2
@@ -157,51 +131,132 @@ if ! [[ "$MINIMIZE_JOBS" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 
-if [[ "$MINIMIZATION_ONLY" -eq 1 && ${#MINIMIZE_INPUT_DIRS[@]} -eq 0 ]]; then
-    echo "--minimization-only requires at least one --input-dir DIR" >&2
+if [[ "$MINIMIZATION_ONLY" -eq 1 && "$RENUMBER_ONLY" -eq 1 ]]; then
+    echo "pick --minimization-only or --renumber-only, not both" >&2
+    exit 1
+fi
+
+if [[ "$MINIMIZATION_ONLY" -eq 1 && ${#STRUCTURES_DIRS[@]} -eq 0 ]]; then
+    echo "--minimization-only needs at least one --structures-dir" >&2
+    exit 1
+fi
+
+if [[ "$RENUMBER_ONLY" -eq 1 && ${#STRUCTURES_DIRS[@]} -eq 0 ]]; then
+    echo "--renumber-only needs at least one --structures-dir" >&2
     exit 1
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STRUCTURE_DIR="$SCRIPT_DIR/structure"
 
-# ---------------------------------------------------------------------------
-# Helper: minimize one folder -> sibling folder with _minimized suffix
-# ---------------------------------------------------------------------------
+run_renumber() {
+    local input_dir="$1"
+    local inplace="${2:-0}"
+
+    if [[ ! -d "$input_dir" ]]; then
+        echo "  skip renumber, no dir: $input_dir" >&2
+        return 1
+    fi
+
+    local parent base out_dir
+    parent="$(cd "$(dirname "$input_dir")" && pwd)"
+    base="$(basename "$input_dir")"
+    if [[ "$inplace" -eq 1 ]]; then
+        out_dir="$input_dir"
+    else
+        out_dir="${parent}/${base}_imgt"
+    fi
+
+    echo ""
+    if [[ "$inplace" -eq 1 ]]; then
+        echo "IMGT renumber (in place): $input_dir"
+    else
+        echo "IMGT renumber: $input_dir -> $out_dir"
+    fi
+    local extra=(--out-dir "$out_dir" --overwrite)
+    if [[ "$ALLOW_PARTIAL_DOMAIN" -eq 1 ]]; then
+        extra+=(--allow-partial-domain)
+    fi
+
+    $ABB2_PYTHON "$STRUCTURE_DIR/postprocess_structures.py" renumber "$input_dir" "${extra[@]}"
+}
 
 run_minimization() {
     local input_dir="$1"
-    local skip_flag="${2:-}"   # "--skip-existing" or ""
+    local skip_flag="${2:-}"
+    local inplace="${3:-0}"
 
     if [[ ! -d "$input_dir" ]]; then
         echo "  [minimize] Skipping missing directory: $input_dir" >&2
-        return
+        return 1
     fi
 
-    local parent
+    local parent base output_dir
     parent="$(cd "$(dirname "$input_dir")" && pwd)"
-    local base
     base="$(basename "$input_dir")"
-    local output_dir="${parent}/${base}_minimized"
+    if [[ "$inplace" -eq 1 ]]; then
+        output_dir="$input_dir"
+    else
+        if [[ "$base" == *_imgt ]]; then
+            base="${base%_imgt}"
+        fi
+        output_dir="${parent}/${base}_minimized"
+    fi
 
     echo ""
-    echo "--- Minimizing: $input_dir -> $output_dir ---"
+    if [[ "$inplace" -eq 1 ]]; then
+        echo "--- Minimizing (in place): $input_dir ---"
+    else
+        echo "--- Minimizing: $input_dir -> $output_dir ---"
+    fi
 
     local skip_args=()
     if [[ "$skip_flag" == "--skip-existing" ]]; then
         skip_args=(--skip-existing)
     fi
 
-    $ABB2_PYTHON "$STRUCTURE_DIR/minimize_structures_batch.py" \
+    $ABB2_PYTHON "$STRUCTURE_DIR/postprocess_structures.py" minimize \
         --input-dir  "$input_dir" \
         --output-dir "$output_dir" \
         --jobs       "$MINIMIZE_JOBS" \
         "${skip_args[@]}"
 }
 
-# ---------------------------------------------------------------------------
-# --minimization-only: no prediction, just minimize the given folders
-# ---------------------------------------------------------------------------
+run_postprocess_predict_dirs() {
+    local backend_tag="$1"
+    local minimize_skip_flag="${2:-}"
+
+    for csv in "${csv_files[@]}"; do
+        local stem predict_dir
+        stem="$(basename "$csv" .csv)"
+        for (( run=1; run<=RUNS; run++ )); do
+            predict_dir="$OUT_DIR/${stem}_${backend_tag}_${run}"
+
+            if [[ ! -d "$predict_dir" ]]; then
+                echo "  [post-process] Skipping missing: $predict_dir" >&2
+                continue
+            fi
+
+            if [[ "$RENUMBER" -eq 1 ]]; then
+                run_renumber "$predict_dir" 1 || exit 1
+            fi
+
+            if [[ "$MINIMIZE" -eq 1 ]]; then
+                run_minimization "$predict_dir" "$minimize_skip_flag" 1
+            fi
+        done
+    done
+}
+
+if [[ "$RENUMBER_ONLY" -eq 1 ]]; then
+    for dir in "${STRUCTURES_DIRS[@]}"; do
+        abs_dir="$(cd "$dir" && pwd)"
+        run_renumber "$abs_dir" || exit 1
+    done
+    echo ""
+    echo "done"
+    exit 0
+fi
 
 if [[ "$MINIMIZATION_ONLY" -eq 1 ]]; then
     SKIP_FLAG=""
@@ -209,19 +264,15 @@ if [[ "$MINIMIZATION_ONLY" -eq 1 ]]; then
         SKIP_FLAG="--skip-existing"
     fi
 
-    for dir in "${MINIMIZE_INPUT_DIRS[@]}"; do
+    for dir in "${STRUCTURES_DIRS[@]}"; do
         abs_dir="$(cd "$dir" && pwd)"
         run_minimization "$abs_dir" "$SKIP_FLAG"
     done
 
     echo ""
-    echo "Minimization complete."
+    echo "done"
     exit 0
 fi
-
-# ---------------------------------------------------------------------------
-# Normal prediction path
-# ---------------------------------------------------------------------------
 
 if [[ -n "$DATA_DIR_CLI" ]]; then
     if [[ ! -d "$DATA_DIR_CLI" ]]; then
@@ -260,7 +311,7 @@ if [[ "$BACKEND" == "abb3" ]]; then
         exit 1
     fi
 
-    "$PYTHON" "$STRUCTURE_DIR/run_abb3_batch_from_csv.py" \
+    "$PYTHON" "$STRUCTURE_DIR/run_abb_batch_from_csv.py" abb3 \
         --data-dir "$DATA_DIR" \
         --output-root "$OUT_DIR" \
         --runs "$RUNS" \
@@ -269,65 +320,14 @@ if [[ "$BACKEND" == "abb3" ]]; then
         --batch-size "$ABB3_BATCH_SIZE" \
         "${SKIP_ARGS[@]}"
 
-    # Post-processing: IMGT renumber and/or minimize.
-    # All intermediate directories are temporary; the final result always lands
-    # in stem_abb3_N/ (same name as the raw ABB3 output, overwriting it).
     if [[ "$RENUMBER" -eq 1 || "$MINIMIZE" -eq 1 ]]; then
-        minimize_skip_args=()
-        [[ "$SKIP_EXISTING" -eq 1 ]] && minimize_skip_args=(--skip-existing)
-
-        for csv in "${csv_files[@]}"; do
-            stem="$(basename "$csv" .csv)"
-            for (( run=1; run<=RUNS; run++ )); do
-                final_dir="$OUT_DIR/${stem}_abb3_${run}"
-
-                if [[ ! -d "$final_dir" ]]; then
-                    echo "  [post-process] Skipping missing: $final_dir" >&2
-                    continue
-                fi
-
-                # Move raw ABB3 output aside so we can write the final result
-                # back to the same directory name.
-                raw_tmp="${final_dir}_tmp_${$}_raw"
-                mv "$final_dir" "$raw_tmp"
-                current="$raw_tmp"
-
-                if [[ "$RENUMBER" -eq 1 ]]; then
-                    echo ""
-                    echo "--- IMGT renumbering: ${stem}_abb3_${run} ---"
-                    if [[ "$MINIMIZE" -eq 1 ]]; then
-                        # Another step follows; renumber into a second temp dir.
-                        imgt_tmp="${final_dir}_tmp_${$}_imgt"
-                        $ABB2_PYTHON "$STRUCTURE_DIR/renumber_abb3_imgt.py" \
-                            "$current" --out-dir "$imgt_tmp"
-                        rm -rf "$current"
-                        current="$imgt_tmp"
-                    else
-                        # Last step; write directly to final_dir.
-                        $ABB2_PYTHON "$STRUCTURE_DIR/renumber_abb3_imgt.py" \
-                            "$current" --out-dir "$final_dir"
-                        rm -rf "$current"
-                        current=""
-                    fi
-                fi
-
-                if [[ "$MINIMIZE" -eq 1 ]]; then
-                    echo ""
-                    echo "--- Minimizing: ${stem}_abb3_${run} ---"
-                    $ABB2_PYTHON "$STRUCTURE_DIR/minimize_structures_batch.py" \
-                        --input-dir  "$current" \
-                        --output-dir "$final_dir" \
-                        --jobs       "$MINIMIZE_JOBS" \
-                        "${minimize_skip_args[@]}"
-                    rm -rf "$current"
-                fi
-            done
-        done
+        minimize_skip_flag=""
+        [[ "$SKIP_EXISTING" -eq 1 ]] && minimize_skip_flag="--skip-existing"
+        run_postprocess_predict_dirs abb3 "$minimize_skip_flag"
     fi
 
 else
-    export ABB2_DEVICE="$ABB2_DEVICE"
-    "$PYTHON" "$STRUCTURE_DIR/run_abb2_batch_from_csv.py" \
+    "$PYTHON" "$STRUCTURE_DIR/run_abb_batch_from_csv.py" abb2 \
         --data-dir "$DATA_DIR" \
         --output-root "$OUT_DIR" \
         --runs "$RUNS" \

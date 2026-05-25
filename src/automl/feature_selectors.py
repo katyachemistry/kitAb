@@ -8,11 +8,18 @@ import pandas as pd
 from scipy.stats import spearmanr
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.feature_selection import RFE
-from sklearn.linear_model import ElasticNet
 from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.svm import SVR
 
+from .pipeline_defaults import (
+    DEFAULT_INTERCORR_IMPORTANCE_METRIC,
+    DEFAULT_INTERCORR_REDUCTION_MODE,
+    DEFAULT_INTERCORR_THRESHOLD,
+    DEFAULT_LOW_VARIANCE_EPSILON,
+    DEFAULT_LOW_VARIANCE_RELATIVE_STD_THRESHOLD,
+    DEFAULT_RANDOM_STATE,
+    DEFAULT_SFS_MIN_IMPROVEMENT,
+)
 from .utils import (
     CorrelationBundle,
     DEFAULT_CORRELATION_SCREENING_EXCLUDE_COLS,
@@ -21,6 +28,7 @@ from .utils import (
     _bh_adjust,
     calculate_correlations_and_plot,
     compute_correlation_bundle,
+    fit_regressor,
     make_regressor,
     reduce_correlated_features,
     apply_minmax_to_train_test_features,
@@ -31,38 +39,42 @@ _ALLOWED_STABILITY_MODELS = frozenset({"elasticnet", "randomforest", "svm"})
 _ALLOWED_RFE_MODELS = frozenset({"elasticnet", "randomforest", "svm"})
 _ALLOWED_SFS_MODELS = frozenset({"elasticnet", "randomforest", "svm", "knn"})
 
-# Canonical YAML/JSON token for adaptive subsample fraction: ``1/log10(5 + n_train)``
-# (``5`` is fixed in the formula; see :func:`stability_reduction_subsample_fraction_fold_train_log10`).
-# Parsed from ``stability_reduction_sample_fraction`` / ``subsample_fraction``; resolved per fold
-# in :func:`run_feature_selection_on_one_fold`.
+# Adaptive subsample fraction: max(0.4, min(0.8, 1/log10(5 + n_train))).
 FOLD_TRAIN_LOG10_CONST_5 = "fold_train_log10_const_5"
 _LEGACY_STABILITY_REDUCTION_SF_SENTINEL = "__stability_reduction_sf_fold_train_log10__"
 
-# Adaptive stability-reduction subsample count: ``round(500 / log10(n_train))`` with
-# ``n_train >= 2``, clamped to ``[100, 300]`` (see :func:`stability_reduction_n_subsamples_fold_train_log500`).
+# Adaptive subsample count: max(100, min(300, round(500/log10(n_train)))).
 FOLD_TRAIN_LOG10_NS_500 = "fold_train_log10_ns_500"
 
-# Fixed subsample count for optional ``stability_prereduction_n_features`` (cheap top-N gate).
 STABILITY_PREREDUCTION_N_SUBSAMPLES = 50
 
 
 def stability_reduction_subsample_fraction_fold_train_log10(n_train: int) -> float:
-    """Return ``1 / log10(5 + n_train)`` with ``n_train >= 1``, clamped to ``[0.4, 0.8]``."""
     nt = max(1, int(n_train))
     x = 1.0 / math.log10(5.0 + float(nt))
     return max(0.4, min(0.8, x))
 
 
 def stability_reduction_n_subsamples_fold_train_log500(n_train: int) -> int:
-    """Return ``round(500 / log10(n_train))`` with ``n_train >= 2``, clamped to ``[100, 300]``."""
     nt = max(2, int(n_train))
     x = 500.0 / math.log10(float(nt))
     k = int(round(x))
     return max(100, min(300, k))
 
 
-# Keys accepted under YAML ``hyperparameters`` / CLI JSON for the stability selector
-# (aliases → run_feature_selection_on_one_fold keyword names).
+def _resolve_stability_n_subsamples(spec: int | str, n_train: int) -> int:
+    if spec == FOLD_TRAIN_LOG10_NS_500:
+        return stability_reduction_n_subsamples_fold_train_log500(n_train)
+    return int(spec)
+
+
+def _resolve_stability_sample_fraction(spec: float | str, n_train: int) -> float:
+    if spec in (FOLD_TRAIN_LOG10_CONST_5, _LEGACY_STABILITY_REDUCTION_SF_SENTINEL):
+        return stability_reduction_subsample_fraction_fold_train_log10(n_train)
+    return float(spec)
+
+
+# Keys under YAML ``hyperparameters`` / CLI JSON (aliases → run_feature_selection_on_one_fold kwargs).
 _STABILITY_HP_ALIASES: dict[str, str] = {
     "n_subsamples": "stability_n_subsamples",
     "stability_n_subsamples": "stability_n_subsamples",
@@ -92,11 +104,9 @@ _STABILITY_HP_ALIASES: dict[str, str] = {
     "stability_rf_max_features": "stability_rf_max_features",
     "rf_max_features": "stability_rf_max_features",
     "max_features": "stability_rf_max_features",
-    # Sklearn RandomForestRegressor names (typical under ``randomforest:`` in YAML)
     "n_estimators": "stability_rf_n_estimators",
     "max_depth": "stability_rf_max_depth",
     "min_samples_leaf": "stability_rf_min_samples_leaf",
-    # Sklearn SVR names (typical under ``svm:``)
     "C": "stability_svm_c",
     "epsilon": "stability_svm_epsilon",
 }
@@ -113,9 +123,7 @@ _SHARED_HP_ALIASES: dict[str, str] = {
     "intercorr_metric": "intercorr_importance_metric",
     "intercorr_reduction_mode": "intercorr_reduction_mode",
     "intercorr_mode": "intercorr_reduction_mode",
-    # Spearman |rho| vs target: elbow then max(min_n, elbow_n) (after intercorr, before stability_reduction).
     "correlation_reduction_min_n_features": "correlation_reduction_min_n_features",
-    # Optional pre-selector stability subsampling filter (after intercorrelation prefilter).
     "stability_reduction_n_features": "stability_reduction_n_features",
     "stability_reduction_features": "stability_reduction_n_features",
     "stability_reduction_model": "stability_reduction_model",
@@ -135,7 +143,6 @@ _SHARED_HP_ALIASES: dict[str, str] = {
     "stability_reduction_rf_max_features": "stability_reduction_rf_max_features",
     "stability_reduction_min_n_features": "stability_reduction_min_n_features",
     "min_n_features": "stability_reduction_min_n_features",
-    # Optional fast top-N stability pass before full stability_reduction (same model/RF kwargs).
     "stability_prereduction_n_features": "stability_prereduction_n_features",
     "prereduction_n_features": "stability_prereduction_n_features",
 }
@@ -416,12 +423,6 @@ def _coerce_selector_hyperparameter(canon: str, v) -> object:
 
 
 def parse_selector_hyperparameters_mapping(selector: str, raw: dict | None) -> dict:
-    """Map YAML/CLI JSON to keyword args for :func:`run_feature_selection_on_one_fold`.
-
-    ``selector`` is ``stability``, ``correlation``, ``sfs``, or ``rfe``. Unknown keys raise
-    ``ValueError``. Which keys are valid depends on ``selector`` (plus shared prefilter keys
-    for all).
-    """
     if not raw:
         return {}
     if not isinstance(raw, dict):
@@ -439,11 +440,11 @@ def parse_selector_hyperparameters_mapping(selector: str, raw: dict | None) -> d
 # Minimum rows (after dropping null targets) required to run stability selection subsampling.
 STABILITY_SELECTION_MIN_SAMPLES = 4
 
+
 def _default_candidate_feature_columns(
     df: pd.DataFrame,
     target_col: str,
 ) -> list[str]:
-    """Numeric columns in ``df`` excluding the target and ``target_*`` names."""
     tc = str(target_col)
     numeric = df.select_dtypes(include=[np.number]).columns.tolist()
     return [
@@ -461,22 +462,7 @@ def _validate_model_type(value: str, *, param_name: str, allowed: frozenset) -> 
     return normalized
 
 
-def _fit_regressor_or_raise_convergence(model, X, y) -> None:
-    """Fit ``model``. For iterative solvers (ElasticNet, SVR), non-convergence raises."""
-    if isinstance(model, (ElasticNet, SVR)):
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", ConvergenceWarning)
-            model.fit(X, y)
-    else:
-        model.fit(X, y)
-
-
 def _default_stability_coef_threshold(model_type: str, n_features: int) -> float:
-    """Per-subsample mask threshold when ``coef_threshold`` is omitted.
-
-    ``elasticnet`` / ``svm``: near-zero (L1 / linear model already sparsifies).
-    ``randomforest``: ``1 / n_features`` (strictly above uniform importance baseline).
-    """
     mt = str(model_type).strip().lower()
     if mt == "randomforest":
         return 1.0 / float(max(1, int(n_features)))
@@ -490,15 +476,15 @@ def _stability_feature_frequencies(
     target_col: str,
     candidate_features: list[str],
     *,
-    n_subsamples: int = 100,
-    sample_fraction: float = 0.5,
+    n_subsamples: int | str = FOLD_TRAIN_LOG10_NS_500,
+    sample_fraction: float | str = FOLD_TRAIN_LOG10_CONST_5,
     model_type: str,
     l1_ratio: float | None = None,
     alpha: float | None = None,
     coef_threshold: float | None = None,
     svm_C: float | None = None,
     svm_epsilon: float | None = None,
-    random_state: int = 42,
+    random_state: int = DEFAULT_RANDOM_STATE,
     verbose: bool = False,
     rf_n_estimators: int | None = None,
     rf_max_depth: int | None = None,
@@ -506,13 +492,9 @@ def _stability_feature_frequencies(
     rf_max_features=None,
     minmax_scale: bool = True,
 ) -> pd.Series:
-    """Repeated subsample fits → selection frequency per feature (same core as stability_selector).
-
-    Caller must pass a validated ``model_type`` and non-empty ``candidate_features`` present
-    in ``merged_df``; ``merged_df`` must have at least ``STABILITY_SELECTION_MIN_SAMPLES`` rows.
-
-    If ``coef_threshold`` is ``None``, uses :func:`_default_stability_coef_threshold` (model-specific).
-    """
+    n_train = len(merged_df)
+    n_subsamples = _resolve_stability_n_subsamples(n_subsamples, n_train)
+    sample_fraction = _resolve_stability_sample_fraction(sample_fraction, n_train)
     X = merged_df[candidate_features].to_numpy(dtype=np.float64, copy=True)
     y = merged_df[target_col].to_numpy(dtype=np.float64, copy=True)
 
@@ -556,7 +538,7 @@ def _stability_feature_frequencies(
         if svm_epsilon is not None:
             mr["svm_epsilon"] = svm_epsilon
         model = make_regressor(model_type, **mr)
-        _fit_regressor_or_raise_convergence(model, X_sub, y_sub)
+        fit_regressor(model, X_sub, y_sub)
         if model_type == "elasticnet":
             w = np.ravel(np.asarray(model.coef_, dtype=np.float64))
         elif model_type == "randomforest":
@@ -584,7 +566,6 @@ def _stability_feature_frequencies(
 
 
 def _selected_names_from_stability_frequencies_elbow(freq: pd.Series) -> list[str]:
-    """Kneedle-like elbow on descending selection frequencies; at least one name when ``freq`` is non-empty."""
     freq_sorted = freq.sort_values(ascending=False)
     n = int(len(freq_sorted))
     if n == 0:
@@ -618,14 +599,14 @@ def stability_reduction_select_top_n(
     *,
     n_features: int,
     model_type: str = "randomforest",
-    n_subsamples: int = 100,
-    sample_fraction: float = 0.5,
+    n_subsamples: int | str = FOLD_TRAIN_LOG10_NS_500,
+    sample_fraction: float | str = FOLD_TRAIN_LOG10_CONST_5,
     l1_ratio: float | None = None,
     alpha: float | None = None,
     coef_threshold: float | None = None,
     svm_C: float | None = None,
     svm_epsilon: float | None = None,
-    random_state: int = 42,
+    random_state: int = DEFAULT_RANDOM_STATE,
     verbose: bool = False,
     rf_n_estimators: int | None = None,
     rf_max_depth: int | None = None,
@@ -633,12 +614,6 @@ def stability_reduction_select_top_n(
     rf_max_features=None,
     minmax_scale: bool = True,
 ) -> tuple[pd.Series, list[str]]:
-    """Stability subsampling → keep the ``n_features`` columns with highest selection frequency.
-
-    Same subsampling logic as :func:`stability_selector` but replaces the elbow cutoff with a
-    fixed top-``n_features`` list (by descending frequency). ``n_features`` is capped by the
-    number of candidates.
-    """
     model_type = _validate_model_type(
         model_type, param_name="model_type", allowed=_ALLOWED_STABILITY_MODELS
     )
@@ -685,15 +660,15 @@ def stability_selector(
     target_col: str,
     candidate_features: list[str] | None = None,
     *,
-    n_subsamples: int = 100,
-    sample_fraction: float = 0.5,
+    n_subsamples: int | str = FOLD_TRAIN_LOG10_NS_500,
+    sample_fraction: float | str = FOLD_TRAIN_LOG10_CONST_5,
     model_type: str = "elasticnet",
     l1_ratio: float | None = None,
     alpha: float | None = None,
     coef_threshold: float | None = None,
     svm_C: float | None = None,
     svm_epsilon: float | None = None,
-    random_state: int = 42,
+    random_state: int = DEFAULT_RANDOM_STATE,
     verbose: bool = True,
     rf_n_estimators: int | None = None,
     rf_max_depth: int | None = None,
@@ -701,22 +676,6 @@ def stability_selector(
     rf_max_features=None,
     minmax_scale: bool = True,
 ) -> tuple[pd.Series, list[str]]:
-    """Stability selection for one target column.
-
-    ``merged_df`` should be a train fold with finite ``target_col`` (and typically
-    preprocessed upstream). Pass ``candidate_features`` to restrict; if ``None``,
-    uses numeric columns except ``target_col`` and names starting with ``target``.
-
-    When ``minmax_scale`` is True (default), applies :class:`~sklearn.preprocessing.MinMaxScaler`
-    to ``X`` before subsampling. Set False if ``merged_df`` features are already
-    MinMax-scaled (e.g. from :func:`run_feature_selection_on_one_fold`).
-
-    ElasticNet / SVR / RandomForest kwargs default to ``None``: they are omitted when calling
-    :func:`~automl.utils.make_regressor`, so sklearn's constructor defaults apply.
-    If ``coef_threshold`` is omitted, the per-subsample inclusion mask uses
-    :func:`_default_stability_coef_threshold` (``1e-6`` for elasticnet/svm, ``1/n_features`` for
-    randomforest). Pass ``coef_threshold`` explicitly to override (not a sklearn parameter).
-    """
     model_type = _validate_model_type(
         model_type, param_name="model_type", allowed=_ALLOWED_STABILITY_MODELS
     )
@@ -790,19 +749,9 @@ def sequential_forward_selector(
     knn_metric: str | None = None,
     knn_metric_params: dict | None = None,
 ):
-    """Forward SFS for one target. ``model_type``: elasticnet, randomforest, svm (linear), or knn.
-
-    If ``candidate_features`` is ``None``, uses numeric columns except ``target_col``
-    and names starting with ``target``.
-
-    Algorithm args (``cv``, ``scoring``, ``min_improvement``, ``n_jobs``) default to
-    ``None`` and fall back to internal defaults (5 folds, ``spearman``, ``0.01``, ``-1``).
-    Regressor hyperparameters default to ``None``: omitted in :func:`~automl.utils.make_regressor`
-    so sklearn defaults apply unless set.
-    """
     cv_eff = 5 if cv is None else int(cv)
     scoring_eff = "spearman" if scoring is None else str(scoring)
-    min_imp_eff = 0.01 if min_improvement is None else float(min_improvement)
+    min_imp_eff = DEFAULT_SFS_MIN_IMPROVEMENT if min_improvement is None else float(min_improvement)
     n_jobs_eff = -1 if n_jobs is None else int(n_jobs)
 
     def _build_custom_folds(n_samples, n_splits, seed):
@@ -928,7 +877,7 @@ def sequential_forward_selector(
                 if knn_metric_params is not None:
                     mr["knn_metric_params"] = knn_metric_params
                 model = make_regressor(model_type_norm, **mr)
-                _fit_regressor_or_raise_convergence(model, X_tr, y_tr)
+                fit_regressor(model, X_tr, y_tr)
                 try:
                     y_pred = model.predict(X_val)
                     fold_scores.append(_score(y_val, y_pred, scoring_eff))
@@ -991,21 +940,9 @@ def select_features_floating_sfs(
     knn_metric: str | None = None,
     knn_metric_params: dict | None = None,
 ):
-    """Sequential floating forward selection for one target.
-
-    ``model_type`` supports the same regressors as :func:`sequential_forward_selector`:
-    ``elasticnet``, ``randomforest``, ``svm`` (linear), or ``knn``.
-
-    The interface and defaults match :func:`sequential_forward_selector`, but after each
-    accepted forward inclusion the routine performs a backward "floating" phase:
-    it removes the already-selected feature whose removal improves the CV score the most,
-    repeating while each removal improves the current subset by at least
-    ``min_improvement``. Removed features return to the candidate pool and may be added
-    again in later forward steps.
-    """
     cv_eff = 5 if cv is None else int(cv)
     scoring_eff = "spearman" if scoring is None else str(scoring)
-    min_imp_eff = 0.01 if min_improvement is None else float(min_improvement)
+    min_imp_eff = DEFAULT_SFS_MIN_IMPROVEMENT if min_improvement is None else float(min_improvement)
     n_jobs_eff = -1 if n_jobs is None else int(n_jobs)
 
     def _build_custom_folds(n_samples, n_splits, seed):
@@ -1125,7 +1062,7 @@ def select_features_floating_sfs(
             if knn_metric_params is not None:
                 mr["knn_metric_params"] = knn_metric_params
             model = make_regressor(model_type_norm, **mr)
-            _fit_regressor_or_raise_convergence(model, X_tr, y_tr)
+            fit_regressor(model, X_tr, y_tr)
             try:
                 y_pred = model.predict(X_val)
                 fold_scores.append(_score(y_val, y_pred, scoring_eff))
@@ -1198,7 +1135,7 @@ def recursive_elimination_selector(
     n_features_to_select: int,
     candidate_features: list | None = None,
     rfe_estimator: str = "elasticnet",
-    random_state: int = 42,
+    random_state: int = DEFAULT_RANDOM_STATE,
     enet_alpha: float | None = None,
     enet_l1_ratio: float | None = None,
     rf_n_estimators: int | None = None,
@@ -1209,17 +1146,6 @@ def recursive_elimination_selector(
     svm_epsilon: float | None = None,
     step: int | None = None,
 ):
-    """RFE for one target. ``rfe_estimator``: elasticnet, randomforest, or svm (linear).
-
-    K-neighbors is not available: sklearn ``RFE`` needs ``coef_`` or ``feature_importances_``.
-
-    If ``candidate_features`` is ``None``, uses numeric columns except ``target_col``
-    and names starting with ``target``.
-
-    Base-estimator and ``step`` default to ``None``: omitted so sklearn defaults apply
-    (``step`` defaults to ``1`` for :class:`~sklearn.feature_selection.RFE`).
-    """
-
     est = _validate_model_type(
         rfe_estimator, param_name="rfe_estimator", allowed=_ALLOWED_RFE_MODELS
     )
@@ -1283,15 +1209,6 @@ def correlation_selector(
     use_fdr: bool = True,
     min_abs_rho: float | None = None,
 ) -> tuple[pd.DataFrame, list[tuple[str, float]]]:
-    """Select features by significance and/or minimum |Spearman rho| vs one target.
-
-    Uses precomputed values from :class:`CorrelationBundle` (no second correlation pass).
-    Returns ``(corr_df, significant_tuples)`` with ``significant_tuples`` sorted by
-    descending absolute rho (same convention as legacy screening).
-
-    If ``candidate_features`` is set, only those names that appear in the bundle are
-    considered (order preserved).
-    """
     target_col = str(target_col)
     if target_col not in bundle.target_cols:
         raise ValueError(f"target_col {target_col!r} not in bundle.target_cols")
@@ -1350,9 +1267,6 @@ def correlation_selector(
 # Backward-compatible name (notebooks, older call sites).
 select_features_by_target_correlation = correlation_selector
 
-
-# --- One-fold selector (prepare_run + parallel workers) ---
-
 _VALID_PIPELINE_STEPS = frozenset({"stability", "correlation", "sfs", "rfe"})
 
 
@@ -1361,7 +1275,6 @@ def cv_shuffled_fold_ilocs(
     n_splits: int,
     random_state: int,
 ) -> tuple[list[int], list[tuple[np.ndarray, np.ndarray]]]:
-    """Shuffle row order then assign contiguous test blocks (outer CV scheme)."""
     N = int(n_samples)
     if n_splits < 2 or n_splits > N:
         raise ValueError(f"n_splits must be between 2 and N={N}.")
@@ -1386,7 +1299,6 @@ def cv_shuffled_fold_ilocs(
 
 
 def _sorted_split_labels(series: pd.Series) -> list:
-    """Deterministic fold order: integer-like if possible, else float, else string."""
     uniq = list(pd.unique(series))
     try:
         return sorted(uniq, key=lambda x: int(float(x)))
@@ -1401,12 +1313,6 @@ def _sorted_split_labels(series: pd.Series) -> list:
 def cv_split_col_ilocs(
     split_values: pd.Series,
 ) -> tuple[list[int], list[tuple[np.ndarray, np.ndarray]]]:
-    """
-    Leave-one-fold-out from discrete labels in ``split_values`` (aligned with training rows).
-
-    The number of CV folds equals the number of distinct labels (at least 2).
-    Config ``n_splits`` is not required to match.
-    """
     s = split_values.reset_index(drop=True)
     if s.isna().any():
         n_bad = int(s.isna().sum())
@@ -1470,16 +1376,12 @@ def run_feature_selection_on_one_fold(
     feature_selection_pipeline: str,
     model_type: str = "elasticnet",
     candidate_features: list[str] | None = None,
-    # low variance filter
-    low_variance_relative_std_threshold: float = 0.15,
-    low_variance_epsilon: float = 1e-8,
-    # intercorrelation filter
-    intercorr_threshold: float = 0.80,
-    intercorr_importance_metric: str = "spearman",
-    intercorr_reduction_mode: str = "cluster",
-    # Spearman |rho| vs target: elbow on ranked |rho|, keep max(min_n, elbow_n) (after intercorr).
+    low_variance_relative_std_threshold: float = DEFAULT_LOW_VARIANCE_RELATIVE_STD_THRESHOLD,
+    low_variance_epsilon: float = DEFAULT_LOW_VARIANCE_EPSILON,
+    intercorr_threshold: float = DEFAULT_INTERCORR_THRESHOLD,
+    intercorr_importance_metric: str = DEFAULT_INTERCORR_IMPORTANCE_METRIC,
+    intercorr_reduction_mode: str = DEFAULT_INTERCORR_REDUCTION_MODE,
     correlation_reduction_min_n_features: int | None = None,
-    # optional stability subsampling reduction (after correlation_reduction when set, before the active selector)
     stability_reduction_n_features: int | None = None,
     stability_reduction_min_n_features: int | None = None,
     stability_reduction_model: str | None = None,
@@ -1494,12 +1396,10 @@ def run_feature_selection_on_one_fold(
     stability_reduction_rf_max_depth: int | None = None,
     stability_reduction_rf_min_samples_leaf: int | None = None,
     stability_reduction_rf_max_features: str | float | int | None = None,
-    # Optional cheap stability top-N before stability_reduction (YAML ``prereduction.n_features``).
     stability_prereduction_n_features: int | None = None,
-    # stability selection args
-    random_state: int = 42,
-    stability_n_subsamples: int | str = 100,
-    stability_sample_fraction: float | str = 0.5,
+    random_state: int = DEFAULT_RANDOM_STATE,
+    stability_n_subsamples: int | str = FOLD_TRAIN_LOG10_NS_500,
+    stability_sample_fraction: float | str = FOLD_TRAIN_LOG10_CONST_5,
     stability_elasticnet_l1_ratio: float | None = None,
     stability_elasticnet_alpha: float | None = None,
     stability_coef_threshold: float | None = None,
@@ -1509,7 +1409,6 @@ def run_feature_selection_on_one_fold(
     stability_rf_max_depth: int | None = None,
     stability_rf_min_samples_leaf: int | None = None,
     stability_rf_max_features: str | float | int | None = None,
-    # correlation filter args (``None`` = omit; helpers use their defaults)
     correlation_p_threshold: float | None = None,
     correlation_fdr_alpha: float | None = None,
     correlation_use_fdr: bool | None = None,
@@ -1518,7 +1417,6 @@ def run_feature_selection_on_one_fold(
     correlation_screening_min_abs_rho: float | None = None,
     correlation_post_threshold: float | None = None,
     correlation_post_importance_metric: str | None = None,
-    # forward SFS args (``None`` = internal algorithm defaults; model kwargs omitted → sklearn defaults)
     sfs_cv: int | None = None,
     sfs_scoring: str | None = None,
     sfs_min_improvement: float | None = None,
@@ -1532,7 +1430,6 @@ def run_feature_selection_on_one_fold(
     sfs_rf_min_samples_leaf: int | None = None,
     sfs_rf_max_features: str | float | int | None = None,
     sfs_knn_n_neighbors: int | None = None,
-    # RFE base-estimator args (passed to :func:`recursive_elimination_selector`)
     rfe_enet_alpha: float | None = None,
     rfe_enet_l1_ratio: float | None = None,
     rfe_rf_n_estimators: int | None = None,
@@ -1543,90 +1440,8 @@ def run_feature_selection_on_one_fold(
     rfe_svm_epsilon: float | None = None,
     rfe_step: int | None = None,
     verbose: bool = False,
-    # feature count cap applied at selection time (not just eval)
     selection_max_features: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-    """MinMax-scale candidate columns (fit on train, transform train+test) → low-var →
-    inter-corr prefilter and one selector on one train/test fold.
-
-    All downstream steps (including eval in ``run_fold_pipeline_config``) see the same
-    scaled feature matrices; ``stability_selector`` is called with ``minmax_scale=False``.
-
-    ``feature_selection_pipeline`` must be a single name: ``stability``,
-    ``correlation``, ``sfs``, or ``rfe`` (no ``->`` chaining).
-
-    ``candidate_features`` — if ``None``, uses every column except ``target_*`` and
-    ``name``. If set, every name must appear in ``train_df_k.columns`` (raises
-    otherwise); order preserved with duplicates dropped.
-
-    Optional **correlation reduction** (YAML ``correlation_reduction`` with ``min_n_features`` on
-    the pipeline or legacy dataset mapping, or ``correlation_reduction_min_n_features`` in shared
-    hyperparameters): after the intercorrelation
-    prefilter, ranks features by Spearman |rho| to ``target_col`` on the train fold (same
-    elbow geometry as stability selection on descending scores), then keeps
-    ``max(min_n_features, elbow_n)`` names, capped by the prefilter size. Omitted / ``None`` skips.
-
-    Optional **stability prereduction** (YAML ``stability_reduction.prereduction`` with
-    ``n_features``): after correlation reduction (when set) or after the intercorrelation
-    prefilter, runs a lightweight stability top-``n`` pass — fixed
-    :data:`STABILITY_PREREDUCTION_N_SUBSAMPLES` (50) subsamples and sample fraction
-    ``max(0.4, min(0.8, 1/log10(5 + n_train)))`` (same rule as
-    :func:`stability_reduction_subsample_fraction_fold_train_log10`) — using the same
-    estimator as ``stability_reduction`` (``model`` / ``stability_reduction_model``), then
-    keeps the top ``n_features`` before the main stability reduction step. Omitted / absent
-    skips entirely.
-
-    Optional **stability reduction** (YAML ``pipeline.stability_reduction`` or shared
-    hyperparameter keys ``stability_reduction_*``): after correlation reduction (when enabled)
-    or after the intercorrelation prefilter,
-    repeated subsample fits (same mechanism as the stability selector) rank features by
-    selection frequency. If ``stability_reduction_n_features`` is set, the top that many
-    features are kept (fixed cap). If the cap is omitted but ``stability_reduction_model`` is
-    set, the same elbow heuristic as :func:`stability_selector` chooses how many features to
-    keep (at least one), then the kept count is ``max(stability_reduction_min_n_features, elbow_n)``
-    when ``stability_reduction_min_n_features`` is set (YAML ``min_n_features``), capped by the
-    number of prefilter features; ties are broken by descending selection frequency. When
-    ``stability_reduction_min_n_features`` is omitted, the elbow count alone is used. Skipped when
-    the prefilter already has at most the cap (top-``n`` mode) or at most one feature (elbow
-    mode), or when both the cap and model are omitted. The YAML
-    alias ``stability_reduction_features`` maps to ``stability_reduction_n_features``. If only
-    the cap is set and ``stability_reduction_model`` is omitted, the subsampling model defaults
-    to ``elasticnet``. For ``stability_reduction_sample_fraction`` / YAML ``subsample_fraction``,
-    use :data:`FOLD_TRAIN_LOG10_CONST_5` (``"fold_train_log10_const_5"``) or aliases
-    ``fold_train_log10``, ``log10_decay``, ``log10_5_plus_n`` to set the fraction from fold
-    train size: ``max(0.4, min(0.8, 1 / log10(5 + n_train)))`` with ``n_train = len(train_df_k)``.
-    Otherwise pass a float, or omit for default ``0.5``. For ``stability_reduction_n_subsamples`` /
-    YAML ``n_subsamples`` under ``stability_reduction``, use :data:`FOLD_TRAIN_LOG10_NS_500`
-    (``"fold_train_log10_ns_500"``) for ``max(100, min(300, round(500 / log10(n_train))))`` with
-    ``n_train = len(train_df_k)`` (at least 2 for a finite denominator). Otherwise pass an int, or
-    omit for default ``100``.
-
-    The **stability selector** step (``feature_selection_pipeline`` includes ``stability``) uses
-    the same tokens on ``stability_n_subsamples`` / ``stability_sample_fraction`` (selector YAML
-    ``hyperparameters``): :data:`FOLD_TRAIN_LOG10_NS_500` and :data:`FOLD_TRAIN_LOG10_CONST_5`
-    resolve per fold like the stability-reduction keys above. Resolved values are echoed in
-    ``stability_selector_subsampling`` on the fold result dict.
-
-    ``selection_max_features`` — caps the number of features kept after selection.
-    For ``stability`` / ``correlation``: hard cap applied post-selection.
-    For ``sfs``: upper bound passed as ``n_features_to_select``; early stopping via
-    ``sfs_min_improvement`` may result in fewer features, which is acceptable.
-    For ``rfe``: mandatory elimination target — RFE always reduces to this count.
-
-    Returns
-    -------
-    train_df_k, test_df_k
-        Train/test after MinMax scaling and dropped low-variance columns (features in
-        ``[0, 1]`` per column, scaler fit on train only).
-    result
-        JSON-serializable dict with ``selected_features``, traces, counts,
-        ``features_lowvar``, ``features_intercorr_prefilter``,
-        ``features_after_correlation_reduction``, ``features_after_prereduction`` (after
-        optional prereduction; equals post–correlation list when prereduction is off), and
-        ``features_after_stability_reduction`` (names entering the main selector step;
-        equals post–prereduction list when stability reduction is off or skipped).
-    """
-
     pipeline_steps = _parse_feature_selection_pipeline(feature_selection_pipeline)
     needs_model = bool(set(pipeline_steps) & _PIPELINE_STEPS_NEEDING_MODEL)
     if needs_model:
@@ -1898,8 +1713,8 @@ def run_feature_selection_on_one_fold(
                 sr_ns = int(stability_reduction_n_subsamples)
                 _sr_ns_rule = "fixed"
             else:
-                sr_ns = 100
-                _sr_ns_rule = "default"
+                sr_ns = stability_reduction_n_subsamples_fold_train_log500(len(train_df_k))
+                _sr_ns_rule = FOLD_TRAIN_LOG10_NS_500
             _sr_sf_spec = stability_reduction_sample_fraction
             if _sr_sf_spec in (
                 FOLD_TRAIN_LOG10_CONST_5,
@@ -1913,8 +1728,10 @@ def run_feature_selection_on_one_fold(
                 sr_sf = float(stability_reduction_sample_fraction)
                 _sr_sf_rule = "fixed"
             else:
-                sr_sf = 0.5
-                _sr_sf_rule = "default"
+                sr_sf = stability_reduction_subsample_fraction_fold_train_log10(
+                    len(train_df_k)
+                )
+                _sr_sf_rule = FOLD_TRAIN_LOG10_CONST_5
             try:
                 if _sr_cap_set:
                     _, sel_sr = stability_reduction_select_top_n(
@@ -2016,7 +1833,6 @@ def run_feature_selection_on_one_fold(
                 if _sr_cap_set:
                     stability_reduction_summary["n_features_cap"] = n_cap
 
-    # Feature names entering the main selector (after optional stability reduction).
     features_after_stability_reduction = list(current_features)
 
     after_step: dict[str, list[str]] = {}

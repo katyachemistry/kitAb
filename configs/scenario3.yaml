@@ -1,0 +1,11 @@
+input_csvs_folder: datasets
+
+result_folder: scenario3
+
+structure_prediction:
+  model: abb3 # abb2
+  device: 0 # 1; 0,3
+
+# n_cpu: 4 # number of CPUs to use for descriptors calculation and AutoML, default all available
+
+automl: False
