@@ -1,0 +1,12 @@
+# Scenario 2a: descriptors only on existing structures (no CSV datasets, no AutoML).
+# Layout: either top-level PDB/mmCIF files in input_structures_folder, or one
+# subdirectory per batch (e.g. ab21_abb3_1/mAb1.pdb).
+input_structures_folder: structures_abb2_paired_oas_sanity_skip_minimized
+
+result_folder: abngs_trial
+
+# n_cpu: 4
+
+structures_processing:
+  renumber_imgt: False
+  minimize: False

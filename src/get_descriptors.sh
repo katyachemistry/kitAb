@@ -1,17 +1,54 @@
 #!/bin/bash
 # mkdssp, propka, freesasa -> developability (parallel over PDB folders).
-# Usage: get_descriptors.sh [--output-dir DIR] [--parent-dir DIR ...] STRUCTURES_DIR ... [num_jobs] [--pH VALUE]
+# Usage: get_descriptors.sh [--output-dir DIR] [--parent-dir DIR ...] STRUCTURES_DIR ... [num_jobs] [--pH VALUE] [--sanity_check_abb2] [--remove_helper_outputs] [--clean-external-outputs]
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
+if [[ -f "$PROJECT_ROOT/fastab.local.env" ]]; then
+    # shellcheck disable=SC1091
+    source "$PROJECT_ROOT/fastab.local.env"
+fi
+
+FASTAB_ENV="${FASTAB_ENV:-fastab}"
+PY="${PY:-conda run -n ${FASTAB_ENV} python}"
+DSSP_BIN="${DSSP_BIN:-mkdssp}"
+
+_py_to_array() {
+    local _py_cmd="$1"
+    local -n _out=$2
+    _out=()
+    mapfile -t _out < <(python3 -c 'import shlex,sys
+for part in shlex.split(sys.argv[1]):
+    print(part)' "$_py_cmd")
+    if [[ ${#_out[@]} -eq 0 ]]; then
+        echo "Error: PY command is empty." >&2
+        exit 1
+    fi
+}
+_py_to_array "$PY" PY_ARR
+
+_fastab_run() {
+    if command -v mamba &>/dev/null; then
+        mamba run -n "$FASTAB_ENV" "$@"
+    elif command -v conda &>/dev/null; then
+        conda run -n "$FASTAB_ENV" "$@"
+    else
+        "$@"
+    fi
+}
+
 EXPLICIT_STRUCTURES=()
 PARENT_DIR_INPUTS=()
 NUM_JOBS=""
 PH_VALUE="7.5"
 USER_OUTPUT_DESCRIPTOR_ROOT=""
+NAMES_FROM_CSV=""
+SANITY_CHECK_ABB2=false
+REMOVE_HELPER_OUTPUTS=false
+CLEAN_EXTERNAL_OUTPUTS=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -42,6 +79,27 @@ while [[ $# -gt 0 ]]; do
             PH_VALUE="$2"
             shift 2
             ;;
+        --names-from-csv)
+            if [[ $# -lt 2 ]]; then
+                echo "Usage: $0 ... [--names-from-csv CSV]" >&2
+                echo "  Error: --names-from-csv requires a CSV path." >&2
+                exit 1
+            fi
+            NAMES_FROM_CSV="$2"
+            shift 2
+            ;;
+        --sanity_check_abb2)
+            SANITY_CHECK_ABB2=true
+            shift
+            ;;
+        --remove_helper_outputs)
+            REMOVE_HELPER_OUTPUTS=true
+            shift
+            ;;
+        --clean-external-outputs)
+            CLEAN_EXTERNAL_OUTPUTS=true
+            shift
+            ;;
         [0-9]*)
             NUM_JOBS="$1"
             shift
@@ -55,6 +113,9 @@ done
 
 STRUCTURES_DIRS=()
 for arg in "${EXPLICIT_STRUCTURES[@]}"; do
+    if [[ -z "$arg" ]]; then
+        continue
+    fi
     if [[ -d "$arg" ]]; then
         STRUCTURES_DIRS+=("$arg")
         continue
@@ -115,6 +176,9 @@ if [[ ${#STRUCTURES_DIRS[@]} -eq 0 ]]; then
     echo "  Runs mkdssp -> propka -> freesasa -> developability for each folder (default: ./developability_descriptors/<basename>/)." >&2
     echo "  --output-dir DIR: write per-dataset outputs under DIR/<basename>/ instead of ./developability_descriptors/<basename>/." >&2
     echo "  --parent-dir: run on every immediate subdirectory of DIR that contains at least one .pdb file." >&2
+    echo "  --sanity_check_abb2: skip PDBs whose ATOM B-factors are all 0.00; log skipped names under the output dir." >&2
+    echo "  --remove_helper_outputs: delete dssp/propka/freesasa files after a structure's descriptor JSON is written." >&2
+    echo "  --clean-external-outputs: after all descriptors for a dataset, remove dssp/, propka/, and sasa/ subdirs." >&2
     exit 1
 fi
 
@@ -154,18 +218,213 @@ else
     DESCRIPTOR_ROOT="${RUN_INVOCATION_DIR}/developability_descriptors"
 fi
 cd "$PROJECT_ROOT"
+export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export NUM_JOBS SCRIPT_DIR
 export PH_VALUE
+export SANITY_CHECK_ABB2
+export REMOVE_HELPER_OUTPUTS
+export CLEAN_EXTERNAL_OUTPUTS
+
+_remove_helper_outputs_for_stem() {
+    local basename="$1"
+    [[ "$REMOVE_HELPER_OUTPUTS" == true ]] || return 0
+    rm -f \
+        "${DSSP_DIR}/${basename}.dssp" \
+        "${PKA_DIR}/${basename}_full.pka" \
+        "${PKA_DIR}/${basename}_full.log" \
+        "${SASA_DIR}/${basename}_full.sasa" \
+        "${SASA_DIR}/${basename}_H_full.sasa" \
+        "${SASA_DIR}/${basename}_L_full.sasa"
+}
+
+_clean_external_output_dirs() {
+    [[ "$CLEAN_EXTERNAL_OUTPUTS" == true ]] || return 0
+    rm -rf "$DSSP_OUTPUT_DIR" "$PROPKA_OUTPUT_DIR" "$SASA_OUTPUT_DIR"
+    echo "Removed external helper dirs for ${BASE_NAME}: dssp/, propka/, sasa/"
+}
+
+# PropKa writes {input_stem}.pka in cwd. Temp renumbered inputs use the prepare stem
+# (e.g. mAb1_full.pdb -> mAb1_full.pka), then rename to {basename}_full.pka.
+_finalize_propka_pka() {
+    local generated="$1"
+    local target="$2"
+    if [ ! -f "$generated" ]; then
+        return 1
+    fi
+    if [ "$generated" != "$target" ]; then
+        mv "$generated" "$target"
+    fi
+    return 0
+}
+
+_abb2_bfactor_all_zero() {
+    local pdb_path="$1"
+    # PDB B-factor columns 61-66; skip when every ATOM/HETATM value is 0.00.
+    awk '
+        /^ATOM|^HETATM/ {
+            if (length($0) < 66) next
+            n++
+            if ((substr($0, 61, 6) + 0) != 0) found_nonzero = 1
+        }
+        END {
+            if (n == 0) exit 1
+            exit (found_nonzero ? 1 : 0)
+        }
+    ' "$pdb_path"
+}
+
+_log_abb2_sanity_skip() {
+    local stem="$1"
+    local log_file="$2"
+    echo "$stem" >> "$log_file"
+}
+
+declare -A ABB2_SKIP_LOOKUP=()
+ABB2_SKIP_STEMS_CSV=""
+
+_build_abb2_sanity_skip_set() {
+    local dir="$1"
+    local log_file="$2"
+    ABB2_SKIP_LOOKUP=()
+    ABB2_SKIP_STEMS_CSV=""
+    : > "$log_file"
+    local pdb stem
+    while IFS= read -r -d '' pdb; do
+        stem="${pdb##*/}"
+        stem="${stem%.pdb}"
+        if ! _is_pipeline_pdb_stem "$stem"; then
+            continue
+        fi
+        if _abb2_bfactor_all_zero "$pdb"; then
+            ABB2_SKIP_LOOKUP[$stem]=1
+            _log_abb2_sanity_skip "$stem" "$log_file"
+        fi
+    done < <(find "$dir" -maxdepth 1 -name "*.pdb" -type f ! -path '*/.*/*' ! -name "*_H.pdb" ! -name "*_L.pdb" -print0)
+    if [[ ${#ABB2_SKIP_LOOKUP[@]} -gt 0 ]]; then
+        local stems=()
+        for stem in "${!ABB2_SKIP_LOOKUP[@]}"; do
+            stems+=("$stem")
+        done
+        ABB2_SKIP_STEMS_CSV="$(printf '%s,' "${stems[@]}")"
+    fi
+}
+
+_is_abb2_sanity_skipped_stem() {
+    local stem="$1"
+    [[ -n "${ABB2_SKIP_LOOKUP[$stem]:-}" ]]
+}
+
+_validate_descriptor_outputs_for_csv() {
+    local csv_path="$1"
+    local results_dir="$2"
+    if [[ -z "$csv_path" || ! -f "$csv_path" ]]; then
+        return 0
+    fi
+    if [[ ! -d "$results_dir" ]]; then
+        echo "Error: descriptor results directory not found: $results_dir" >&2
+        exit 1
+    fi
+
+    local skip_csv="${ABB2_SKIP_STEMS_CSV:-}"
+    if ! "${PY_ARR[@]}" - "$csv_path" "$results_dir" "$skip_csv" <<'PY'
+import csv
+import sys
+from pathlib import Path
+
+csv_path = Path(sys.argv[1])
+results_dir = Path(sys.argv[2])
+skip_names = {
+    name.strip()
+    for name in sys.argv[3].split(",")
+    if name.strip()
+}
+
+with csv_path.open(newline="") as handle:
+    reader = csv.DictReader(handle)
+    if "name" not in (reader.fieldnames or []):
+        raise SystemExit(f"CSV has no name column: {csv_path}")
+    expected = [
+        (row.get("name") or "").strip()
+        for row in reader
+        if (row.get("name") or "").strip()
+    ]
+
+missing = []
+for name in expected:
+    if name in skip_names:
+        continue
+    json_path = results_dir / f"{name}.json"
+    if not json_path.is_file() or json_path.stat().st_size == 0:
+        missing.append(name)
+
+if missing:
+    preview = ", ".join(missing[:10])
+    extra = f" (+{len(missing) - 10} more)" if len(missing) > 10 else ""
+    raise SystemExit(
+        f"Missing descriptor JSON for {len(missing)} CSV name(s) in {results_dir}: "
+        f"{preview}{extra}"
+    )
+PY
+    then
+        exit 1
+    fi
+}
+
+ALLOWED_NAMES=()
+if [[ -n "$NAMES_FROM_CSV" ]]; then
+    if [[ ! -f "$NAMES_FROM_CSV" ]]; then
+        echo "Error: --names-from-csv file not found: $NAMES_FROM_CSV" >&2
+        exit 1
+    fi
+    mapfile -t ALLOWED_NAMES < <("${PY_ARR[@]}" -c 'import csv, sys
+with open(sys.argv[1], newline="") as handle:
+    reader = csv.DictReader(handle)
+    if "name" not in (reader.fieldnames or []):
+        raise SystemExit(f"CSV has no name column: {sys.argv[1]}")
+    for row in reader:
+        name = (row.get("name") or "").strip()
+        if name:
+            print(name)' "$NAMES_FROM_CSV")
+    if [[ ${#ALLOWED_NAMES[@]} -eq 0 ]]; then
+        echo "Error: no names found in --names-from-csv: $NAMES_FROM_CSV" >&2
+        exit 1
+    fi
+fi
+export ALLOWED_NAMES
+if [[ ${#ALLOWED_NAMES[@]} -gt 0 ]]; then
+    ALLOWED_NAMES_CSV="$(printf '%s,' "${ALLOWED_NAMES[@]}")"
+else
+    ALLOWED_NAMES_CSV=""
+fi
+export ALLOWED_NAMES_CSV
+
+_is_pipeline_pdb_stem() {
+    local stem="$1"
+    case "$stem" in
+        *_full_atom_sasa|*_H_chain|*_L_chain|*_H|*_L) return 1 ;;
+    esac
+    if [[ -n "$ALLOWED_NAMES_CSV" ]]; then
+        local name
+        for name in "${ALLOWED_NAMES[@]}"; do
+            [[ "$stem" == "$name" ]] && return 0
+        done
+        return 1
+    fi
+    return 0
+}
 
 pipeline_pdb_paths() {
     local dir="$1"
-    find "$dir" -name "*.pdb" -type f ! -name "*_H.pdb" ! -name "*_L.pdb" -print0 | while IFS= read -r -d '' pdb; do
+    # Top-level antibody PDBs only; skip hidden staging dirs and pipeline artifacts.
+    find "$dir" -maxdepth 1 -name "*.pdb" -type f ! -path '*/.*/*' ! -name "*_H.pdb" ! -name "*_L.pdb" -print0 | while IFS= read -r -d '' pdb; do
         local stem="${pdb##*/}"
         stem="${stem%.pdb}"
-        case "$stem" in
-            *_H|*_L) ;;
-            *) printf '%s\0' "$pdb" ;;
-        esac
+        if _is_pipeline_pdb_stem "$stem"; then
+            if [[ "$SANITY_CHECK_ABB2" == true ]] && _is_abb2_sanity_skipped_stem "$stem"; then
+                continue
+            fi
+            printf '%s\0' "$pdb"
+        fi
     done
 }
 
@@ -180,9 +439,6 @@ count_pipeline_pdbs() {
 USE_GNU_PARALLEL=false
 command -v parallel &>/dev/null && USE_GNU_PARALLEL=true
 
-PROPKA_CONDA_ACTIVATE="${PROPKA_CONDA_ACTIVATE:-source /home/kb/miniforge3/bin/activate developability}"
-DSSP_BIN="${DSSP_BIN:-mkdssp}"
-
 RUN_START=$(date +%s)
 TOTAL_STRUCTURES=0
 
@@ -191,8 +447,6 @@ PIPELINE_ORDER=(dssp propka freesasa developability)
 for STRUCTURES_DIR in "${STRUCTURES_DIRS[@]}"; do
     STRUCTURES_DIR="$(cd "$STRUCTURES_DIR" && pwd)"
     BASE_NAME="$(basename "$STRUCTURES_DIR")"
-    N_PDB=$(count_pipeline_pdbs "$STRUCTURES_DIR")
-    TOTAL_STRUCTURES=$((TOTAL_STRUCTURES + N_PDB))
 
     DATASET_DESCRIPTOR_DIR="${DESCRIPTOR_ROOT}/${BASE_NAME}"
     DSSP_OUTPUT_DIR="${DATASET_DESCRIPTOR_DIR}/dssp"
@@ -200,6 +454,19 @@ for STRUCTURES_DIR in "${STRUCTURES_DIRS[@]}"; do
     SASA_OUTPUT_DIR="${DATASET_DESCRIPTOR_DIR}/sasa"
     DEV_JSON_OUTPUT_DIR="${DATASET_DESCRIPTOR_DIR}/results"
     mkdir -p "$DSSP_OUTPUT_DIR" "$PROPKA_OUTPUT_DIR" "$SASA_OUTPUT_DIR" "$DEV_JSON_OUTPUT_DIR"
+
+    if [[ "$SANITY_CHECK_ABB2" == true ]]; then
+        ABB2_SANITY_SKIP_LOG="${DATASET_DESCRIPTOR_DIR}/abb2_sanity_skip.log"
+        _build_abb2_sanity_skip_set "$STRUCTURES_DIR" "$ABB2_SANITY_SKIP_LOG"
+        export ABB2_SANITY_SKIP_LOG ABB2_SKIP_STEMS_CSV
+    else
+        ABB2_SKIP_LOOKUP=()
+        ABB2_SKIP_STEMS_CSV=""
+        unset ABB2_SANITY_SKIP_LOG
+    fi
+
+    N_PDB=$(count_pipeline_pdbs "$STRUCTURES_DIR")
+    TOTAL_STRUCTURES=$((TOTAL_STRUCTURES + N_PDB))
 
     for MODE in "${PIPELINE_ORDER[@]}"; do
     case "$MODE" in
@@ -218,7 +485,7 @@ for STRUCTURES_DIR in "${STRUCTURES_DIRS[@]}"; do
                         echo "CRYST1    1.000    1.000    1.000  90.00  90.00  90.00 P 1           1          "
                         awk '!/^REMARK/ && !/^CRYST1/' "$pdb_file"
                     } > "$temp_pdb"
-                    if ! "$DSSP_BIN" "$temp_pdb" "$output_file" &>/dev/null; then
+                    if ! _fastab_run "$DSSP_BIN" "$temp_pdb" "$output_file" &>/dev/null; then
                         echo "✗ $basename (failed)"
                         rm -f "$output_file"
                     elif [[ ! -s "$output_file" ]]; then
@@ -227,13 +494,14 @@ for STRUCTURES_DIR in "${STRUCTURES_DIRS[@]}"; do
                     fi
                     rm -f "$temp_pdb"
                 }
-                export -f process_file
-                export DSSP_BIN
+                export -f process_file _fastab_run
+                export DSSP_BIN FASTAB_ENV
                 pipeline_pdb_paths "$STRUCTURES_DIR" | parallel -0 -j "$NUM_JOBS" process_file {}
             else
-                export STRUCTURES_DIR DSSP_BIN
-                python3 << 'DSSP_PY'
+                export STRUCTURES_DIR DSSP_BIN FASTAB_ENV
+                "${PY_ARR[@]}" << 'DSSP_PY'
 import os
+import shutil
 from pathlib import Path
 from multiprocessing import Pool, cpu_count
 import subprocess
@@ -242,7 +510,14 @@ STRUCTURES_DIR = os.environ.get("STRUCTURES_DIR", ".")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
 SCRIPT_DIR = os.environ.get("SCRIPT_DIR", ".")
 DSSP_BIN = os.environ.get("DSSP_BIN", "mkdssp")
+FASTAB_ENV = os.environ.get("FASTAB_ENV", "fastab")
 num_jobs = int(os.environ.get("NUM_JOBS", str(cpu_count())))
+
+def run_in_fastab(args, **kwargs):
+    for conda in ("mamba", "conda"):
+        if shutil.which(conda):
+            return subprocess.run([conda, "run", "-n", FASTAB_ENV, *args], **kwargs)
+    return subprocess.run(args, **kwargs)
 
 def process_file(pdb_path):
     pdb_file = Path(pdb_path)
@@ -258,7 +533,7 @@ def process_file(pdb_path):
                     if not line.startswith('REMARK') and not line.startswith('CRYST1'):
                         tf.write(line)
             path = tf.name
-        r = subprocess.run([DSSP_BIN, path, str(output_file)], capture_output=True, text=True, cwd=SCRIPT_DIR)
+        r = run_in_fastab([DSSP_BIN, path, str(output_file)], capture_output=True, text=True, cwd=SCRIPT_DIR)
         Path(path).unlink(missing_ok=True)
         if r.returncode != 0:
             output_file.unlink(missing_ok=True)
@@ -270,7 +545,24 @@ def process_file(pdb_path):
     except Exception as e:
         return f"✗ {basename} (error: {str(e)[:50]})"
 
-pdb_files = sorted(p for p in Path(STRUCTURES_DIR).rglob("*.pdb") if not (p.stem.endswith("_H") or p.stem.endswith("_L")))
+allowed_names = set(filter(None, os.environ.get("ALLOWED_NAMES_CSV", "").split(",")))
+abb2_skip_stems = set(filter(None, os.environ.get("ABB2_SKIP_STEMS_CSV", "").split(",")))
+
+def pipeline_pdb_files(structures_dir):
+    root = Path(structures_dir)
+    out = []
+    for p in sorted(root.glob("*.pdb")):
+        stem = p.stem
+        if stem.endswith(("_H", "_L", "_full_atom_sasa", "_H_chain", "_L_chain")):
+            continue
+        if allowed_names and stem not in allowed_names:
+            continue
+        if stem in abb2_skip_stems:
+            continue
+        out.append(p)
+    return out
+
+pdb_files = pipeline_pdb_files(STRUCTURES_DIR)
 with Pool(num_jobs) as pool:
     results = pool.map(process_file, pdb_files)
 for r in results:
@@ -287,58 +579,70 @@ DSSP_PY
             SASA_DIR="$SASA_OUTPUT_DIR"
             export SASA_DIR
             if [ "$USE_GNU_PARALLEL" = true ]; then
-                pipeline_pdb_paths "$STRUCTURES_DIR" | parallel -0 -j "$NUM_JOBS" '
-                    pdbfile={}
+                process_file() {
+                    local pdbfile="$1"
+                    local filename
                     filename=$(basename "$pdbfile" .pdb)
-                    sasa_full="'"$SASA_DIR"'/${filename}_full.sasa"
-                    sasa_H="'"$SASA_DIR"'/${filename}_H_full.sasa"
-                    sasa_L="'"$SASA_DIR"'/${filename}_L_full.sasa"
-
+                    local sasa_full="${SASA_DIR}/${filename}_full.sasa"
+                    local sasa_H="${SASA_DIR}/${filename}_H_full.sasa"
+                    local sasa_L="${SASA_DIR}/${filename}_L_full.sasa"
+                    local tmp_H tmp_L
                     tmp_H=$(mktemp)
                     tmp_L=$(mktemp)
-                    awk '"'"'{
+                    awk -v h="$tmp_H" -v l="$tmp_L" '{
                         if ($1 == "ATOM" || $1 == "HETATM") {
                             chain = substr($0, 22, 1);
-                            if (chain == "H") print > "'"'"'"$tmp_H"'"'"'";
-                            if (chain == "L") print > "'"'"'"$tmp_L"'"'"'";
+                            if (chain == "H") print > h;
+                            if (chain == "L") print > l;
                         } else {
-                            print > "'"'"'"$tmp_H"'"'"'";
-                            print > "'"'"'"$tmp_L"'"'"'";
+                            print > h;
+                            print > l;
                         }
-                    }'"'"' "$pdbfile"
+                    }' "$pdbfile"
 
-                    if ! freesasa --shrake-rupley --format=rsa --depth=residue "$pdbfile" > "$sasa_full" 2>/dev/null; then
+                    if ! _fastab_run freesasa --shrake-rupley --format=rsa --depth=residue "$pdbfile" > "$sasa_full" 2>/dev/null; then
                         echo "✗ $filename (full failed)"
                         rm -f "$sasa_full"
                     fi
 
                     if grep -q "^ATOM" "$tmp_H"; then
-                        if ! freesasa --shrake-rupley --format=rsa --depth=residue "$tmp_H" > "$sasa_H" 2>/dev/null; then
+                        if ! _fastab_run freesasa --shrake-rupley --format=rsa --depth=residue "$tmp_H" > "$sasa_H" 2>/dev/null; then
                             echo "✗ $filename (H-only failed)"
                             rm -f "$sasa_H"
                         fi
                     fi
 
                     if grep -q "^ATOM" "$tmp_L"; then
-                        if ! freesasa --shrake-rupley --format=rsa --depth=residue "$tmp_L" > "$sasa_L" 2>/dev/null; then
+                        if ! _fastab_run freesasa --shrake-rupley --format=rsa --depth=residue "$tmp_L" > "$sasa_L" 2>/dev/null; then
                             echo "✗ $filename (L-only failed)"
                             rm -f "$sasa_L"
                         fi
                     fi
 
                     rm -f "$tmp_H" "$tmp_L"
-                '
+                }
+                export -f process_file _fastab_run
+                export SASA_DIR FASTAB_ENV
+                pipeline_pdb_paths "$STRUCTURES_DIR" | parallel -0 -j "$NUM_JOBS" process_file {}
             else
-                export STRUCTURES_DIR
-                python3 << 'FREESASA_PY'
+                export STRUCTURES_DIR SASA_DIR FASTAB_ENV
+                "${PY_ARR[@]}" << 'FREESASA_PY'
 import os
+import shutil
 from pathlib import Path
 from multiprocessing import Pool, cpu_count
 import subprocess
 import tempfile
 STRUCTURES_DIR = os.environ.get("STRUCTURES_DIR", ".")
 SASA_DIR = os.environ.get("SASA_DIR", ".")
+FASTAB_ENV = os.environ.get("FASTAB_ENV", "fastab")
 num_jobs = int(os.environ.get("NUM_JOBS", str(cpu_count())))
+
+def run_in_fastab(args, **kwargs):
+    for conda in ("mamba", "conda"):
+        if shutil.which(conda):
+            return subprocess.run([conda, "run", "-n", FASTAB_ENV, *args], **kwargs)
+    return subprocess.run(args, **kwargs)
 
 def process_file(pdb_path):
     pdb_file = Path(pdb_path)
@@ -365,7 +669,7 @@ def process_file(pdb_path):
 
     errors = []
 
-    r = subprocess.run(
+    r = run_in_fastab(
         ["freesasa", "--shrake-rupley", "--format=rsa", "--depth=residue", str(pdb_file)],
         capture_output=True, text=True
     )
@@ -380,7 +684,7 @@ def process_file(pdb_path):
 
     has_H_atoms = any(l.startswith("ATOM") for l in tmp_H_path.read_text().splitlines())
     if has_H_atoms:
-        r = subprocess.run(
+        r = run_in_fastab(
             ["freesasa", "--shrake-rupley", "--format=rsa", "--depth=residue", str(tmp_H_path)],
             capture_output=True, text=True
         )
@@ -391,7 +695,7 @@ def process_file(pdb_path):
 
     has_L_atoms = any(l.startswith("ATOM") for l in tmp_L_path.read_text().splitlines())
     if has_L_atoms:
-        r = subprocess.run(
+        r = run_in_fastab(
             ["freesasa", "--shrake-rupley", "--format=rsa", "--depth=residue", str(tmp_L_path)],
             capture_output=True, text=True
         )
@@ -411,7 +715,24 @@ def process_file(pdb_path):
 
     return "; ".join(errors) if errors else None
 
-pdb_files = sorted(p for p in Path(STRUCTURES_DIR).rglob("*.pdb") if not (p.stem.endswith("_H") or p.stem.endswith("_L")))
+allowed_names = set(filter(None, os.environ.get("ALLOWED_NAMES_CSV", "").split(",")))
+abb2_skip_stems = set(filter(None, os.environ.get("ABB2_SKIP_STEMS_CSV", "").split(",")))
+
+def pipeline_pdb_files(structures_dir):
+    root = Path(structures_dir)
+    out = []
+    for p in sorted(root.glob("*.pdb")):
+        stem = p.stem
+        if stem.endswith(("_H", "_L", "_full_atom_sasa", "_H_chain", "_L_chain")):
+            continue
+        if allowed_names and stem not in allowed_names:
+            continue
+        if stem in abb2_skip_stems:
+            continue
+        out.append(p)
+    return out
+
+pdb_files = pipeline_pdb_files(STRUCTURES_DIR)
 with Pool(num_jobs) as pool:
     results = pool.map(process_file, pdb_files)
 for r in results:
@@ -426,88 +747,115 @@ FREESASA_PY
 
         propka)
             OUTPUT_DIR="$PROPKA_OUTPUT_DIR"
-            export OUTPUT_DIR PROPKA_CONDA_ACTIVATE
+            export OUTPUT_DIR
+            PROPKA_TMP_STRUCTURES="${OUTPUT_DIR}/tmp_structures"
+            mkdir -p "$PROPKA_TMP_STRUCTURES"
+            export PROPKA_TMP_STRUCTURES
             if [ "$USE_GNU_PARALLEL" = true ]; then
                 process_file() {
                     local pdb_file="$1"
                     local basename=$(basename "$pdb_file" .pdb)
                     local output_dir="$2"
-                    eval "$PROPKA_CONDA_ACTIVATE"
+                    local tmp_structures="${output_dir}/tmp_structures"
+                    mkdir -p "$tmp_structures"
                     cd "$output_dir"
-                    propka3 "$pdb_file" > "${basename}_full.log" 2>&1
-                    if [ -f "${basename}.pka" ]; then mv "${basename}.pka" "${basename}_full.pka"; else echo "✗ $basename (full - failed)"; fi
-                    grep -E "^REMARK|^HEADER|^TITLE|^COMPND|^SOURCE" "$pdb_file" > "${basename}_H_chain.pdb.tmp"
-                    awk '/^ATOM/ || /^HETATM/ { if (substr($0, 22, 1) == "H") print }' "$pdb_file" >> "${basename}_H_chain.pdb.tmp"
-                    echo "END" >> "${basename}_H_chain.pdb.tmp"
-                    mv "${basename}_H_chain.pdb.tmp" "${basename}_H_chain.pdb"
-                    propka3 "${basename}_H_chain.pdb" > "${basename}_H.log" 2>&1
-                    if [ -f "${basename}_H_chain.pka" ]; then mv "${basename}_H_chain.pka" "${basename}_H.pka"; else echo "✗ $basename (H chain - failed)"; fi
-                    grep -E "^REMARK|^HEADER|^TITLE|^COMPND|^SOURCE" "$pdb_file" > "${basename}_L_chain.pdb.tmp"
-                    awk '/^ATOM/ || /^HETATM/ { if (substr($0, 22, 1) == "L") print }' "$pdb_file" >> "${basename}_L_chain.pdb.tmp"
-                    echo "END" >> "${basename}_L_chain.pdb.tmp"
-                    mv "${basename}_L_chain.pdb.tmp" "${basename}_L_chain.pdb"
-                    propka3 "${basename}_L_chain.pdb" > "${basename}_L.log" 2>&1
-                    if [ -f "${basename}_L_chain.pka" ]; then mv "${basename}_L_chain.pka" "${basename}_L.pka"; else echo "✗ $basename (L chain - failed)"; fi
-                    rm -f "${basename}_H_chain.pdb" "${basename}_L_chain.pdb"
+                    local propka_input propka_stem
+                    propka_input=$(cd "$SCRIPT_DIR" && _fastab_run python utils/prepare_propka_input.py "$pdb_file" \
+                        --tmp-dir "$tmp_structures" --stem "${basename}_full" 2>/dev/null | head -1)
+                    propka_stem=$(basename "$propka_input" .pdb)
+                    _fastab_run propka3 "$propka_input" > "${basename}_full.log" 2>&1
+                    if ! _finalize_propka_pka "${propka_stem}.pka" "${basename}_full.pka"; then echo "✗ $basename (full - failed)"; fi
                 }
-                export -f process_file
+                export -f process_file _fastab_run _finalize_propka_pka
+                export FASTAB_ENV SCRIPT_DIR
                 pipeline_pdb_paths "$STRUCTURES_DIR" | parallel -0 -j "$NUM_JOBS" process_file {} "$OUTPUT_DIR"
             else
-                export STRUCTURES_DIR
-                python3 << 'PROPKA_PY'
+                export STRUCTURES_DIR FASTAB_ENV PY SCRIPT_DIR
+                "${PY_ARR[@]}" << 'PROPKA_PY'
 import os
+import shutil
+import sys
 from pathlib import Path
 from multiprocessing import Pool, cpu_count
 import subprocess
 STRUCTURES_DIR = os.environ.get("STRUCTURES_DIR", ".")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
+FASTAB_ENV = os.environ.get("FASTAB_ENV", "fastab")
+SCRIPT_DIR = Path(os.environ.get("SCRIPT_DIR", "."))
+TMP_STRUCTURES = Path(OUTPUT_DIR) / "tmp_structures"
+TMP_STRUCTURES.mkdir(parents=True, exist_ok=True)
 num_jobs = int(os.environ.get("NUM_JOBS", str(cpu_count())))
-conda_activate = os.environ.get("PROPKA_CONDA_ACTIVATE", "source /home/kb/miniforge3/bin/activate developability")
+
+def run_in_fastab(args, **kwargs):
+    for conda in ("mamba", "conda"):
+        if shutil.which(conda):
+            return subprocess.run([conda, "run", "-n", FASTAB_ENV, *args], **kwargs)
+    return subprocess.run(args, **kwargs)
+
+def prepare_propka_input(source_pdb, stem):
+    cmd = [
+        sys.executable,
+        str(SCRIPT_DIR / "utils" / "prepare_propka_input.py"),
+        str(source_pdb),
+        "--tmp-dir",
+        str(TMP_STRUCTURES),
+        "--stem",
+        stem,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=SCRIPT_DIR)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr or r.stdout or f"prepare_propka_input failed for {source_pdb}")
+    propka_input = r.stdout.strip().splitlines()[0].strip()
+    if not propka_input:
+        raise RuntimeError(f"prepare_propka_input returned no PDB path for {source_pdb}")
+    return Path(propka_input)
+
+def run_propka_variant(pdb_file, basename, label, stem):
+    out = []
+    output_dir = Path(OUTPUT_DIR)
+    propka_input = prepare_propka_input(pdb_file, stem)
+    propka_stem = propka_input.stem
+    log_out = output_dir / f"{basename}_{label}.log"
+    pka_out = output_dir / f"{basename}_{label}.pka"
+    r = run_in_fastab(["propka3", str(propka_input)], capture_output=True, text=True, cwd=output_dir)
+    with open(log_out, "w") as f:
+        f.write(r.stdout)
+        f.write(r.stderr)
+    generated = output_dir / f"{propka_stem}.pka"
+    if generated.exists():
+        if generated != pka_out:
+            generated.rename(pka_out)
+    else:
+        out.append(f"✗ {basename} ({label} - failed)")
+    return out
 
 def process_file(pdb_path):
     pdb_file = Path(pdb_path)
     basename = pdb_file.stem
-    output_dir = Path(OUTPUT_DIR)
-    out = []
     try:
-        pka_out = output_dir / f"{basename}_full.pka"
-        log_out = output_dir / f"{basename}_full.log"
-        r = subprocess.run(["bash", "-c", f"{conda_activate} && propka3 '{pdb_file}'"], capture_output=True, text=True, cwd=output_dir)
-        with open(log_out, "w") as f:
-            f.write(r.stdout)
-            f.write(r.stderr)
-        pka = output_dir / f"{basename}.pka"
-        if pka.exists():
-            pka.rename(pka_out)
-        else:
-            out.append(f"✗ {basename} (full - failed)")
-        for chain, ch in [("H", "H"), ("L", "L")]:
-            chain_pdb = output_dir / f"{basename}_{chain}_chain.pdb"
-            with open(chain_pdb, "w") as f:
-                with open(pdb_file) as pdb:
-                    for line in pdb:
-                        if any(line.startswith(x) for x in ["REMARK", "HEADER", "TITLE", "COMPND", "SOURCE"]):
-                            f.write(line)
-                with open(pdb_file) as pdb:
-                    for line in pdb:
-                        if line.startswith(("ATOM", "HETATM")) and len(line) > 21 and line[21] == ch:
-                            f.write(line)
-                f.write("END\n")
-            r = subprocess.run(["bash", "-c", f"{conda_activate} && propka3 '{chain_pdb}'"], capture_output=True, text=True, cwd=output_dir)
-            with open(output_dir / f"{basename}_{chain}.log", "w") as f:
-                f.write(r.stdout)
-                f.write(r.stderr)
-            pka = output_dir / f"{basename}_{chain}_chain.pka"
-            if pka.exists():
-                pka.rename(output_dir / f"{basename}_{chain}.pka")
-            else:
-                out.append(f"✗ {basename} ({chain} chain - failed)")
-            chain_pdb.unlink(missing_ok=True)
+        out = run_propka_variant(pdb_file, basename, "full", f"{basename}_full")
         return "\n".join(out) if out else None
     except Exception as e:
         return f"✗ {basename} (error: {str(e)[:80]})"
 
-pdb_files = sorted(p for p in Path(STRUCTURES_DIR).rglob("*.pdb") if not (p.stem.endswith("_H") or p.stem.endswith("_L")))
+allowed_names = set(filter(None, os.environ.get("ALLOWED_NAMES_CSV", "").split(",")))
+abb2_skip_stems = set(filter(None, os.environ.get("ABB2_SKIP_STEMS_CSV", "").split(",")))
+
+def pipeline_pdb_files(structures_dir):
+    root = Path(structures_dir)
+    out = []
+    for p in sorted(root.glob("*.pdb")):
+        stem = p.stem
+        if stem.endswith(("_H", "_L", "_full_atom_sasa", "_H_chain", "_L_chain")):
+            continue
+        if allowed_names and stem not in allowed_names:
+            continue
+        if stem in abb2_skip_stems:
+            continue
+        out.append(p)
+    return out
+
+pdb_files = pipeline_pdb_files(STRUCTURES_DIR)
 with Pool(num_jobs) as pool:
     results = pool.map(process_file, pdb_files)
 for r in results:
@@ -515,10 +863,9 @@ for r in results:
         for line in r.split("\n"):
             if line.strip():
                 print(line)
-propka_runs = len(pdb_files) * 3
-propka_failed = sum(r.count('✗') for r in results if r)
+propka_failed = sum(1 for r in results if r)
 if propka_failed:
-    print(f"Completed: {propka_runs - propka_failed}/{propka_runs} successful ({propka_failed} failed)")
+    print(f"Completed: {len(pdb_files) - propka_failed}/{len(pdb_files)} successful ({propka_failed} failed)")
 PROPKA_PY
             fi
             ;;
@@ -538,7 +885,7 @@ PROPKA_PY
                     local dssp_file="${DSSP_DIR}/${basename}.dssp"
                     local pka_file="${PKA_DIR}/${basename}_full.pka"
                     local output_file="${OUTPUT_DIR}/${basename}.json"
-                    local cmd=("python3" "developability/calculate_descriptors.py" "$pdb_file" "$sasa_file")
+                    local -a cmd=(python developability/calculate_descriptors.py "$pdb_file" "$sasa_file")
                     if [ ! -f "$sasa_file" ]; then
                         echo "✗ $basename (SASA file not found)"
                         return
@@ -547,17 +894,21 @@ PROPKA_PY
                     [ -f "$pka_file" ] && cmd+=("--pka-file" "$pka_file")
                     cmd+=("--pH" "$PH_VALUE")
                     cmd+=("--output" "$output_file")
-                    if ! output=$(cd "$SCRIPT_DIR" && "${cmd[@]}" 2>&1); then
+                    if ! output=$(cd "$SCRIPT_DIR" && _fastab_run "${cmd[@]}" 2>&1); then
                         echo "✗ $basename (failed)"
                         printf '%s\n' "$output"
+                    elif [[ -s "$output_file" ]]; then
+                        _remove_helper_outputs_for_stem "$basename"
                     fi
                 }
-                export -f process_file
-                export SASA_DIR DSSP_DIR PKA_DIR OUTPUT_DIR PH_VALUE
+                export -f process_file _fastab_run _remove_helper_outputs_for_stem
+                export SASA_DIR DSSP_DIR PKA_DIR OUTPUT_DIR PH_VALUE SCRIPT_DIR FASTAB_ENV REMOVE_HELPER_OUTPUTS
                 pipeline_pdb_paths "$STRUCTURES_DIR" | parallel -0 -j "$NUM_JOBS" process_file {}
             else
-                python3 << 'DEV_PY'
+                export PY REMOVE_HELPER_OUTPUTS
+                "${PY_ARR[@]}" << 'DEV_PY'
 import os
+import shlex
 from pathlib import Path
 from multiprocessing import Pool, cpu_count
 import subprocess
@@ -569,6 +920,21 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
 SCRIPT_DIR = os.environ.get("SCRIPT_DIR", ".")
 num_jobs = int(os.environ.get('NUM_JOBS', cpu_count()))
 ph_value = os.environ.get('PH_VALUE', '7.5')
+py_cmd = shlex.split(os.environ.get("PY", "python3"))
+remove_helper_outputs = os.environ.get("REMOVE_HELPER_OUTPUTS", "").lower() in ("1", "true", "yes")
+
+def remove_helper_outputs_for_stem(basename):
+    if not remove_helper_outputs:
+        return
+    for path in (
+        Path(DSSP_DIR) / f"{basename}.dssp",
+        Path(PKA_DIR) / f"{basename}_full.pka",
+        Path(PKA_DIR) / f"{basename}_full.log",
+        Path(SASA_DIR) / f"{basename}_full.sasa",
+        Path(SASA_DIR) / f"{basename}_H_full.sasa",
+        Path(SASA_DIR) / f"{basename}_L_full.sasa",
+    ):
+        path.unlink(missing_ok=True)
 
 def process_file(pdb_path):
     pdb_file = Path(pdb_path)
@@ -579,7 +945,7 @@ def process_file(pdb_path):
     output_file = Path(OUTPUT_DIR) / f"{basename}.json"
     if not sasa_file.exists():
         return f"✗ {basename} (SASA file not found)"
-    cmd = ["python3", "developability/calculate_descriptors.py", str(pdb_file), str(sasa_file)]
+    cmd = py_cmd + ["developability/calculate_descriptors.py", str(pdb_file), str(sasa_file)]
     if dssp_file.exists():
         cmd.extend(["--dssp-file", str(dssp_file)])
     if pka_file.exists():
@@ -590,11 +956,30 @@ def process_file(pdb_path):
         r = subprocess.run(cmd, capture_output=True, text=True, cwd=SCRIPT_DIR)
         if r.returncode != 0:
             return f"✗ {basename} (failed)\n{r.stderr}"
+        if output_file.is_file() and output_file.stat().st_size > 0:
+            remove_helper_outputs_for_stem(basename)
         return None
     except Exception as e:
         return f"✗ {basename} (error: {str(e)[:200]})"
 
-pdb_files = sorted(p for p in Path(STRUCTURES_DIR).rglob("*.pdb") if not (p.stem.endswith("_H") or p.stem.endswith("_L")))
+allowed_names = set(filter(None, os.environ.get("ALLOWED_NAMES_CSV", "").split(",")))
+abb2_skip_stems = set(filter(None, os.environ.get("ABB2_SKIP_STEMS_CSV", "").split(",")))
+
+def pipeline_pdb_files(structures_dir):
+    root = Path(structures_dir)
+    out = []
+    for p in sorted(root.glob("*.pdb")):
+        stem = p.stem
+        if stem.endswith(("_H", "_L", "_full_atom_sasa", "_H_chain", "_L_chain")):
+            continue
+        if allowed_names and stem not in allowed_names:
+            continue
+        if stem in abb2_skip_stems:
+            continue
+        out.append(p)
+    return out
+
+pdb_files = pipeline_pdb_files(STRUCTURES_DIR)
 with Pool(num_jobs) as pool:
     results = pool.map(process_file, pdb_files)
 for r in results:
@@ -608,6 +993,12 @@ DEV_PY
             ;;
     esac
     done
+
+    if [[ -n "$NAMES_FROM_CSV" ]]; then
+        _validate_descriptor_outputs_for_csv "$NAMES_FROM_CSV" "$DEV_JSON_OUTPUT_DIR"
+    fi
+
+    _clean_external_output_dirs
 done
 
 ELAPSED=$(( $(date +%s) - RUN_START ))

@@ -29,6 +29,7 @@ from automl.feature_selectors import parse_selector_hyperparameters_mapping
 from automl.pipeline_defaults import (
     DEFAULT_EVAL_MODELS,
     DEFAULT_FEATURES_FRAC_CSV,
+    DEFAULT_RANDOM_STATE,
 )
 from automl.utils import parse_eval_hyperparameters_mapping
 
@@ -716,7 +717,7 @@ def _pipeline_settings_from_block(
 
 def _coerce_random_seeds(raw: object, *, yaml_key: str) -> list[int]:
     if raw is None:
-        return [42]
+        return [DEFAULT_RANDOM_STATE]
     if isinstance(raw, (list, tuple)):
         if not raw:
             raise ValueError(
@@ -725,7 +726,7 @@ def _coerce_random_seeds(raw: object, *, yaml_key: str) -> list[int]:
         return [int(float(x)) for x in raw]
     s = str(raw).strip()
     if not s:
-        return [42]
+        return [DEFAULT_RANDOM_STATE]
     if "," in s:
         parts = [p.strip() for p in s.split(",") if p.strip()]
         if not parts:
@@ -745,7 +746,7 @@ def _resolve_random_state_raw(block: dict, pipeline: dict | None) -> object:
             r = _get(src, *names)
             if r is not None:
                 return r
-    return 42
+    return DEFAULT_RANDOM_STATE
 
 
 def _parse_dataset_records(root: dict, pipeline: dict | None) -> list[dict]:
@@ -819,9 +820,9 @@ def _parse_dataset_records(root: dict, pipeline: dict | None) -> list[dict]:
         if skip_pre is False:
             force_preprocess = True
 
-        mtn_raw = _get(block, "max_target_nan_frac", "max-target-nan-frac", default=0.5)
+        mtn_raw = _get(block, "max_target_nan_frac", "max-target-nan-frac", default=0.7)
         try:
-            max_target_nan_frac = float(mtn_raw if mtn_raw is not None else 0.5)
+            max_target_nan_frac = float(mtn_raw if mtn_raw is not None else 0.7)
         except (TypeError, ValueError):
             raise ValueError(
                 f"Dataset block {yaml_key!r}: max_target_nan_frac must be a float in (0, 1]"
@@ -1186,9 +1187,17 @@ def main() -> None:
         help="Do not run aggregate_batch_results.py after parallel finishes.",
     )
     p.add_argument(
+        "--clean-folds",
+        action="store_true",
+        help=(
+            "Remove fold parquet files after parallel completes. Default: keep them until "
+            "hyperparameter tuning succeeds."
+        ),
+    )
+    p.add_argument(
         "--no-clean-folds",
         action="store_true",
-        help="Keep fold parquet files after parallel (default: remove them; disables phase-1 cache reuse).",
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--automl-config",
@@ -1580,6 +1589,7 @@ def main() -> None:
             str(_REPO_ROOT / "src/automl/aggregate_batch_results.py"),
             "--manifest",
             str(manifest_path),
+            "--no-plots",
         ]
         print(
             "Aggregating full batch (batch_manifest.json; refreshes all datasets, "
@@ -1590,7 +1600,7 @@ def main() -> None:
         if r2.returncode != 0:
             sys.exit(r2.returncode)
 
-    if not args.no_clean_folds:
+    if args.clean_folds and not args.no_clean_folds:
         n_removed = 0
         seen_dirs: set[Path] = set()
         for drec in datasets:
@@ -1607,7 +1617,7 @@ def main() -> None:
         if n_removed:
             print(
                 f"Removed {n_removed} fold parquet file(s) from run dir(s). "
-                "(Pass --no-clean-folds to keep them for phase-1 cache reuse.)",
+                "(Omit --clean-folds to keep them for hyperparameter tuning.)",
                 file=sys.stderr,
             )
 

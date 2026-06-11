@@ -28,7 +28,6 @@ from utils.chemistry import (
     get_standard_residue_pka,
     NONPOLAR_RESIDUES,
     BACKBONE_ATOMS,
-    KYTE_DOOLITTLE,
     MAX_SALT_BRIDGE_DISTANCE,
     NEGATIVE_ATOMS,
     NEGATIVE_CHARGED_RESIDUES,
@@ -122,22 +121,295 @@ _SASA_INSERTION_FALLBACK_WARNED: Set[Tuple[ResKey4, ResKey4]] = set()
 
 _CHARGE_CACHE: Dict[Tuple[str, Optional[float], float], float] = {}
 
+IONIZABLE_SIDECHAIN_RESIDUES: frozenset = frozenset(
+    {"ASP", "GLU", "LYS", "ARG", "HIS", "TYR", "CYS"}
+)
+_DISULFIDE_SG_MAX_DISTANCE: float = 2.5
+
+
+def _lookup_pka_value(
+    key: ResKey4,
+    pka_data: Dict[ResKey4, float],
+    *,
+    atoms: Optional[List[Atom]] = None,
+) -> Optional[float]:
+    """PropKa value for a structure residue key (insertion-code fallback only).
+
+    When ``atoms`` is provided, may return a standard model side-chain pKa for the
+    first/last residue of a chain when PropKa lists N+/C- but omits the coupled
+    side-chain row (e.g. N-terminal Asp on kappa light chains).
+    """
+    if key in pka_data:
+        return pka_data[key]
+    insertion_fallback_key = (key[0], key[1], key[2], "")
+    if insertion_fallback_key in pka_data:
+        return pka_data[insertion_fallback_key]
+    if atoms is not None:
+        terminus_std = _terminus_sidechain_standard_pka_fallback(key, pka_data, atoms)
+        if terminus_std is not None:
+            return terminus_std
+    return None
+
+
+def _is_disulfide_cysteine(res_key: ResKey4, atoms: List[Atom]) -> bool:
+    """True when this CYS SG is within bonding distance of another CYS SG."""
+    if res_key[0] != "CYS":
+        return False
+    sg_xyz: Optional[Tuple[float, float, float]] = None
+    for atom in atoms:
+        if residue_key_from_atom(atom) != res_key:
+            continue
+        if (atom.name or "").strip().upper() != "SG":
+            continue
+        sg_xyz = (float(atom.x), float(atom.y), float(atom.z))
+        break
+    if sg_xyz is None:
+        return False
+    sx, sy, sz = sg_xyz
+    for atom in atoms:
+        other_key = residue_key_from_atom(atom)
+        if other_key == res_key or other_key[0] != "CYS":
+            continue
+        if (atom.name or "").strip().upper() != "SG":
+            continue
+        dx, dy, dz = float(atom.x) - sx, float(atom.y) - sy, float(atom.z) - sz
+        if math.sqrt(dx * dx + dy * dy + dz * dz) <= _DISULFIDE_SG_MAX_DISTANCE:
+            return True
+    return False
+
+
+def _n_terminal_residue_by_chain(atoms: List[Atom]) -> Dict[str, ResKey4]:
+    """First residue per chain in sequence order."""
+    seq = _get_residue_seq_index(atoms)
+    chain_keys: Dict[str, List[ResKey4]] = defaultdict(list)
+    for key in iter_unique_residues(atoms):
+        chain_keys[key[2]].append(key)
+    out: Dict[str, ResKey4] = {}
+    for chain, keys in chain_keys.items():
+        keys.sort(key=lambda k: seq.get(k, 999999))
+        out[chain] = keys[0]
+    return out
+
+
+def _c_terminal_residue_by_chain(atoms: List[Atom]) -> Dict[str, ResKey4]:
+    """Last residue per chain in sequence order."""
+    seq = _get_residue_seq_index(atoms)
+    chain_keys: Dict[str, List[ResKey4]] = defaultdict(list)
+    for key in iter_unique_residues(atoms):
+        chain_keys[key[2]].append(key)
+    out: Dict[str, ResKey4] = {}
+    for chain, keys in chain_keys.items():
+        keys.sort(key=lambda k: seq.get(k, 999999))
+        out[chain] = keys[-1]
+    return out
+
+
+def _terminus_sidechain_standard_pka_fallback(
+    key: ResKey4,
+    pka_data: Dict[ResKey4, float],
+    atoms: List[Atom],
+    *,
+    n_terminal_by_chain: Optional[Dict[str, ResKey4]] = None,
+    c_terminal_by_chain: Optional[Dict[str, ResKey4]] = None,
+) -> Optional[float]:
+    """Standard model side-chain pKa when PropKa has N+/C- but omits the terminal side chain.
+
+    Applies only to the first or last residue of a chain with an ionizable side chain.
+    Never overrides an existing PropKa row for that residue.
+    """
+    if key in pka_data or (key[0], key[1], key[2], "") in pka_data:
+        return None
+
+    res_name = key[0]
+    if res_name not in IONIZABLE_SIDECHAIN_RESIDUES:
+        return None
+    if res_name == "CYS" and _is_disulfide_cysteine(key, atoms):
+        return None
+
+    if n_terminal_by_chain is None:
+        n_terminal_by_chain = _n_terminal_residue_by_chain(atoms)
+    if c_terminal_by_chain is None:
+        c_terminal_by_chain = _c_terminal_residue_by_chain(atoms)
+
+    chain = key[2]
+    if (
+        n_terminal_by_chain.get(chain) == key
+        and _has_terminus_pka(pka_data, chain, "N+")
+    ):
+        return get_standard_residue_pka(res_name)
+    if (
+        c_terminal_by_chain.get(chain) == key
+        and _has_terminus_pka(pka_data, chain, "C-")
+    ):
+        return get_standard_residue_pka(res_name)
+    return None
+
+
+def enrich_terminus_sidechain_pka_fallbacks(
+    atoms: List[Atom],
+    pka_data: Dict[ResKey4, float],
+) -> Dict[ResKey4, float]:
+    """Return ``pka_data`` plus standard side-chain pKa for eligible terminal residues."""
+    if not pka_data:
+        return dict(pka_data)
+
+    out = dict(pka_data)
+    n_terminal_by_chain = _n_terminal_residue_by_chain(atoms)
+    c_terminal_by_chain = _c_terminal_residue_by_chain(atoms)
+    candidate_keys = set(n_terminal_by_chain.values()) | set(c_terminal_by_chain.values())
+
+    for key in sorted(candidate_keys, key=lambda k: (k[2], k[1], k[3], k[0])):
+        std = _terminus_sidechain_standard_pka_fallback(
+            key,
+            pka_data,
+            atoms,
+            n_terminal_by_chain=n_terminal_by_chain,
+            c_terminal_by_chain=c_terminal_by_chain,
+        )
+        if std is None or key in out:
+            continue
+        out[key] = float(std)
+        chain = key[2]
+        terminus_labels: List[str] = []
+        if n_terminal_by_chain.get(chain) == key and _has_terminus_pka(pka_data, chain, "N+"):
+            terminus_labels.append("N+")
+        if c_terminal_by_chain.get(chain) == key and _has_terminus_pka(pka_data, chain, "C-"):
+            terminus_labels.append("C-")
+        logger.info(
+            "Standard side-chain pKa fallback for %r -> %.2f (PropKa has %s, side-chain row missing)",
+            key,
+            std,
+            "+".join(terminus_labels),
+        )
+    return out
+
+
+def _has_terminus_pka(
+    pka_data: Dict[ResKey4, float],
+    chain: str,
+    terminus_name: str,
+) -> bool:
+    return any(k[0] == terminus_name and k[2] == chain for k in pka_data)
+
+
+def _ionizable_pka_satisfied(
+    key: ResKey4,
+    pka_data: Dict[ResKey4, float],
+    atoms: List[Atom],
+    *,
+    n_terminal_by_chain: Optional[Dict[str, ResKey4]] = None,
+) -> bool:
+    """True if PropKa provides pKa for this ionizable residue (directly or via N+)."""
+    if _lookup_pka_value(key, pka_data) is not None:
+        return True
+    if n_terminal_by_chain is None:
+        n_terminal_by_chain = _n_terminal_residue_by_chain(atoms)
+    chain = key[2]
+    if n_terminal_by_chain.get(chain) == key and _has_terminus_pka(pka_data, chain, "N+"):
+        # PropKa lists N+ for the N-terminus and often omits the first residue row when
+        # it is ionizable (e.g. ASP 1 on kappa light chains).
+        return True
+    return False
+
+
+def warn_missing_pka_coverage(
+    atoms: List[Atom],
+    pka_data: Dict[ResKey4, float],
+    *,
+    pdb_path: Optional[str] = None,
+    source_path: Optional[str] = None,
+) -> None:
+    """Log ionizable residues still missing PropKa after N+/C- rules (non-fatal)."""
+    residue_keys = set(iter_unique_residues(atoms))
+    n_terminal_by_chain = _n_terminal_residue_by_chain(atoms)
+    missing_ionizable: List[ResKey4] = []
+    for key in residue_keys:
+        res_name = key[0]
+        if res_name not in IONIZABLE_SIDECHAIN_RESIDUES:
+            continue
+        if res_name == "CYS" and _is_disulfide_cysteine(key, atoms):
+            continue
+        if not _ionizable_pka_satisfied(
+            key, pka_data, atoms, n_terminal_by_chain=n_terminal_by_chain
+        ):
+            missing_ionizable.append(key)
+    if not missing_ionizable:
+        return
+    src = f" (source={source_path!r})" if source_path else ""
+    logger.warning(
+        "PropKa missing for %d ionizable residue(s) in %r%s; examples: %r",
+        len(missing_ionizable),
+        pdb_path,
+        src,
+        missing_ionizable[:5],
+    )
+
+
+def require_pka_coverage(
+    atoms: List[Atom],
+    pka_data: Dict[ResKey4, float],
+    *,
+    source_path: Optional[str] = None,
+) -> None:
+    """Raise if any ionizable side chain or chain terminus lacks a PropKa entry."""
+    if not pka_data:
+        raise ValueError(
+            "pKa data is empty; a PropKa file with per-residue pKa values is required."
+        )
+
+    residue_keys = set(iter_unique_residues(atoms))
+    n_terminal_by_chain = _n_terminal_residue_by_chain(atoms)
+    missing_sidechains: List[ResKey4] = []
+    for key in sorted(residue_keys, key=lambda k: (k[2], k[1], k[3], k[0])):
+        res_name = key[0]
+        if res_name not in IONIZABLE_SIDECHAIN_RESIDUES:
+            continue
+        if res_name == "CYS" and _is_disulfide_cysteine(key, atoms):
+            continue
+        if not _ionizable_pka_satisfied(
+            key, pka_data, atoms, n_terminal_by_chain=n_terminal_by_chain
+        ):
+            missing_sidechains.append(key)
+
+    chains = sorted({k[2] for k in residue_keys})
+    missing_termini: List[str] = []
+    for chain in chains:
+        if not any(k[0] == "N+" and k[2] == chain for k in pka_data):
+            missing_termini.append(f"N+ (chain {chain!r})")
+        if not any(k[0] == "C-" and k[2] == chain for k in pka_data):
+            missing_termini.append(f"C- (chain {chain!r})")
+
+    if not missing_sidechains and not missing_termini:
+        return
+
+    src = f" (source={source_path!r})" if source_path else ""
+    parts: List[str] = []
+    if missing_sidechains:
+        shown = missing_sidechains[:10]
+        extra = f" ... and {len(missing_sidechains) - 10} more" if len(missing_sidechains) > 10 else ""
+        parts.append(f"missing pKa for ionizable residue(s): {shown!r}{extra}")
+    if missing_termini:
+        parts.append(f"missing termini: {', '.join(missing_termini)}")
+    raise ValueError(
+        f"PropKa coverage incomplete for parsed structure{src}. " + "; ".join(parts)
+    )
+
+
 def _residue_fractional_charge_at_pH(
     residue_name: str,
     pka_value: Optional[float],
     pH: float,
-    use_fallback: bool = True,
 ) -> float:
     """Fractional charge at pH (Henderson–Hasselbalch). Non-titratable → 0.
 
-    use_fallback=True: missing pKa → standard table value (no PropKa file).
-    use_fallback=False: missing pKa → 0 (e.g. disulfide CYS must not pick up CYS pKa 8.37).
+    Ionizable residues must have PropKa values assigned before descriptors run
+    (see require_pka_coverage). Terminal side-chain fallbacks are applied in
+    ``_lookup_pka_value`` / ``enrich_terminus_sidechain_pka_fallbacks``; other
+    missing pKa values yield q=0.
     """
     res_name = (residue_name or "").strip().upper()
     if pka_value is not None:
         effective_pka: Optional[float] = pka_value
-    elif use_fallback:
-        effective_pka = get_standard_residue_pka(res_name)
     else:
         effective_pka = None
     cache_key = (res_name, effective_pka, float(pH))
@@ -176,8 +448,6 @@ def _get_charged_residues_at_pH(
     min_abs_charge: float = MIN_ABS_CHARGE_THRESHOLD,
 ) -> Tuple[Set[Tuple[str, int, str, str]], Set[Tuple[str, int, str, str]]]:
 
-    # With PropKa data: missing entry → q=0 (disulfide CYS etc.). Without: use standard pKa.
-    use_fallback = not bool(pka_data)
     positive: Set[Tuple[str, int, str, str]] = set()
     negative: Set[Tuple[str, int, str, str]] = set()
     seen: Set[Tuple[str, int, str, str]] = set()
@@ -187,7 +457,9 @@ def _get_charged_residues_at_pH(
             continue
         seen.add(res_key)
         q = _residue_fractional_charge_at_pH(
-            atom.residue_name, pka_data.get(res_key), pH, use_fallback=use_fallback
+            atom.residue_name,
+            _lookup_pka_value(res_key, pka_data, atoms=atoms),
+            pH,
         )
         if q > min_abs_charge:
             positive.add(res_key)
@@ -245,13 +517,12 @@ def _residue_category_group_surface_pcf(
     pka_val: Optional[float],
     pH: float,
     min_abs_charge: float = MIN_ABS_CHARGE_THRESHOLD,
-    use_fallback_pka: bool = True,
 ) -> Optional[str]:
     """Surface patch class: negative | positive | hydrophobic | None.
 
     Uses NONPOLAR_RESIDUES (includes neutral Phe, Trp, Tyr) after charge assignment.
     """
-    q = _residue_fractional_charge_at_pH(res_name, pka_val, pH, use_fallback=use_fallback_pka)
+    q = _residue_fractional_charge_at_pH(res_name, pka_val, pH)
     if q < -min_abs_charge:
         return "negative"
     if q > min_abs_charge:
@@ -671,7 +942,7 @@ def pair_correlation_clustering_score_random_surface_null_by_bin(
         return zeros
     n_perm = max(1, int(n_permutations))
     rho = n / v_reference
-    gen = rng if rng is not None else np.random.default_rng(0)
+    gen = rng if rng is not None else np.random.default_rng(42)
     if n > n_allow:
         return zeros
 

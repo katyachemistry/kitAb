@@ -32,14 +32,13 @@ from analysis.aggregated_csv import (
     expand_glob_pattern,
     expand_paths as _expand_paths,
     is_our_source as _is_our_source,
-    is_propermab_source as _is_propermab_source,
     resolve_output_dir,
     row_is_gpr_eval as _row_is_gpr_eval,
     row_matches_eval_model_filter as _row_matches_eval_model_filter,
     run_suffix_after_target as _run_suffix_after_target,
     selector_model_frac as _selector_model_frac,
 )
-from analysis.feature_universe import (
+from analysis.features import (
     COL_PEAR_FEAT,
     COL_PEAR_RUN,
     COL_SPEAR_FEAT,
@@ -48,8 +47,10 @@ from analysis.feature_universe import (
     SUMMARY_COL_SPEAR,
     build_feature_usage_rows,
     canonical_feature_names,
+    normalize_feature_count_dict,
+    normalize_feature_name,
     print_json_features_missing_from_usage,
-    validate_reference_json,
+    validate_reference_features,
     write_feature_usage_csv,
     write_global_feature_usage_from_aggregated,
 )
@@ -136,7 +137,7 @@ def pairwise_jaccard_stability(
     p: int,
     *,
     n_permutations: int = 1000,
-    random_seed: int = 0,
+    random_seed: int = 42,
     pairwise: bool = False,
 ) -> dict[str, Any]:
     if p < 0 or not isinstance(p, int):
@@ -244,7 +245,7 @@ def parse_feature_sets_by_fold_json(cell: str) -> list[set[str]] | None:
         feats = data[k]
         if not isinstance(feats, list):
             continue
-        out.append({f for f in feats if isinstance(f, str)})
+        out.append({normalize_feature_name(f) for f in feats if isinstance(f, str)})
     return out if len(out) >= 2 else None
 
 
@@ -255,7 +256,7 @@ def load_universe_features(path: Path) -> tuple[str, ...]:
         s = line.strip()
         if not s or s.startswith("#"):
             continue
-        out.append(s)
+        out.append(normalize_feature_name(s))
     return tuple(out)
 
 
@@ -264,7 +265,7 @@ def stability_from_features_cell(
     universe: Sequence[str],
     *,
     n_permutations: int = 1000,
-    random_seed: int = 0,
+    random_seed: int = 42,
     pairwise: bool = False,
 ) -> dict[str, Any] | None:
     names = parse_feature_sets_by_fold_json(features_cell)
@@ -281,13 +282,16 @@ def stability_from_features_cell(
 
 GROUP_KEYS = (COL_DATASET, COL_SOURCE, COL_TARGET, COL_TRACK)
 
-SPEARMAN_OUR_COL = "Spearman_our"
-SPEARMAN_PROPERMAB_COL = "Spearman_propermab"
-SPEARMAN_DELTA_COL = "Spearman_delta"
-JACCARD_OUR_COL = "Jaccard_norm_our"
-JACCARD_PROPERMAB_COL = "Jaccard_norm_propermab"
-JACCARD_DELTA_COL = "Jaccard_norm_delta"
-JACCARD_SUMMARY_STEM = "jaccard_comparison"
+COL_VARIANT = "Variant"
+COL_RESULT_SPEARMAN = "Spearman"
+COL_RESULT_JACCARD_NORM = "Jaccard_norm"
+COL_RESULT_BEST_RUN = "best_Target-Selector-Model"
+COL_RESULT_BEST_FRAC = "best_selector_model_frac"
+
+_AGGREGATED_FNAME = re.compile(r"^aggregated_(.+)\.csv$", re.IGNORECASE)
+_RANDOM_SEED_SUFFIX = re.compile(r"__rs\d+$")
+_VARIANT_SIDE_MARKERS = frozenset({"our"})
+_ABB2_VARIANT_IN_SOURCE = re.compile(r"(abb2_\d+)")
 
 COL_STAB_JACCARD = "best_spearman_fold_stability_mean_jaccard"
 COL_STAB_EXPECTED = "best_spearman_fold_stability_mean_expected_jaccard"
@@ -328,22 +332,14 @@ def _feature_names_in_cell(cell: str) -> set[str]:
     return out
 
 
-def _infer_universes_from_rows(
-    rows: list[dict[str, Any]],
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    our: set[str] = set()
-    pm: set[str] = set()
+def _infer_universe_from_rows(rows: list[dict[str, Any]]) -> tuple[str, ...]:
+    names: set[str] = set()
     for r in rows:
-        cell = str(r.get(COL_FEATURES, "") or "")
-        names = _feature_names_in_cell(cell)
-        if not names:
+        if not _is_our_source(str(r.get(COL_SOURCE, ""))):
             continue
-        src = str(r.get(COL_SOURCE, ""))
-        if _is_our_source(src):
-            our |= names
-        elif _is_propermab_source(src):
-            pm |= names
-    return tuple(sorted(our)), tuple(sorted(pm))
+        cell = str(r.get(COL_FEATURES, "") or "")
+        names |= _feature_names_in_cell(cell)
+    return tuple(sorted(names))
 
 
 def _universe_for_source(
@@ -351,14 +347,11 @@ def _universe_for_source(
     *,
     universe_single: tuple[str, ...] | None,
     universe_our: tuple[str, ...],
-    universe_propermab: tuple[str, ...],
 ) -> tuple[str, ...] | None:
     if universe_single is not None:
         return universe_single
     if _is_our_source(source):
         return universe_our if universe_our else None
-    if _is_propermab_source(source):
-        return universe_propermab if universe_propermab else None
     return None
 
 
@@ -386,10 +379,10 @@ def _feature_fold_counts_json(features_cell: str) -> str:
     for feats in data.values():
         if not isinstance(feats, list):
             continue
-        in_fold = {f for f in feats if isinstance(f, str)}
+        in_fold = {normalize_feature_name(f) for f in feats if isinstance(f, str)}
         for f in in_fold:
             counts[f] += 1
-    ordered = {k: counts[k] for k in sorted(counts)}
+    ordered = normalize_feature_count_dict(counts)
     return json.dumps(ordered, ensure_ascii=False)
 
 
@@ -532,10 +525,9 @@ def build_summary(
     *,
     universe_single: tuple[str, ...] | None = None,
     universe_our: tuple[str, ...] = (),
-    universe_propermab: tuple[str, ...] = (),
     rank_with_stability: str = "none",
     stability_permutations: int = 1000,
-    stability_random_seed: int = 0,
+    stability_random_seed: int = 42,
     stability_weight: float = 0.1,
     eval_model: str | None = None,
     no_gpr: bool = False,
@@ -573,7 +565,6 @@ def build_summary(
             src,
             universe_single=universe_single,
             universe_our=universe_our,
-            universe_propermab=universe_propermab,
         )
         rs = _best_spearman_row_in_group(
             g_spear,
@@ -667,86 +658,127 @@ def _stab_normalized_from_summary_row(r: dict[str, Any]) -> float | None:
     return None
 
 
-def build_spearman_comparison(summary: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    summary = _collapse_summary_best_track_per_source(summary)
-    our_spear: dict[tuple[str, str], list[float]] = defaultdict(list)
-    pm_spear: dict[tuple[str, str], list[float]] = defaultdict(list)
-    our_jacc: dict[tuple[str, str], list[float]] = defaultdict(list)
-    pm_jacc: dict[tuple[str, str], list[float]] = defaultdict(list)
-    for r in summary:
-        src = str(r.get(COL_SOURCE, ""))
-        ds = str(r.get(COL_DATASET, ""))
-        tgt = str(r.get(COL_TARGET, ""))
-        key = (ds, tgt)
-        spe = r.get("best_spearman")
-        if isinstance(spe, (int, float)):
-            v = float(spe)
-            if _is_our_source(src):
-                our_spear[key].append(v)
-            elif _is_propermab_source(src):
-                pm_spear[key].append(v)
-        jac = _stab_normalized_from_summary_row(r)
-        if jac is not None:
-            if _is_our_source(src):
-                our_jacc[key].append(jac)
-            elif _is_propermab_source(src):
-                pm_jacc[key].append(jac)
+def _aggregated_slug_from_filename(name: str) -> str | None:
+    m = _AGGREGATED_FNAME.match(name)
+    return m.group(1) if m else None
 
-    keys = sorted(set(our_spear) | set(pm_spear) | set(our_jacc) | set(pm_jacc))
-    out: list[dict[str, Any]] = []
-    for key in keys:
-        ds, tgt = key[0], key[1]
-        o_list = our_spear.get(key, [])
-        p_list = pm_spear.get(key, [])
-        o: float | None = statistics.mean(o_list) if o_list else None
-        p: float | None = statistics.mean(p_list) if p_list else None
-        delta: float | None = None
-        if o is not None and p is not None:
-            delta = o - p
-        jo_list = our_jacc.get(key, [])
-        jp_list = pm_jacc.get(key, [])
-        jo: float | None = statistics.mean(jo_list) if jo_list else None
-        jp: float | None = statistics.mean(jp_list) if jp_list else None
-        jdelta: float | None = None
-        if jo is not None and jp is not None:
-            jdelta = jo - jp
-        out.append(
-            {
-                COL_DATASET: ds,
-                COL_TARGET: tgt,
-                SPEARMAN_OUR_COL: o,
-                SPEARMAN_PROPERMAB_COL: p,
-                SPEARMAN_DELTA_COL: delta,
-                JACCARD_OUR_COL: jo,
-                JACCARD_PROPERMAB_COL: jp,
-                JACCARD_DELTA_COL: jdelta,
-            }
-        )
+
+def _strip_random_seed_suffix(slug: str) -> str:
+    return _RANDOM_SEED_SUFFIX.sub("", slug)
+
+
+def _variant_from_slug(slug: str, dataset_stem: str) -> str:
+    slug = _strip_random_seed_suffix(slug)
+    if slug == dataset_stem:
+        return ""
+    prefix = f"{dataset_stem}_"
+    if not slug.startswith(prefix):
+        return slug
+    rest = slug[len(prefix) :]
+    if rest.lower() in _VARIANT_SIDE_MARKERS:
+        return ""
+    return rest
+
+
+def build_aggregated_variant_map(
+    paths: list[Path], rows: list[dict[str, Any]]
+) -> dict[tuple[str, str], str]:
+    """Map (Dataset_stem, Developability_source) -> variant (e.g. abb2_1)."""
+    dataset_by_file: dict[str, str] = {}
+    for row in rows:
+        fn = str(row.get("_source_file", ""))
+        if fn and fn not in dataset_by_file:
+            dataset_by_file[fn] = str(row.get(COL_DATASET, ""))
+
+    file_variant: dict[str, str] = {}
+    for p in paths:
+        slug = _aggregated_slug_from_filename(p.name)
+        if slug is None:
+            continue
+        ds = dataset_by_file.get(p.name, "")
+        if not ds:
+            continue
+        file_variant[p.name] = _variant_from_slug(slug, ds)
+
+    out: dict[tuple[str, str], str] = {}
+    for row in rows:
+        ds = str(row.get(COL_DATASET, ""))
+        src = str(row.get(COL_SOURCE, ""))
+        fn = str(row.get("_source_file", ""))
+        key = (ds, src)
+        if key in out:
+            continue
+        if fn in file_variant:
+            out[key] = file_variant[fn]
     return out
 
 
-def _build_jaccard_comparison_tail_rows(
-    comparison_rows: list[dict[str, Any]],
+def _variant_for_summary_row(
+    r: dict[str, Any], variant_map: dict[tuple[str, str], str]
+) -> str:
+    ds = str(r.get(COL_DATASET, ""))
+    src = str(r.get(COL_SOURCE, ""))
+    if (ds, src) in variant_map:
+        return variant_map[(ds, src)]
+    m = _ABB2_VARIANT_IN_SOURCE.search(src)
+    return m.group(1) if m else ""
+
+
+def build_results_per_target(
+    summary: list[dict[str, Any]],
+    variant_map: dict[tuple[str, str], str] | None = None,
 ) -> list[dict[str, Any]]:
-    tail: list[dict[str, Any]] = []
-    for r in comparison_rows:
-        jo = r.get(JACCARD_OUR_COL)
-        jp = r.get(JACCARD_PROPERMAB_COL)
-        jd = r.get(JACCARD_DELTA_COL)
-        if jo is None and jp is None:
+    """One row per (dataset, variant, target): best model and mean metrics across seeds."""
+    variant_map = variant_map or {}
+    collapsed = _collapse_summary_best_track_per_source(summary)
+    by_key: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for r in collapsed:
+        if not _is_our_source(str(r.get(COL_SOURCE, ""))):
             continue
-        tail.append(
+        ds = str(r.get(COL_DATASET, ""))
+        tgt = str(r.get(COL_TARGET, ""))
+        variant = _variant_for_summary_row(r, variant_map)
+        by_key[(ds, variant, tgt)].append(r)
+
+    out: list[dict[str, Any]] = []
+    for key in sorted(by_key.keys()):
+        ds, variant, tgt = key
+        group = by_key[key]
+        spears: list[float] = []
+        jaccs: list[float] = []
+        best_row: dict[str, Any] | None = None
+        best_spear: float | None = None
+        for r in group:
+            spe = r.get("best_spearman")
+            if isinstance(spe, (int, float)):
+                v = float(spe)
+                spears.append(v)
+                if best_spear is None or v > best_spear:
+                    best_spear = v
+                    best_row = r
+            jac = _stab_normalized_from_summary_row(r)
+            if jac is not None:
+                jaccs.append(jac)
+        if best_row is None and group:
+            best_row = group[0]
+        out.append(
             {
-                COL_DATASET: str(r.get(COL_DATASET, "")),
-                COL_SOURCE: JACCARD_SUMMARY_STEM,
-                COL_TARGET: str(r.get(COL_TARGET, "")),
-                COL_TRACK: "",
-                JACCARD_OUR_COL: jo,
-                JACCARD_PROPERMAB_COL: jp,
-                JACCARD_DELTA_COL: jd,
+                COL_DATASET: ds,
+                COL_VARIANT: variant,
+                COL_TARGET: tgt,
+                COL_RESULT_SPEARMAN: statistics.mean(spears) if spears else None,
+                COL_RESULT_JACCARD_NORM: statistics.mean(jaccs) if jaccs else None,
+                COL_RESULT_BEST_RUN: str(best_row.get("best_spearman_Target-Selector-Model", ""))
+                if best_row
+                else "",
+                COL_RESULT_BEST_FRAC: str(
+                    best_row.get("best_spearman_selector_model_frac", "")
+                )
+                if best_row
+                else "",
             }
         )
-    return tail
+    return out
 
 
 def _fmt_spearman_cell(v: float | None) -> str:
@@ -761,18 +793,17 @@ def _fmt_float_cell(v: float | None) -> str:
     return f"{float(v):.17g}"
 
 
-def write_comparison_csv(path: Path, rows: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def write_results_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     fieldnames = [
         COL_DATASET,
+        COL_VARIANT,
         COL_TARGET,
-        SPEARMAN_OUR_COL,
-        SPEARMAN_PROPERMAB_COL,
-        SPEARMAN_DELTA_COL,
-        JACCARD_OUR_COL,
-        JACCARD_PROPERMAB_COL,
-        JACCARD_DELTA_COL,
+        COL_RESULT_SPEARMAN,
+        COL_RESULT_JACCARD_NORM,
+        COL_RESULT_BEST_RUN,
+        COL_RESULT_BEST_FRAC,
     ]
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
@@ -780,112 +811,30 @@ def write_comparison_csv(path: Path, rows: list[dict[str, Any]]) -> None:
             w.writerow(
                 {
                     COL_DATASET: r[COL_DATASET],
+                    COL_VARIANT: r.get(COL_VARIANT, ""),
                     COL_TARGET: r[COL_TARGET],
-                    SPEARMAN_OUR_COL: _fmt_spearman_cell(r.get(SPEARMAN_OUR_COL)),  # type: ignore[arg-type]
-                    SPEARMAN_PROPERMAB_COL: _fmt_spearman_cell(
-                        r.get(SPEARMAN_PROPERMAB_COL)  # type: ignore[arg-type]
+                    COL_RESULT_SPEARMAN: _fmt_spearman_cell(
+                        r.get(COL_RESULT_SPEARMAN)  # type: ignore[arg-type]
                     ),
-                    SPEARMAN_DELTA_COL: _fmt_spearman_cell(r.get(SPEARMAN_DELTA_COL)),  # type: ignore[arg-type]
-                    JACCARD_OUR_COL: _fmt_float_cell(r.get(JACCARD_OUR_COL)),  # type: ignore[arg-type]
-                    JACCARD_PROPERMAB_COL: _fmt_float_cell(
-                        r.get(JACCARD_PROPERMAB_COL)  # type: ignore[arg-type]
+                    COL_RESULT_JACCARD_NORM: _fmt_float_cell(
+                        r.get(COL_RESULT_JACCARD_NORM)  # type: ignore[arg-type]
                     ),
-                    JACCARD_DELTA_COL: _fmt_float_cell(r.get(JACCARD_DELTA_COL)),  # type: ignore[arg-type]
+                    COL_RESULT_BEST_RUN: r.get(COL_RESULT_BEST_RUN, ""),
+                    COL_RESULT_BEST_FRAC: r.get(COL_RESULT_BEST_FRAC, ""),
                 }
             )
 
 
-def write_comparison_heatmap(path: Path, rows: list[dict[str, Any]]) -> bool:
-    try:
-        import matplotlib.pyplot as plt
-        from matplotlib.colors import LinearSegmentedColormap
-        import numpy as np
-    except ImportError as exc:
-        print(f"Skipping comparison heatmap: {exc}", file=sys.stderr)
-        return False
-
-    dataset_order: list[str] = []
-    spear: dict[tuple[str, str], list[float]] = defaultdict(list)
-    jacc: dict[tuple[str, str], list[float]] = defaultdict(list)
-    side_cols = (
-        ("FASTAb", SPEARMAN_OUR_COL, JACCARD_OUR_COL),
-        ("PROPERMAB", SPEARMAN_PROPERMAB_COL, JACCARD_PROPERMAB_COL),
-    )
-    for r in rows:
-        ds = str(r.get(COL_DATASET, "")).strip()
-        if not ds:
-            continue
-        if ds not in dataset_order:
-            dataset_order.append(ds)
-        for side, spe_col, jac_col in side_cols:
-            sv = r.get(spe_col)
-            if isinstance(sv, (int, float)) and math.isfinite(float(sv)):
-                spear[(side, ds)].append(float(sv))
-            jv = r.get(jac_col)
-            if isinstance(jv, (int, float)) and math.isfinite(float(jv)):
-                jacc[(side, ds)].append(float(jv))
-
-    if not dataset_order:
-        print("Skipping comparison heatmap: no datasets to plot", file=sys.stderr)
-        return False
-
-    side_names = [x[0] for x in side_cols]
-    spearman_values = np.full((len(side_names), len(dataset_order)), np.nan)
-    jaccard_values = np.full_like(spearman_values, np.nan)
-    for r_idx, side in enumerate(side_names):
-        for c_idx, ds in enumerate(dataset_order):
-            spe_vals = spear.get((side, ds), [])
-            jac_vals = jacc.get((side, ds), [])
-            if spe_vals:
-                spearman_values[r_idx, c_idx] = statistics.mean(spe_vals)
-            if jac_vals:
-                jaccard_values[r_idx, c_idx] = statistics.mean(jac_vals)
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    cmap = LinearSegmentedColormap.from_list(
-        "white_to_light_green", ["#ffffff", "#b7e4b5"]
-    )
-    cmap.set_bad("#f2f2f2")
-    width = max(8.0, 0.45 * len(dataset_order))
-    fig, ax = plt.subplots(figsize=(width, 3.2), constrained_layout=True)
-    im = ax.imshow(
-        np.ma.masked_invalid(jaccard_values),
-        aspect="auto",
-        cmap=cmap,
-        vmin=0.0,
-        vmax=1.0,
-    )
-
-    ax.set_xticks(range(len(dataset_order)))
-    ax.set_xticklabels(dataset_order, rotation=45, ha="right", fontsize=8)
-    ax.set_yticks(range(len(side_names)))
-    ax.set_yticklabels(side_names, fontsize=10)
-
-    for r_idx in range(len(side_names)):
-        for c_idx in range(len(dataset_order)):
-            val = spearman_values[r_idx, c_idx]
-            label = "" if math.isnan(float(val)) else f"{val:.2f}"
-            ax.text(c_idx, r_idx, label, ha="center", va="center", color="black", fontsize=8)
-
-    cbar = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
-    cbar.set_label("Normalized Jaccard", fontsize=9)
-    ax.tick_params(axis="both", length=0)
-    fig.savefig(path, dpi=200, bbox_inches="tight")
-    fig.savefig(path.with_suffix(".pdf"), bbox_inches="tight")
-    plt.close(fig)
-    return True
-
-
 def run_best_metrics_from_aggregated(
     inputs: list[str],
-    out: Path,
+    summary_out: Path,
     *,
+    results_out: Path | None = None,
     universe_features: Path | None = None,
     universe_features_our: Path | None = None,
-    universe_features_propermab: Path | None = None,
     rank_with_stability: str = "none",
     stability_permutations: int = 1000,
-    stability_seed: int = 0,
+    stability_seed: int = 42,
     stability_weight: float = 0.1,
     eval_model: str | None = None,
     no_gpr: bool = False,
@@ -895,6 +844,7 @@ def run_best_metrics_from_aggregated(
     if not paths:
         raise SystemExit("No input files found.")
     rows = _read_rows(paths)
+    rows = [r for r in rows if _is_our_source(str(r.get(COL_SOURCE, "")))]
     required = {COL_RUN_ID, COL_TARGET, AGG_COL_SPEAR, AGG_COL_PEAR, COL_FEATURES}
     if rows:
         missing = required - set(rows[0].keys())
@@ -913,29 +863,21 @@ def run_best_metrics_from_aggregated(
 
     universe_single = _load_universe_arg(universe_features, "--universe-features")
     universe_our_arg = _load_universe_arg(universe_features_our, "--universe-features-our")
-    universe_pm_arg = _load_universe_arg(
-        universe_features_propermab, "--universe-features-propermab"
-    )
-    inferred_our, inferred_pm = _infer_universes_from_rows(rows)
+    inferred_our = _infer_universe_from_rows(rows)
     if universe_single is not None:
         universe_our = universe_single
-        universe_propermab = universe_single
     else:
         universe_our = universe_our_arg if universe_our_arg is not None else inferred_our
-        universe_propermab = (
-            universe_pm_arg if universe_pm_arg is not None else inferred_pm
-        )
-    if rank_with_stability != "none" and not universe_our and not universe_propermab:
+    if rank_with_stability != "none" and not universe_our:
         raise SystemExit(
             "--rank-with-stability requires a feature universe (infer from inputs or pass "
-            "--universe-features / --universe-features-our / --universe-features-propermab)."
+            "--universe-features / --universe-features-our)."
         )
     if stability_permutations < 1:
         raise SystemExit("--stability-permutations must be >= 1.")
-    if universe_single is None:
+    if universe_single is None and universe_our:
         print(
-            f"Inferred feature universes: our p={len(universe_our)}, "
-            f"propermab p={len(universe_propermab)}",
+            f"Inferred feature universe: p={len(universe_our)}",
             file=sys.stderr,
         )
 
@@ -943,7 +885,6 @@ def run_best_metrics_from_aggregated(
         rows,
         universe_single=universe_single,
         universe_our=universe_our,
-        universe_propermab=universe_propermab,
         rank_with_stability=rank_with_stability,
         stability_permutations=stability_permutations,
         stability_random_seed=stability_seed,
@@ -976,9 +917,6 @@ def run_best_metrics_from_aggregated(
         COL_STAB_JACCARD,
         COL_STAB_EXPECTED,
         COL_STAB_NORM,
-        JACCARD_OUR_COL,
-        JACCARD_PROPERMAB_COL,
-        JACCARD_DELTA_COL,
         "best_pearson",
         "best_pearson_Target-Selector-Model",
         "best_pearson_selector_model_frac",
@@ -987,39 +925,29 @@ def run_best_metrics_from_aggregated(
         "Pipeline_time_std_s",
     ]
     stab_cols = STAB_COLS
-    jaccard_agg_cols = (JACCARD_OUR_COL, JACCARD_PROPERMAB_COL, JACCARD_DELTA_COL)
     timing_cols = ("Pipeline_time_sum_s", "Pipeline_time_std_s")
 
     def _build_timing_tail_rows() -> list[dict[str, Any]]:
-        our_times: list[float] = []
-        pm_times: list[float] = []
+        times: list[float] = []
         for r in summary:
             pt_f = r.get("Pipeline_time_sum_s")
             if pt_f is None or not isinstance(pt_f, (int, float)):
                 continue
             pt_f = float(pt_f)
-            if not math.isfinite(pt_f):
-                continue
-            src = str(r.get(COL_SOURCE, ""))
-            if _is_our_source(src):
-                our_times.append(pt_f)
-            elif _is_propermab_source(src):
-                pm_times.append(pt_f)
-        tail: list[dict[str, Any]] = []
-        for label, times in (("our", our_times), ("propermab", pm_times)):
-            if not times:
-                continue
-            mean_t = statistics.mean(times)
-            std_t = statistics.stdev(times) if len(times) >= 2 else None
-            tail.append({
-                COL_DATASET: "pipeline_time_summary",
-                COL_SOURCE: label,
-                COL_TARGET: "",
-                COL_TRACK: "",
-                "Pipeline_time_sum_s": _fmt_float_cell(mean_t),
-                "Pipeline_time_std_s": _fmt_float_cell(std_t) if std_t is not None else "",
-            })
-        return tail
+            if math.isfinite(pt_f):
+                times.append(pt_f)
+        if not times:
+            return []
+        mean_t = statistics.mean(times)
+        std_t = statistics.stdev(times) if len(times) >= 2 else None
+        return [{
+            COL_DATASET: "pipeline_time_summary",
+            COL_SOURCE: "",
+            COL_TARGET: "",
+            COL_TRACK: "",
+            "Pipeline_time_sum_s": _fmt_float_cell(mean_t),
+            "Pipeline_time_std_s": _fmt_float_cell(std_t) if std_t is not None else "",
+        }]
 
     def write_csv(dest: Any, tail_rows: list[dict[str, Any]] | None = None) -> None:
         w = csv.DictWriter(dest, fieldnames=fieldnames, extrasaction="ignore")
@@ -1028,9 +956,7 @@ def run_best_metrics_from_aggregated(
             out_row: dict[str, Any] = {}
             for k in fieldnames:
                 v = r.get(k, "")
-                if k in stab_cols or k in jaccard_agg_cols:
-                    out_row[k] = _fmt_float_cell(v) if isinstance(v, (int, float)) else ""
-                elif k in timing_cols:
+                if k in stab_cols or k in timing_cols:
                     out_row[k] = _fmt_float_cell(v) if isinstance(v, (int, float)) else ""
                 else:
                     out_row[k] = v if v is not None else ""
@@ -1039,30 +965,27 @@ def run_best_metrics_from_aggregated(
             for r in tail_rows:
                 w.writerow({k: r.get(k, "") for k in fieldnames})
 
-    comp_rows = build_spearman_comparison(summary)
     timing_tail = _build_timing_tail_rows()
-    jaccard_tail = _build_jaccard_comparison_tail_rows(comp_rows)
-    summary_tail = timing_tail + jaccard_tail
 
-    out.parent.mkdir(parents=True, exist_ok=True)
-    with open(out, "w", newline="", encoding="utf-8") as f:
-        write_csv(f, tail_rows=summary_tail)
+    summary_out.parent.mkdir(parents=True, exist_ok=True)
+    with open(summary_out, "w", newline="", encoding="utf-8") as f:
+        write_csv(f, tail_rows=timing_tail)
     print(
-        f"Wrote {len(summary)} rows (+ {len(summary_tail)} summary tail) to {out}",
+        f"Wrote {len(summary)} rows (+ {len(timing_tail)} pipeline-time summary) "
+        f"to {summary_out}",
         file=sys.stderr,
     )
-    comparison_path = out.parent / "comparison.csv"
-    write_comparison_csv(comparison_path, comp_rows)
-    heatmap_path = out.parent / "comparison_spearman_jaccard_norm_heatmap.png"
-    if write_comparison_heatmap(heatmap_path, comp_rows):
-        print(f"Wrote comparison heatmap to {heatmap_path}", file=sys.stderr)
+
+    if results_out is None:
+        results_out = summary_out.parent / "results.csv"
+    variant_map = build_aggregated_variant_map(paths, rows)
+    result_rows = build_results_per_target(summary, variant_map=variant_map)
+    write_results_csv(results_out, result_rows)
     print(
-        f"Wrote {len(comp_rows)} rows to {comparison_path} "
-        f"(mean {SPEARMAN_OUR_COL}/{SPEARMAN_PROPERMAB_COL}, "
-        f"normalized {JACCARD_OUR_COL}/{JACCARD_PROPERMAB_COL} across random seeds)",
+        f"Wrote {len(result_rows)} per-target result rows to {results_out}",
         file=sys.stderr,
     )
-    return out, comparison_path
+    return summary_out, results_out
 
 
 COL_SPEARMAN = "best_spearman"
@@ -1070,12 +993,7 @@ COL_FEAT = "best_spearman_features"
 COL_TSM = "best_spearman_Target-Selector-Model"
 COL_FRAC = "best_spearman_selector_model_frac"
 
-SEED_SUFFIXES = ("__rs0", "__rs100", "__rs42")
-EXCLUDE_SOURCE_SUBSTRING = "propermab"
-
-
-def _include_developability_source(src: str) -> bool:
-    return EXCLUDE_SOURCE_SUBSTRING.lower() not in src.lower()
+_RANDOM_SEED_SOURCE_SUFFIX = re.compile(r"__rs\d+$")
 
 
 @dataclass(frozen=True)
@@ -1088,21 +1006,21 @@ class FolderRowPick:
 
 
 def _is_seed_source(src: str) -> bool:
-    return any(src.endswith(suf) for suf in SEED_SUFFIXES)
+    return bool(_RANDOM_SEED_SOURCE_SUFFIX.search(src))
 
 
 def _seed_suffix(src: str) -> str | None:
-    for suf in SEED_SUFFIXES:
-        if src.endswith(suf):
-            return suf
-    return None
+    m = _RANDOM_SEED_SOURCE_SUFFIX.search(src)
+    return m.group(0) if m else None
 
 
 def _source_base(src: str) -> str:
-    for suf in SEED_SUFFIXES:
-        if src.endswith(suf):
-            return src[: -len(suf)]
-    return src
+    return _RANDOM_SEED_SOURCE_SUFFIX.sub("", src)
+
+
+def _seed_suffix_sort_key(suffix: str) -> int:
+    m = re.search(r"__rs(\d+)$", suffix)
+    return int(m.group(1)) if m else 0
 
 
 def _iter_folded_batch_dirs(runs_dir: Path, exclude_names: frozenset[str]) -> list[Path]:
@@ -1163,7 +1081,7 @@ def _accumulate_feature_usage_from_nested_json(
                 continue
             if isinstance(v, float) and not v.is_integer():
                 continue
-            totals[feat] += int(v)
+            totals[normalize_feature_name(feat)] += int(v)
 
 
 def _parse_feature_count_dict(cell: str) -> dict[str, int]:
@@ -1183,8 +1101,9 @@ def _parse_feature_count_dict(cell: str) -> dict[str, int]:
             continue
         if isinstance(v, float) and not v.is_integer():
             continue
-        out[k] = int(v)
-    return out
+        key = normalize_feature_name(k)
+        out[key] = out.get(key, 0) + int(v)
+    return dict(sorted(out.items()))
 
 
 def _group_score_from_rows(rows: list[tuple[str, float, str, str, str]]) -> float | None:
@@ -1205,10 +1124,7 @@ def _nested_pick_from_rows(rows: list[tuple[str, float, str, str, str]]) -> dict
             suf = _seed_suffix(r[0])
             if suf is not None:
                 by_suffix[suf] = r
-        ordered: list[tuple[str, tuple[str, float, str, str, str]]] = []
-        for suf in SEED_SUFFIXES:
-            if suf in by_suffix:
-                ordered.append((suf, by_suffix[suf]))
+        ordered = sorted(by_suffix.items(), key=lambda item: _seed_suffix_sort_key(item[0]))
         src_m: dict[str, str] = {}
         tsm_m: dict[str, str] = {}
         frac_m: dict[str, str] = {}
@@ -1256,7 +1172,7 @@ def _folder_aggregate_from_csv(path: Path) -> dict[tuple[str, str], FolderRowPic
             sp = _parse_spearman(row.get(COL_SPEARMAN, ""))
             if not ds or not tgt or src == "" or sp is None:
                 continue
-            if not _include_developability_source(src):
+            if not _is_our_source(src):
                 continue
             feat = row.get(COL_FEAT) or ""
             tsm = row.get(COL_TSM) or ""
@@ -1403,22 +1319,7 @@ def run_compare_folded_batches(
         )
 
 def _parse_feature_counts(cell: str) -> dict[str, int]:
-    if not cell or not str(cell).strip():
-        return {}
-    try:
-        data = json.loads(cell)
-    except json.JSONDecodeError:
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    out: dict[str, int] = {}
-    for k, v in data.items():
-        if not isinstance(k, str):
-            continue
-        if isinstance(v, bool) or not isinstance(v, (int, float)):
-            continue
-        out[k] = int(v)
-    return out
+    return _parse_feature_count_dict(cell)
 
 
 def _float_metric(cell: str) -> float | None:
@@ -1492,7 +1393,7 @@ def aggregate_from_summary_rows(
 
     for row in rows:
         src = row.get(COL_SOURCE, "")
-        if _is_propermab_source(str(src)):
+        if not _is_our_source(str(src)):
             continue
 
         ds = row.get(COL_DATASET, "")
@@ -1577,19 +1478,15 @@ def write_feature_usage_from_summary(
         canonical=canonical, usage=usage, all_folds=all_folds
     )
 
-    kept = sum(1 for r in rows if not _is_propermab_source(str(r.get(COL_SOURCE, ""))))
-    used = sum(
-        1
-        for r in ref_rows
-        if not _is_propermab_source(str(r.get(COL_SOURCE, "")))
-    )
+    kept = sum(1 for r in rows if _is_our_source(str(r.get(COL_SOURCE, ""))))
+    used = sum(1 for r in ref_rows if _is_our_source(str(r.get(COL_SOURCE, ""))))
     if out_path:
         with open(out_path, "w", newline="", encoding="utf-8") as f:
             write_feature_usage_csv(f, out_rows)
         mode = "all_track_rows" if all_track_rows else "pick_best_track"
         print(
             f"Wrote {len(out_rows)} rows from {len(rows)} input rows "
-            f"({kept} non-ProperMAB); aggregated {used} row(s) after track filter "
+            f"({kept} developability-source rows); aggregated {used} row(s) after track filter "
             f"(mode={mode!r}) metric={metric!r} n_folds={n_folds} -> {out_path}",
             file=sys.stderr,
         )
@@ -1599,7 +1496,7 @@ def write_feature_usage_from_summary(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Analyze batch-run aggregated CSVs (best metrics, our vs ProperMAB, feature usage)."
+        description="Analyze batch-run aggregated CSVs (best metrics and feature usage)."
     )
     parser.add_argument(
         "inputs",
@@ -1615,7 +1512,17 @@ def main() -> None:
     parser.add_argument(
         "--summary-name",
         default="best_metrics_summary.csv",
-        help="Best-metrics output filename under --out-dir (default: best_metrics_summary.csv).",
+        help=(
+            "Detailed best-metrics CSV per track (default: best_metrics_summary.csv)."
+        ),
+    )
+    parser.add_argument(
+        "--results-name",
+        default="results.csv",
+        help=(
+            "Per-target best-model table (dataset × variant × target; "
+            "default: results.csv)."
+        ),
     )
     parser.add_argument(
         "--feature-usage-name",
@@ -1640,11 +1547,6 @@ def main() -> None:
         default=None,
     )
     parser.add_argument(
-        "--universe-features-propermab",
-        type=Path,
-        default=None,
-    )
-    parser.add_argument(
         "--rank-with-stability",
         choices=("none", "lexi", "composite"),
         default="none",
@@ -1657,7 +1559,7 @@ def main() -> None:
     parser.add_argument(
         "--stability-seed",
         type=int,
-        default=0,
+        default=42,
     )
     parser.add_argument(
         "--stability-weight",
@@ -1743,6 +1645,11 @@ def main() -> None:
         help="Write per-dataset fold-Spearman strip plots from aggregated CSV inputs.",
     )
     parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Do not write optional analysis plots (e.g. fold-Spearman strip plots).",
+    )
+    parser.add_argument(
         "--plot-out-dir",
         type=Path,
         default=None,
@@ -1752,7 +1659,7 @@ def main() -> None:
 
     if args.list_json_features_not_in_usage is not None:
         try:
-            validate_reference_json(args.reference_json.resolve())
+            validate_reference_features(args.reference_json.resolve())
         except (FileNotFoundError, ValueError) as e:
             raise SystemExit(str(e)) from e
         raise SystemExit(
@@ -1764,7 +1671,7 @@ def main() -> None:
 
     if args.aggregate_our_glob:
         try:
-            validate_reference_json(args.reference_json.resolve())
+            validate_reference_features(args.reference_json.resolve())
         except (FileNotFoundError, ValueError) as e:
             raise SystemExit(str(e)) from e
         paths = expand_glob_pattern(args.aggregate_our_glob)
@@ -1795,12 +1702,13 @@ def main() -> None:
 
     out_dir = resolve_output_dir(args.out_dir)
     summary_path = out_dir / args.summary_name
+    results_path = out_dir / args.results_name
     run_best_metrics_from_aggregated(
         args.inputs,
         summary_path,
+        results_out=results_path,
         universe_features=args.universe_features,
         universe_features_our=args.universe_features_our,
-        universe_features_propermab=args.universe_features_propermab,
         rank_with_stability=args.rank_with_stability,
         stability_permutations=args.stability_permutations,
         stability_seed=args.stability_seed,
@@ -1813,7 +1721,7 @@ def main() -> None:
     if not args.skip_feature_usage and not args.aggregate_our_glob:
         ref = args.reference_json.resolve()
         try:
-            validate_reference_json(ref)
+            validate_reference_features(ref)
         except (FileNotFoundError, ValueError) as e:
             raise SystemExit(str(e)) from e
         write_feature_usage_from_summary(
@@ -1827,7 +1735,7 @@ def main() -> None:
     elif not args.skip_feature_usage and args.aggregate_our_glob:
         ref = args.reference_json.resolve()
         try:
-            validate_reference_json(ref)
+            validate_reference_features(ref)
         except (FileNotFoundError, ValueError) as e:
             raise SystemExit(str(e)) from e
         paths = expand_glob_pattern(args.aggregate_our_glob)
@@ -1837,7 +1745,7 @@ def main() -> None:
             out_path=out_dir / args.feature_usage_name,
         )
 
-    if args.plot_fold_spearmans:
+    if args.plot_fold_spearmans and not args.no_plots:
         from analysis.plot_aggregated_fold_spearmans import run_plot_fold_spearmans
 
         plot_dir = resolve_output_dir(args.plot_out_dir) if args.plot_out_dir is not None else out_dir

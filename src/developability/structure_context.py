@@ -13,7 +13,6 @@ from utils.parsers import (
     SASAEntry,
     residue_key_from_atom,
 )
-from utils.chemistry import get_standard_residue_pka
 
 logger = logging.getLogger(__name__)
 
@@ -234,8 +233,15 @@ class StructureContext:
             if pka_path is None:
                 pka_path = self._resolve_auto_pka_path()
             if pka_path and os.path.exists(pka_path):
+                from utils.propka_pdb import parse_pka_for_structure, resolve_propka_map_path
+
+                map_path = resolve_propka_map_path(pka_path)
+                filtered = parse_pka_for_structure(
+                    pka_path,
+                    self.atoms,
+                    propka_map_path=map_path,
+                )
                 raw = parse_pka(pka_path, None)
-                filtered = parse_pka(pka_path, self.atoms)
 
                 if raw and not filtered:
                     raw_chains = sorted({k[2] for k in raw.keys()})
@@ -265,34 +271,39 @@ class StructureContext:
                             example_dropped,
                         )
 
-                self._warn_missing_coverage(
-                    set(filtered.keys()), label="pKa", source_path=pka_path
+                from developability.descriptor_utils import (
+                    enrich_terminus_sidechain_pka_fallbacks,
+                    require_pka_coverage,
+                    warn_missing_pka_coverage,
                 )
 
-                filled = dict(filtered)
-                try:
-                    residue_keys = self.residue_keys
-                except Exception:
-                    residue_keys = set()
-                for key in residue_keys:
-                    if key in filled:
-                        continue
-                    std = get_standard_residue_pka(key[0])
-                    if std is not None:
-                        filled[key] = float(std)
-
-                self._pka_residue = filled
+                require_pka_coverage(self.atoms, filtered, source_path=pka_path)
+                warn_missing_pka_coverage(
+                    self.atoms,
+                    filtered,
+                    pdb_path=self._pdb_path,
+                    source_path=pka_path,
+                )
+                self._pka_residue = enrich_terminus_sidechain_pka_fallbacks(
+                    self.atoms, filtered
+                )
             else:
-                filled: Dict[ResKey4, float] = {}
-                try:
-                    residue_keys = self.residue_keys
-                except Exception:
-                    residue_keys = set()
-                for key in residue_keys:
-                    std = get_standard_residue_pka(key[0])
-                    if std is not None:
-                        filled[key] = float(std)
-                self._pka_residue = filled
+                raise ValueError(
+                    f"pKa file required but not found for structure {self._pdb_path!r} "
+                    f"(explicit path={self._pka_path!r}, auto-detect failed). "
+                    "Every ionizable residue must have a PropKa-assigned pKa value."
+                )
+                # Standard pKa fallback when no PropKa file (disabled):
+                # filled: Dict[ResKey4, float] = {}
+                # try:
+                #     residue_keys = self.residue_keys
+                # except Exception:
+                #     residue_keys = set()
+                # for key in residue_keys:
+                #     std = get_standard_residue_pka(key[0])
+                #     if std is not None:
+                #         filled[key] = float(std)
+                # self._pka_residue = filled
         return self._pka_residue
 
     @property

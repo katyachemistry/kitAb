@@ -17,13 +17,17 @@ if str(_src_dir) not in sys.path:
     sys.path.insert(0, str(_src_dir))
 
 from automl.dataset_validation import (
+    require_developability_name_coverage,
     require_no_nans_except_columns,
     require_no_nans_in_dataframe,
     validate_experimental_dataset,
 )
 from automl.feature_selectors import cv_shuffled_fold_ilocs, cv_split_col_ilocs
 from automl.pipeline_defaults import DEFAULT_FEATURES_FRAC, DEFAULT_RANDOM_STATE
+from analysis.features import normalize_feature_name
 from utils.load_results_to_dataframe import load_json_results
+
+FEATURES_CSV_FILENAME = "features.csv"
 
 
 def drop_invalid_target_rows(
@@ -84,7 +88,7 @@ def standardize_pipeline_column_names(
 
     new_feats: list[str] = []
     for f in feats_in:
-        nf = f if f.startswith("feature_") else f"feature_{f}"
+        nf = normalize_feature_name(f)
         new_feats.append(nf)
         if nf != f:
             rename_map[f] = nf
@@ -93,8 +97,11 @@ def standardize_pipeline_column_names(
     return out, new_target, new_feats
 
 
-def load_propermab_features_csv(features_path: Path) -> pd.DataFrame:
+def load_features_csv(features_path: Path) -> pd.DataFrame:
+    """Load a per-antibody feature table from CSV (user-supplied or legacy Propermab export)."""
     features_path = Path(features_path)
+    if not features_path.is_file():
+        raise FileNotFoundError(f"Features CSV not found: {features_path}")
     feat_df = pd.read_csv(features_path)
     feat_df = feat_df.copy()
     if "pdb_file" in feat_df.columns:
@@ -109,6 +116,43 @@ def load_propermab_features_csv(features_path: Path) -> pd.DataFrame:
         )
     feat_df = feat_df.drop(columns=["pdb_file", "error"], errors="ignore")
     return feat_df
+
+
+def resolve_features_csv_path(source: Path) -> Path | None:
+    """Return path to features CSV if *source* is a .csv file or a folder containing one."""
+    src = Path(source)
+    if src.is_file() and src.suffix.lower() == ".csv":
+        return src.resolve()
+    if src.is_dir():
+        direct = src / FEATURES_CSV_FILENAME
+        if direct.is_file():
+            return direct.resolve()
+    return None
+
+
+def resolve_json_results_dir(source: Path) -> Path | None:
+    """Return directory containing developability JSON files (*source* or *source*/results)."""
+    src = Path(source)
+    if not src.is_dir():
+        return None
+    if any(src.glob("*.json")):
+        return src.resolve()
+    results = src / "results"
+    if results.is_dir() and any(results.glob("*.json")):
+        return results.resolve()
+    return None
+
+
+def developability_source_kind(source: Path) -> str:
+    """``csv`` for features.csv layouts; ``json`` for descriptor JSON results folders."""
+    if resolve_features_csv_path(source) is not None:
+        return "csv"
+    if resolve_json_results_dir(source) is not None:
+        return "json"
+    raise ValueError(
+        f"Unrecognized developability source {source!r}: expected a {FEATURES_CSV_FILENAME} "
+        f"(file or under a run subfolder) or a directory of *.json files."
+    )
 
 
 def one_hot_listed_non_numeric_features(
@@ -148,21 +192,24 @@ def load_developability_dataframe(
     developability_source: Path,
 ) -> tuple[pd.DataFrame, str]:
     src = Path(developability_source)
-    if src.is_dir():
-        df_dev = load_json_results(src)
+    csv_path = resolve_features_csv_path(src)
+    if csv_path is not None:
+        df_dev = load_features_csv(csv_path)
+        id_hint = f"name or pdb_file basename in {csv_path}"
+    else:
+        json_dir = resolve_json_results_dir(src)
+        if json_dir is None:
+            raise ValueError(
+                f"developability_source must be {FEATURES_CSV_FILENAME}, a folder containing it, "
+                f"or a directory of *.json files; got {src}"
+            )
+        df_dev = load_json_results(json_dir)
         if "name" not in df_dev.columns:
             raise ValueError(
-                f"Developability JSON folder {src} has no 'name' column "
+                f"Developability JSON folder {json_dir} has no 'name' column "
                 "(expected from JSON filename stems)."
             )
-        id_hint = f"JSON filename stems under {src}"
-    elif src.is_file() and src.suffix.lower() == ".csv":
-        df_dev = load_propermab_features_csv(src)
-        id_hint = f"pdb_file basename or name in {src}"
-    else:
-        raise ValueError(
-            f"developability_source must be a directory of *.json files or a .csv path; got {src}"
-        )
+        id_hint = f"JSON filename stems under {json_dir}"
     return df_dev, id_hint
 
 
@@ -189,6 +236,14 @@ def merge_experimental_with_developability_subset(
     right = developability_df.loc[:, ["name", *dev_cols_ordered]].copy()
     left = experimental_df.copy()
     _normalize_merge_keys(left, name_col, right)
+    require_developability_name_coverage(
+        left,
+        right,
+        name_col=name_col,
+        developability_name_col="name",
+        context="Experimental/developability merge",
+        id_hint=id_hint,
+    )
 
     if name_col == "name":
         merged = left.merge(right, on="name", how="inner")
@@ -243,6 +298,23 @@ def _subset_columns(df: pd.DataFrame, cols: list[str], *, context: str) -> pd.Da
     if missing:
         raise ValueError(f"{context}: missing column(s): {missing}")
     return df.loc[:, order].copy()
+
+
+def _infer_experimental_feature_columns(
+    df: pd.DataFrame,
+    *,
+    name_col: str,
+    target_cols: list[str],
+    split_col: str | None,
+) -> list[str]:
+    exclude = {str(name_col), *[str(t) for t in target_cols]}
+    if split_col:
+        exclude.add(str(split_col))
+    return [
+        str(c)
+        for c in df.columns
+        if str(c).startswith("feature_") and str(c) not in exclude
+    ]
 
 
 def _validate_experimental_column_roles(
@@ -324,8 +396,8 @@ def _filter_developability_columns_by_groups(
         return list(columns)
     if not developability_is_json_dir:
         warnings.warn(
-            f"{context}: --developability-feature-groups is ignored when developability "
-            "source is not a directory of JSON files (e.g. Propermab .csv).",
+            f"{context}: --developability-feature-groups is ignored for features.csv "
+            "developability sources (JSON group filter applies to descriptor JSON only).",
             UserWarning,
             stacklevel=2,
         )
@@ -371,8 +443,15 @@ def load_merge_and_expand(
         raise ValueError(f"Unsupported dataset extension {path.suffix!r}; use .csv or .parquet.")
 
     name_col = str(name_col)
-    feats = [str(c) for c in feature_cols]
     targets = [str(c) for c in target_cols]
+    feats = [str(c) for c in feature_cols]
+    if not feats:
+        feats = _infer_experimental_feature_columns(
+            exp,
+            name_col=name_col,
+            target_cols=targets,
+            split_col=str(split_col) if split_col else None,
+        )
     dev_groups = (
         list(developability_feature_groups)
         if developability_feature_groups is not None
@@ -431,13 +510,14 @@ def load_merge_and_expand(
         return token
 
     for src in dev_sources:
+        src_kind = developability_source_kind(src)
         df_dev_one, id_hint_one = load_developability_dataframe(src)
         merged_id_hint_parts.append(id_hint_one)
         dev_candidates = _developability_feature_column_candidates(df_dev_one)
         dev_cols_one = _filter_developability_columns_by_groups(
             dev_candidates,
             dev_groups,
-            developability_is_json_dir=src.is_dir(),
+            developability_is_json_dir=(src_kind == "json"),
             context=f"load_merge_and_expand ({src})",
         )
         dev_cols_one = list(dict.fromkeys(dev_cols_one))
@@ -594,7 +674,7 @@ def write_folds_for_target(
     random_state: int,
     features_frac: float,
     dataset_stem: str,
-    max_target_nan_frac: float = 0.5,
+    max_target_nan_frac: float = 0.7,
     split_col: str | None = None,
 ) -> tuple[Path, list[str]]:
     name_col = str(name_col)
@@ -724,8 +804,9 @@ def main() -> None:
         metavar="COL",
         help=(
             "Optional: columns on the experimental table only (space-separated). "
+            "When omitted, any CSV columns named feature_* are used automatically. "
             "Developability feature columns (after optional --developability-feature-groups) "
-            "are inner-merged in addition to these. Omit to use only developability columns. "
+            "are inner-merged in addition to these. Omit both to use only developability columns. "
             "Non-numeric listed columns are one-hot-encoded after merge."
         ),
     )
@@ -736,8 +817,10 @@ def main() -> None:
         type=Path,
         dest="developability_sources",
         help=(
-            "One or more developability sources (space-separated): directory of *.json "
-            "(stem = ID) and/or propermab features.csv."
+            "One or more developability sources: directory of descriptor *.json "
+            "(optionally under results/), a features.csv file, a run subfolder "
+            "containing features.csv, or a flat {dataset_stem}{suffix}.csv file "
+            "(see predefined_descriptors in generic config)."
         ),
     )
     parser.add_argument(
@@ -791,12 +874,12 @@ def main() -> None:
     parser.add_argument(
         "--max-target-nan-frac",
         type=float,
-        default=0.5,
+        default=0.7,
         dest="max_target_nan_frac",
         metavar="F",
         help=(
             "Skip a target (raise) when this fraction or more of rows are NaN in that column "
-            "(default 0.5). Use e.g. 0.7 for sparse multi-endpoint tables."
+            "(default 0.7). Use e.g. 0.5 for stricter filtering on sparse multi-endpoint tables."
         ),
     )
     parser.add_argument(

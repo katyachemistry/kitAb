@@ -8,6 +8,7 @@
 #   freesasa (conda package `freesasa-c`)
 #   propka3  (conda package `propka`)
 #   mmseqs   (conda package `mmseqs2` from bioconda — sequence clustering for CV folds)
+#   parallel (GNU parallel — get_descriptors.sh / run_automl.sh)
 #
 # Create (mamba recommended):
 #   ./install.sh
@@ -18,15 +19,12 @@
 #   which mkdssp freesasa propka3
 #
 # Versions pinned from the existing `developability` conda env (2026-05).
-# Optional system tools (not in this file): GNU parallel for src/get_descriptors.sh.
 
 name: fastab
 
 channels:
   - conda-forge
   - bioconda
-
-channel_priority: strict
 
 dependencies:
   # --- Python ---
@@ -35,8 +33,9 @@ dependencies:
   # --- External structure/biophysics CLIs (used by src/get_descriptors.sh) ---
   - dssp=4.6.1          # provides `mkdssp` (set DSSP_BIN=mkdssp in pipeline)
   - freesasa-c=2.1.2    # provides `freesasa`
-  - propka=3.5.1        # provides `propka3`
+  - propka=3.5.1        # provides `propka3` (install.sh patches for Python 3.14)
   - mmseqs2             # provides `mmseqs` (sequence-identity clustering for AutoML CV folds)
+  - parallel            # GNU parallel (get_descriptors.sh / run_automl.sh)
 
   # --- Core scientific Python (developability + automl) ---
   - numpy=2.4.2

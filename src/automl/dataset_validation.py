@@ -60,6 +60,55 @@ def _stripped_name_series(df: pd.DataFrame, name_col: str) -> pd.Series:
     return raw.astype(str).str.strip()
 
 
+def _collect_duplicate_concat_sequence_errors(
+    df: pd.DataFrame,
+    names: pd.Series,
+    *,
+    heavy_col: str,
+    light_col: str,
+    context: str,
+    max_groups: int = 5,
+) -> list[str]:
+    heavy = df[heavy_col].astype(str).str.strip()
+    light = df[light_col].astype(str).str.strip()
+    empty_mask = (heavy == "") | (light == "")
+    if empty_mask.any():
+        n_empty = int(empty_mask.sum())
+        return [
+            f"{context}: {n_empty} row(s) have empty {heavy_col!r} or {light_col!r} "
+            "after stripping whitespace."
+        ]
+
+    concat = heavy + light
+    dup_mask = concat.duplicated(keep=False)
+    if not dup_mask.any():
+        return []
+
+    by_seq: dict[str, list[str]] = {}
+    for idx in df.index[dup_mask]:
+        by_seq.setdefault(concat.at[idx], []).append(names.at[idx])
+
+    errors: list[str] = []
+    for name_list in by_seq.values():
+        uniq = sorted(set(name_list))
+        if len(uniq) < 2:
+            continue
+        sample = uniq[:10]
+        tail = f" … and {len(uniq) - 10} more" if len(uniq) > 10 else ""
+        errors.append(
+            f"{context}: duplicate concatenated {heavy_col!r}+{light_col!r} "
+            f"sequence ({len(uniq)} name(s)): {sample!r}{tail}."
+        )
+
+    if len(errors) > max_groups:
+        extra = len(errors) - max_groups
+        errors = errors[:max_groups]
+        errors.append(
+            f"{context}: … and {extra} more duplicate concatenated sequence group(s)."
+        )
+    return errors
+
+
 def _collect_pipe_in_name_errors(
     names: pd.Series,
     *,
@@ -155,30 +204,15 @@ def collect_experimental_dataset_errors(
         )
         return errors
 
-    seq_key = heavy.astype(str) + light.astype(str)
-    dup_seq_mask = seq_key.duplicated(keep=False)
-    if dup_seq_mask.any():
-        dup_df = pd.DataFrame(
-            {name_col: names, "_seq_key": seq_key}
-        ).loc[dup_seq_mask]
-        groups: dict[str, list[str]] = {}
-        for nm, key in zip(dup_df[name_col], dup_df["_seq_key"], strict=True):
-            groups.setdefault(str(key), []).append(str(nm))
-        group_lines = [
-            str(sorted(dict.fromkeys(group_names)))
-            for group_names in groups.values()
-        ]
-        group_lines.sort()
-        sample = group_lines[:5]
-        tail = (
-            f" … and {len(group_lines) - 5} more duplicate sequence group(s)"
-            if len(group_lines) > 5
-            else ""
+    errors.extend(
+        _collect_duplicate_concat_sequence_errors(
+            df,
+            names,
+            heavy_col=heavy_col,
+            light_col=light_col,
+            context=ctx,
         )
-        errors.append(
-            f"{ctx}: duplicate concatenated {heavy_col!r}+{light_col!r} sequence(s); "
-            f"name groups: {', '.join(sample)}{tail}."
-        )
+    )
 
     return errors
 
@@ -278,3 +312,57 @@ def validate_experimental_structures_present(
     )
     if errors:
         raise ValueError("\n".join(errors))
+
+
+def collect_missing_developability_names(
+    experimental_names: Iterable[str],
+    developability_names: Iterable[str],
+    *,
+    exclude_names: Iterable[str] | None = None,
+) -> list[str]:
+    """Return experimental IDs with no matching developability row."""
+    excluded = {str(name).strip() for name in (exclude_names or ()) if str(name).strip()}
+    expected = {
+        str(name).strip()
+        for name in experimental_names
+        if str(name).strip() and str(name).strip() not in excluded
+    }
+    available = {str(name).strip() for name in developability_names if str(name).strip()}
+    return sorted(expected - available)
+
+
+def require_developability_name_coverage(
+    experimental_df: pd.DataFrame,
+    developability_df: pd.DataFrame,
+    *,
+    name_col: str = "name",
+    developability_name_col: str = "name",
+    exclude_names: Iterable[str] | None = None,
+    context: str = "Experimental/developability merge",
+    id_hint: str = "developability source",
+    max_examples: int = 10,
+) -> None:
+    """Raise if any experimental row lacks a developability entry (JSON or features.csv)."""
+    name_col = str(name_col)
+    developability_name_col = str(developability_name_col)
+    if name_col not in experimental_df.columns:
+        raise ValueError(f"{context}: missing experimental column {name_col!r}.")
+    if developability_name_col not in developability_df.columns:
+        raise ValueError(
+            f"{context}: developability table missing column {developability_name_col!r}."
+        )
+
+    missing = collect_missing_developability_names(
+        experimental_df[name_col].tolist(),
+        developability_df[developability_name_col].tolist(),
+        exclude_names=exclude_names,
+    )
+    if not missing:
+        return
+
+    shown = missing[:max_examples]
+    extra = f" ... and {len(missing) - max_examples} more" if len(missing) > max_examples else ""
+    raise ValueError(
+        f"{context}: developability data missing for {len(missing)} experimental "
+        f"name(s) ({id_hint}): {shown!r}{extra}"
+    )

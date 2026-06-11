@@ -2,7 +2,8 @@
 # Default path: src/automl.yaml (override with automl_config: in run config or --automl-config).
 
 pipeline:
-  random_state: 42, 100, 0
+  # Per-dataset random_seeds in run configs override this (42,43,44 for shuffled CV).
+  random_state: 42
   # One value or comma-separated / YAML list, e.g. 0.15,0.10,0.08 or [0.15, 0.10, 0.08]
   features_frac: 0.15,0.10,0.08,0.06,0.04,0.02
   eval_models: all

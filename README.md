@@ -30,7 +30,7 @@ FASTAb/
 │   └── …
 ```
 
-One dataset = one csv file. It must contain "name", "heavy", "light" and "target_X", "target_Y", ..., "feature_A", "feature_B", ... columns.
+One dataset = one csv file. It must contain "name", "heavy", "light" and "target_X", "target_Y", ..., "feature_A", "feature_B", ... columns. Each `name` must be unique, and the concatenated `heavy`+`light` sequence must be unique across rows (checked when the run config is prepared and again before AutoML merge).
 
 Try out the scenario using example. 
 
@@ -60,17 +60,7 @@ split_randomly: ab21.csv,hutchinson2023enhancement_top200tm1_igg.csv,pdgf38.csv
 
 Entries may be given with or without the `.csv` suffix; matching is by dataset stem.
 
-### Stability targets
-
-If some of your targets are stability-related (e.g. Tm, aggregation rate), list their suffixes under `stability_features`:
-
-```yaml
-stability_features:
-  - _Tm
-  - _agg
-```
-
-For targets whose name ends with one of these suffixes, the pipeline will additionally include structural `core` features in the AutoML feature set.
+AutoML uses all developability descriptor groups for every target (`surface`, `core`, `general`, `sequence_motives`) unless a run config block sets `developability_features` explicitly.
 
 ---
 
@@ -107,6 +97,40 @@ If your structures are not IMGT-numbered, you **must** set **renumber: True**. I
 
 ---
 
+## Scenario 2a: Descriptors only on existing structures (no CSV datasets)
+
+See **configs/scenario2a.yaml**.
+
+Use this when you already have PDB/mmCIF files and only need developability descriptors (no assay CSVs, no AutoML). Set ```input_structures_folder``` and ```result_folder```; omit ```input_csvs_folder```.
+
+Supported layouts:
+
+```text
+FASTAb/
+├── structures_abb2_paired_oas_sanity_skip_minimized/   # flat folder
+│   ├── abngs_oas_paired_merged_data_paired_5457817.pdb
+│   └── …
+```
+
+or nested batch folders (same convention as scenario 2):
+
+```text
+FASTAb/
+├── structures_abb3/
+│   ├── ab21_abb3_1/
+│   │   ├── mAb1.pdb
+│   │   └── …
+│   └── …
+```
+
+Optional ```structures_processing``` (minimize / IMGT renumber) runs in place before descriptors, as in scenario 2.
+
+```bash
+bash fastab.sh configs/scenario2a.yaml
+```
+
+---
+
 ## Scenario 3: You only want to run descriptors calculation, no predictions from AutoML part. 
 
 Depending on whether you have structures or not, prepare input and configure relevant fields in yaml (see scenarios 1 and 2). We give example **scenario3.yaml** for no-structures case. 
@@ -116,7 +140,12 @@ This scenario only differs from previous in 1 field: ```no_automl```. Configure 
 
 If you already have calculated developability descriptors (e.g. from previous runs) and want to run only the AutoML part, configure ```calculate_descriptors: False``` in your config YAML file. See **configs/scenario4.yaml**.
 
-Provide the path to the folder containing your pre-calculated descriptors under ```predefined_descriptors```, and list the allowed suffixes of the subfolders to run on. For each matched folder, the pipeline automatically searches for the corresponding CSV dataset inside ```input_csvs_folder``` using its stem.
+Provide the path to the folder containing your pre-calculated descriptors under ```predefined_descriptors```, and list the allowed suffixes for run names ``{dataset_stem}{suffix}``. For each match, the pipeline finds the corresponding dataset CSV in ```input_csvs_folder``` by stem. Layout is detected automatically (vendor-agnostic):
+
+- **Subfolders**: ``{dataset_stem}{suffix}/features.csv`` (optional ```features_filename```), or ``{dataset_stem}{suffix}/results/*.json`` (FASTAb-style JSON).
+- **Flat CSVs** (when no matching subfolders exist): ``{dataset_stem}{suffix}.csv`` in the folder root.
+
+If any ``{dataset_stem}{suffix}`` subfolders exist, flat CSVs in the root are ignored.
 
 ```yaml
 input_csvs_folder: datasets

@@ -1245,8 +1245,14 @@ def _run_minimize_cli(rest: list[str]) -> None:
             else:
                 n_fail += 1
                 print(f"  {status}  {short}", flush=True)
+
     print(f"\nDone: {n_ok} ok, {n_warn} warn, {n_skip} skipped, {n_fail} failed.", flush=True)
     print(f"Output: {output_dir}", flush=True)
+
+    staging = input_dir / _MINIMIZE_STAGING_DIRNAME
+    if staging.is_dir():
+        shutil.rmtree(staging)
+        print(f"Removed minimization staging: {staging}", flush=True)
 
 
 if __name__ == "__main__":

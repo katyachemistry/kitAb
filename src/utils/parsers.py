@@ -1,5 +1,6 @@
 from typing import Dict, List, Tuple, Optional, Iterable, Iterator
 from dataclasses import dataclass
+from collections import defaultdict
 import re
 import shlex
 from pathlib import Path
@@ -11,6 +12,64 @@ _RESNUM_PATTERN = re.compile(r"^(-?\d+)([A-Za-z])?$")
 hbond_pattern = re.compile(r"(-?\d+),\s*(-?\d+\.?\d*)")
 
 CHARGED_RESIDUE_TYPES = frozenset({"ASP", "GLU", "LYS", "ARG", "HIS", "TYR", "CYS", "N+", "C-"})
+
+ResKey4 = Tuple[str, int, str, str]
+
+_PKA_INSERTION_REMAP_WARNED: set[Tuple[ResKey4, ResKey4]] = set()
+
+
+def _build_residue_key_index(
+    pdb_residue_set: set[ResKey4],
+) -> Dict[Tuple[str, int, str], List[ResKey4]]:
+    index: Dict[Tuple[str, int, str], List[ResKey4]] = defaultdict(list)
+    for key in pdb_residue_set:
+        index[(key[0], key[1], key[2])].append(key)
+    for keys in index.values():
+        keys.sort(key=lambda k: k[3])
+    return index
+
+
+def resolve_external_residue_key(
+    external_key: ResKey4,
+    pdb_residue_set: set[ResKey4],
+    *,
+    residue_index: Optional[Dict[Tuple[str, int, str], List[ResKey4]]] = None,
+) -> Optional[ResKey4]:
+    """Map PropKa/DSSP residue keys onto parsed structure keys.
+
+    PropKa often omits IMGT insertion codes (e.g. ``TYR 112 H``) while the
+    structure uses ``112B``. When exactly one structure residue matches
+    ``(residue_name, residue_number, chain)``, use that key.
+    """
+    if external_key in pdb_residue_set:
+        return external_key
+
+    res_name, res_num, chain, inscode = external_key
+    if inscode:
+        return None
+
+    if residue_index is None:
+        residue_index = _build_residue_key_index(pdb_residue_set)
+
+    candidates = residue_index.get((res_name, res_num, chain), [])
+    if len(candidates) == 1:
+        mapped = candidates[0]
+        if mapped != external_key and (external_key, mapped) not in _PKA_INSERTION_REMAP_WARNED:
+            _PKA_INSERTION_REMAP_WARNED.add((external_key, mapped))
+            logger.info(
+                "Mapped external residue key %r -> structure key %r (insertion-code mismatch)",
+                external_key,
+                mapped,
+            )
+        return mapped
+
+    if not candidates:
+        return None
+
+    unlettered = (res_name, res_num, chain, "")
+    if unlettered in pdb_residue_set:
+        return unlettered
+    return None
 
 _PKA_CACHE: Dict[Tuple[str, int], Dict[Tuple[str, int, str, str], float]] = {}
 
@@ -52,6 +111,31 @@ def parse_residue_number_field(s: str) -> Optional[Tuple[int, str]]:
     num = int(match.group(1))
     ins = (match.group(2) or "")
     return (num, ins)
+
+
+def parse_dssp_residue_fields(line: str) -> Optional[Tuple[int, str, str]]:
+    """Parse residue number, insertion code, and chain from a DSSP data line.
+
+    Columns 6-10 (``line[5:10]``) hold the PDB residue number; the insertion
+    code may be the last character of that field. mkdssp sometimes right-pads
+    three-digit numbers with two spaces, pushing the insertion letter into
+    column 11 (``line[10]``). Chain ID stays at column 12 (``line[11]``).
+    """
+    if len(line) < 12:
+        return None
+    parsed_res = parse_residue_number_field(line[5:10])
+    if parsed_res is None:
+        return None
+    residue_number, insertion_code = parsed_res
+    if not insertion_code:
+        spill = line[10]
+        if spill.isalpha():
+            insertion_code = spill
+    chain = line[11:12].strip()
+    if not chain:
+        return None
+    return residue_number, insertion_code, chain
+
 
 @dataclass(frozen=True)
 class Atom:
@@ -364,6 +448,33 @@ def parse_cif(
     return atoms
 
 
+def collect_pdb_bfactor_values(pdb_path: str) -> set[float]:
+    """Collect unique B-factors (PDB columns 61-66) from ATOM/HETATM records."""
+    bfactors: set[float] = set()
+    try:
+        with open(pdb_path, "r") as handle:
+            for line in handle:
+                if not line.startswith(("ATOM", "HETATM")):
+                    continue
+                if len(line) < 66:
+                    continue
+                try:
+                    bfactors.add(float(line[60:66].strip()))
+                except ValueError:
+                    continue
+    except OSError:
+        return set()
+    return bfactors
+
+
+def abb2_bfactor_all_zero(pdb_path: str) -> bool:
+    """True when every ATOM/HETATM B-factor is 0.00 (unrefined abb2 structure)."""
+    bfactors = collect_pdb_bfactor_values(pdb_path)
+    if not bfactors:
+        return False
+    return all(abs(value) < 1e-6 for value in bfactors)
+
+
 def parse_structure(
     path: str,
     allowed_chains: Optional[Iterable[str]] = None,
@@ -639,6 +750,7 @@ def parse_pka(
         for atom in pdb_atoms:
             inscode = getattr(atom, "insertion_code", "") or ""
             pdb_residue_set.add((atom.residue_name, atom.residue_number, atom.chain, inscode))
+    residue_index = _build_residue_key_index(pdb_residue_set) if pdb_atoms else None
 
     pka_data: Dict[Tuple[str, int, str, str], float] = {}
 
@@ -704,8 +816,15 @@ def parse_pka(
 
                     residue_key = (residue_name, residue_number, chain, insertion_code)
 
-                    if pdb_atoms and residue_name not in ("N+", "C-") and residue_key not in pdb_residue_set:
-                        continue
+                    if pdb_atoms and residue_name not in ("N+", "C-"):
+                        mapped_key = resolve_external_residue_key(
+                            residue_key,
+                            pdb_residue_set,
+                            residue_index=residue_index,
+                        )
+                        if mapped_key is None:
+                            continue
+                        residue_key = mapped_key
 
                     if residue_key not in pka_data:
                         pka_data[residue_key] = pka_value
@@ -812,6 +931,7 @@ def parse_dssp(
     if pdb_atoms:
         for atom in pdb_atoms:
             pdb_residue_set.add(residue_key_from_atom(atom))
+    residue_index = _build_residue_key_index(pdb_residue_set) if pdb_atoms else None
 
     dssp_data: Dict[Tuple[str, int, str, str], Dict[str, Optional[float]]] = {}
     hbond_data: Dict[Tuple[str, int, str, str], List[Tuple[int, float]]] = {}
@@ -832,16 +952,10 @@ def parse_dssp(
             continue
 
         try:
-            parsed_res = parse_residue_number_field(line[5:10])
-            if parsed_res is None:
+            parsed_fields = parse_dssp_residue_fields(line)
+            if parsed_fields is None:
                 continue
-            residue_number, insertion_code = parsed_res
-
-            if len(line) < 12:
-                continue
-            chain = line[11:12].strip()
-            if not chain:
-                continue
+            residue_number, insertion_code, chain = parsed_fields
 
             if len(line) < 14:
                 continue
@@ -852,8 +966,15 @@ def parse_dssp(
             residue_name = AA_1_TO_3[aa_1letter]
             residue_key = (residue_name, residue_number, chain, insertion_code)
 
-            if pdb_atoms and residue_key not in pdb_residue_set:
-                continue
+            if pdb_atoms:
+                mapped_key = resolve_external_residue_key(
+                    residue_key,
+                    pdb_residue_set,
+                    residue_index=residue_index,
+                )
+                if mapped_key is None:
+                    continue
+                residue_key = mapped_key
 
             dssp_seq_str = line[0:5].strip()
             if dssp_seq_str:

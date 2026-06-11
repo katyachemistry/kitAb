@@ -15,8 +15,18 @@ DBSCAN_EPS_MIN_SAMPLES_BY_CATEGORY_DEFAULT: Dict[str, Tuple[float, int]] = {
 
 SURFACE_EXPOSED_THRESHOLD_DEFAULT: float = EXPOSURE_REL_ASA_THRESHOLD
 
-PCF_CLUSTER_BIN_STARTS_DEFAULT: Tuple[float, ...] = (3.0, 4.0, 5.0, 3.0, 5.0)
-PCF_CLUSTER_BIN_WIDTHS_DEFAULT: Tuple[float, ...] = (1.0, 1.0, 1.0, 2.0, 2.0)
+PCF_CLUSTER_BIN_STARTS_DEFAULT: Tuple[float, ...] = (
+    # 3.0, 4.0, 5.0,  # bin width 1 shells (3w1A, 4w1A, 5w1A)
+    # 3.0, 5.0,  # bin width 2 shells (3w2A, 5w2A)
+    4.0,
+    7.0,
+)
+PCF_CLUSTER_BIN_WIDTHS_DEFAULT: Tuple[float, ...] = (
+    # 1.0, 1.0, 1.0,  # bin width 1
+    # 2.0, 2.0,  # bin width 2
+    3.0,
+    3.0,
+)
 PCF_CLUSTER_N_PERMUTATIONS_DEFAULT: int = 3000
 
 CDR_VICINITY_HEAVY_ATOM_CUTOFF: float = 5.0
@@ -82,7 +92,8 @@ NEGATIVE_ATOMS = frozenset(
 
 GLN_ASN_RESIDUES = frozenset({"GLN", "ASN"})
 
-KYTE_DOOLITTLE = {
+# Kyte-Doolittle (inactive in pipeline; legacy export for run_developability_fix_results.py).
+KYTE_DOOLITTLE: Dict[str, float] = {
     "ILE": 4.5,
     "VAL": 4.2,
     "LEU": 3.8,
@@ -105,17 +116,49 @@ KYTE_DOOLITTLE = {
     "ARG": -4.5,
 }
 
+WIMLEY_WHITE: Dict[str, float] = {
+    "ALA": -0.20,
+    "ARG": -0.41,
+    "ASN": -0.51,
+    "ASP": -1.53,
+    "CYS": 0.31,
+    "GLN": -0.71,
+    "GLU": -2.51,
+    "GLY": 0.00,
+    "HIS": -0.20,
+    "ILE": 0.35,
+    "LEU": 0.71,
+    "LYS": -0.59,
+    "MET": 0.30,
+    "PHE": 1.43,
+    "PRO": -0.55,
+    "SER": -0.15,
+    "THR": -0.16,
+    "TRP": 2.33,
+    "TYR": 1.19,
+    "VAL": -0.08,
+}
+
+# Active residue hydrophobicity lookup for developability descriptors.
+RESIDUE_HYDROPHOBICITY: Mapping[str, float] = WIMLEY_WHITE
+
+
+def residue_hydrophobicity(residue_name: str) -> float:
+    """Per-residue hydrophobicity from the active scale (Wimley-White)."""
+    return float(RESIDUE_HYDROPHOBICITY.get((residue_name or "").strip().upper(), 0.0))
+
 NEGATIVE_CHARGED_RESIDUES = frozenset({res for _atom, res in NEGATIVE_ATOMS})
 POSITIVE_CHARGED_RESIDUES = frozenset({res for _atom, res in POSITIVE_ATOMS})
 
-AROMATIC_RESIDUES = frozenset({"PHE", "TYR", "TRP"})
-# Side-chain nonpolar / hydrophobic patch grouping (DBSCAN, PCF, CDR vicinity SASA sums).
-# Includes aromatic Phe, Trp, and Tyr when neutral at the working pH: developability
-# surface descriptors treat their patches like other nonpolar clusters (charge is handled
-# separately via PropKa before this classification). AROMATIC_RESIDUES remains the set
-# for aromatic-specific metrics (e.g. aro_* SASA, SAP aromatic score).
+AROMATIC_RESIDUES = frozenset({"PHE", "TYR", "TRP", "HIS"})
+
+
+# NONPOLAR_RESIDUES = frozenset(
+#     {"ALA", "VAL", "LEU", "ILE", "MET", "PHE", "TRP", "TYR", "PRO", "CYS"}
+# )
+# https://pmc.ncbi.nlm.nih.gov/articles/PMC9475378/#s3
 NONPOLAR_RESIDUES = frozenset(
-    {"ALA", "VAL", "LEU", "ILE", "MET", "PHE", "TRP", "TYR", "PRO", "CYS"}
+    {"VAL", "LEU", "ILE", "MET", "PHE", "TRP", "TYR", "CYS"}
 )
 HYDROPHOBIC_RESIDUES = NONPOLAR_RESIDUES
 

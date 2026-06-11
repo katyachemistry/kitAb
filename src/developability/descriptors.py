@@ -25,6 +25,7 @@ from developability.descriptor_utils import (
     _get_residue_seq_index,
     _get_charged_residues_at_pH,
     _residue_category_group_surface_pcf,
+    _lookup_pka_value,
     get_exposed_residues,
     _sasa_lookup,
     is_donor,
@@ -47,19 +48,19 @@ from utils.parsers import (
 )
 from utils.chemistry import (
     AROMATIC_RESIDUES,
-    CTERM_PKA,
+    CTERM_PKA,  # kept for commented standard termini pKa fallback
     DBSCAN_EPS_MIN_SAMPLES_BY_CATEGORY_DEFAULT,
     EXPOSURE_REL_ASA_THRESHOLD,
     get_ff19sb_atom_charge_with_source,
     BACKBONE_ATOMS,
-    KYTE_DOOLITTLE,
+    residue_hydrophobicity,
     MAX_HBOND_DISTANCE,
     MAX_SALT_BRIDGE_DISTANCE,
     MIN_BACKBONE_SEPARATION,
     MIN_HBOND_ANGLE,
     NEGATIVE_ATOMS,
     NEGATIVE_CHARGED_RESIDUES,
-    NTERM_PKA,
+    NTERM_PKA,  # kept for commented standard termini pKa fallback
     PCF_CLUSTER_BIN_STARTS_DEFAULT,
     PCF_CLUSTER_BIN_WIDTHS_DEFAULT,
     PCF_CLUSTER_N_PERMUTATIONS_DEFAULT,
@@ -67,7 +68,6 @@ from utils.chemistry import (
     POSITIVE_CHARGED_RESIDUES,
     SURFACE_EXPOSED_THRESHOLD_DEFAULT,
     THREE_TO_ONE,
-    get_standard_residue_pka,
 )
 
 logger = logging.getLogger(__name__)
@@ -112,8 +112,21 @@ def net_charge_from_pka(
             net += _residue_fractional_charge_at_pH(res_name, pka, pH)
 
     for chain in chains:
-        nterm_pka = nterm_pka_by_chain.get(chain, NTERM_PKA)
-        cterm_pka = cterm_pka_by_chain.get(chain, CTERM_PKA)
+        if chain not in nterm_pka_by_chain:
+            raise ValueError(
+                f"Missing PropKa N+ entry for chain {chain!r}; "
+                "termini pKa values must come from the PropKa file."
+            )
+        if chain not in cterm_pka_by_chain:
+            raise ValueError(
+                f"Missing PropKa C- entry for chain {chain!r}; "
+                "termini pKa values must come from the PropKa file."
+            )
+        nterm_pka = nterm_pka_by_chain[chain]
+        cterm_pka = cterm_pka_by_chain[chain]
+        # Standard termini pKa fallback (disabled — PropKa required):
+        # nterm_pka = nterm_pka_by_chain.get(chain, NTERM_PKA)
+        # cterm_pka = cterm_pka_by_chain.get(chain, CTERM_PKA)
         # N-terminus
         net += 1.0 / (1.0 + np.power(10.0, pH - nterm_pka))
         # C-terminus
@@ -270,8 +283,8 @@ def residue_neighbor_score(
         entry = sasa_data.get(key4)
         sasa_arr[i] = float(getattr(entry, "total_side_rel", 0.0) or 0.0)
         if needs_charge:
-            pka = pka_data.get(key4) if pka_data else None
-            charge_arr[i] = _residue_fractional_charge_at_pH(key4[0], pka, pH, use_fallback=not bool(pka_data))
+            pka = _lookup_pka_value(key4, pka_data, atoms=pdb_atoms) if pka_data else None
+            charge_arr[i] = _residue_fractional_charge_at_pH(key4[0], pka, pH)
 
     exposed_arr: np.ndarray = sasa_arr > sasa_cutoff
 
@@ -279,7 +292,7 @@ def residue_neighbor_score(
         raw_source = charge_arr
     elif source == "hydrophobicity":
         raw_source = np.array(
-            [float(KYTE_DOOLITTLE.get(k[0], 0.0)) for k in res_keys], dtype=np.float64
+            [residue_hydrophobicity(k[0]) for k in res_keys], dtype=np.float64
         )
     elif source == "charge_pos":
         raw_source = np.maximum(0.0, charge_arr)
@@ -301,7 +314,7 @@ def residue_neighbor_score(
         center_arr = sasa_arr
     elif center_weight == "hydrophobicity":
         center_arr = np.array(
-            [float(KYTE_DOOLITTLE.get(k[0], 0.0)) for k in res_keys], dtype=np.float64
+            [residue_hydrophobicity(k[0]) for k in res_keys], dtype=np.float64
         )
     elif center_weight == "charge":
         center_arr = charge_arr
@@ -473,8 +486,8 @@ def compute_sap_shell_synergy_scores(
         entry = sasa_data.get(key4)
         sasa_arr[i] = float(getattr(entry, "total_side_rel", 0.0) or 0.0)
         aa = (key4[0] or "").strip().upper()
-        pka = pka_lookup.get(key4)
-        charge_arr[i] = _residue_fractional_charge_at_pH(aa, pka, pH, use_fallback=not bool(pka_lookup))
+        pka = _lookup_pka_value(key4, pka_lookup, atoms=pdb_atoms) if pka_lookup else None
+        charge_arr[i] = _residue_fractional_charge_at_pH(aa, pka, pH)
         aro_arr[i] = 1.0 if aa in AROMATIC_RESIDUES else 0.0
         his_arr[i] = 1.0 if aa == "HIS" else 0.0
 
@@ -507,8 +520,8 @@ def compute_sap_shell_synergy_scores(
                 his_env[ri] += his_src[rj]
 
     w = sasa_arr
-    out["sap_aromatic_score"] = float(np.sum(w * aro_env))
-    out["sap_histidine_score"] = float(np.sum(w * his_env))
+    out["sap_aro_score"] = float(np.sum(w * aro_env))
+    out["sap_his_score"] = float(np.sum(w * his_env))
     out["sap_pos_aro_synergy"] = float(np.sum(w * pos_env * aro_env))
     out["sap_aro_neg_contrast"] = float(np.sum(w * aro_env * neg_env))
     return out
@@ -828,7 +841,7 @@ def compute_residue_DBSCAN_cluster_labels(
     for key, xyz in ca_by_res.items():
         res_name = key[0]
         group = _residue_category_group_surface_pcf(
-            res_name, pka_data.get(key), pH, use_fallback_pka=not bool(pka_data)
+            res_name, _lookup_pka_value(key, pka_data, atoms=atoms), pH
         )
         if group == "negative":
             neg_keys.append(key)
@@ -958,7 +971,7 @@ def compute_exposed_pair_correlation_cluster_scores(
     bin_starts: Tuple[float, ...] = PCF_CLUSTER_BIN_STARTS_DEFAULT,
     bin_widths: Tuple[float, ...] = PCF_CLUSTER_BIN_WIDTHS_DEFAULT,
     n_permutations: int = PCF_CLUSTER_N_PERMUTATIONS_DEFAULT,
-    random_seed: int = 0,
+    random_seed: int = 42,
 ) -> Dict[str, Optional[float]]:
     """PCF clustering scores for exposed Cα by charge/hydrophobic class and distance shell."""
     result = _empty_pcf_cluster_scores(bin_starts, bin_widths)
@@ -1003,7 +1016,7 @@ def compute_exposed_pair_correlation_cluster_scores(
         xyz = ca_by_res[key]
         res_name = key[0]
         pka_val = get_pka_for_key(key, pka_output_data)
-        group = _residue_category_group_surface_pcf(res_name, pka_val, pH, use_fallback_pka=not bool(pka_output_data))
+        group = _residue_category_group_surface_pcf(res_name, pka_val, pH)
         if group == "negative":
             neg.append(xyz)
         elif group == "positive":

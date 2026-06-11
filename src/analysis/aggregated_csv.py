@@ -18,14 +18,10 @@ ANALYSIS_RESULTS_DIRNAME = "analysis_results"
 _FOLD_SPEAR_RE = re.compile(r"^fold_(\d+)_spearman$")
 
 
-def is_propermab_source(source: str) -> bool:
-    return "propermab" in source.lower()
-
-
 def is_our_source(source: str) -> bool:
-    if is_propermab_source(source):
-        return False
-    s = source
+    s = str(source)
+    if s.startswith("descriptors_"):
+        return True
     return "_results" in s or "_our_" in s or "_our__" in s or s.endswith("_our")
 
 

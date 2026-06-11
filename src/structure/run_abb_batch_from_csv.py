@@ -9,6 +9,10 @@ import sys
 from pathlib import Path
 from typing import Union
 
+_src_dir = Path(__file__).resolve().parents[1]
+if str(_src_dir) not in sys.path:
+    sys.path.insert(0, str(_src_dir))
+
 ABB3_SRC_DEFAULT = os.environ.get("ABB3_SRC", "/home/kb/abodybuilder3/src")
 CKPT_DEFAULT = os.environ.get(
     "ABB3_CHECKPOINT",
@@ -56,10 +60,50 @@ def _build_dataset_jobs(
 def _validate_csv_columns(csv_path: Path) -> None:
     import pandas as pd
 
-    header = pd.read_csv(csv_path, nrows=0)
-    missing = [c for c in ("name", "heavy", "light") if c not in header.columns]
-    if missing:
-        raise SystemExit(f"{csv_path}: missing columns {missing}")
+    from automl.dataset_validation import validate_experimental_dataset
+
+    df = pd.read_csv(csv_path)
+    allow_nan = [
+        c
+        for c in df.columns
+        if str(c).startswith("target_")
+        or str(c).startswith("feature_")
+        or str(c) == "fold"
+    ]
+    try:
+        validate_experimental_dataset(
+            df,
+            allow_nan_in_columns=allow_nan,
+            context=str(csv_path),
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def _ensure_lightning_pytorch() -> None:
+    """ABB3 imports ``lightning.pytorch``; some envs only have ``pytorch_lightning`` installed."""
+    try:
+        import lightning.pytorch  # noqa: F401
+        return
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"lightning", "lightning.pytorch"}:
+            raise
+    try:
+        import pytorch_lightning as pl
+    except ModuleNotFoundError as exc:
+        if exc.name != "pytorch_lightning":
+            raise
+        raise SystemExit(
+            "PyTorch Lightning is missing from this env. ABB3 needs the 'lightning' "
+            "package, not only 'pytorch-lightning'. Repair with: "
+            "conda run -n fastab-abb3 python -m pip install 'lightning==2.1.2'"
+        ) from exc
+    import types
+
+    lightning = types.ModuleType("lightning")
+    lightning.pytorch = pl
+    sys.modules["lightning"] = lightning
+    sys.modules["lightning.pytorch"] = pl
 
 
 def _early_set_cuda_visible_device(device_arg: str) -> None:
@@ -93,10 +137,13 @@ def _resolve_torch_device(device_arg: str):
             raise SystemExit(f"Device {device_arg} requested but CUDA is not available")
         device = torch.device(device_arg)
         idx = device.index if device.index is not None else 0
-        if idx >= torch.cuda.device_count():
+        n = torch.cuda.device_count()
+        if idx >= n:
+            # After CUDA_VISIBLE_DEVICES masking, only cuda:0 is valid.
+            if n == 1:
+                return torch.device("cuda:0")
             raise SystemExit(
-                f"Device {device_arg} not available "
-                f"(only {torch.cuda.device_count()} CUDA device(s))"
+                f"Device {device_arg} not available (only {n} CUDA device(s) visible)"
             )
         return device
     raise SystemExit(f"Unknown --device {device_arg!r} (use cuda:0, cuda:1, cpu)")
@@ -111,6 +158,8 @@ def process_one_dataset_abb2(
     skip_existing: bool,
     n_threads_save: int,
 ) -> None:
+    import time
+
     import pandas as pd
 
     df = pd.read_csv(csv_path)
@@ -118,7 +167,7 @@ def process_one_dataset_abb2(
     if missing:
         raise SystemExit(f"{csv_path}: missing columns {missing}")
 
-    print(f"\n>>> Dataset {dataset!r} ({csv_path.name})", flush=True)
+    print(f"\n>>> Dataset {dataset!r} ({csv_path.name}, {len(df)} antibodies)", flush=True)
 
     for run in range(1, runs + 1):
         run_dir = out_root / f"{dataset}_abb2_{run}"
@@ -126,8 +175,9 @@ def process_one_dataset_abb2(
         print(f"=== run {run}/{runs} -> {run_dir} ===", flush=True)
 
         n_ok, n_skip, n_fail = 0, 0, 0
+        n_total = len(df)
 
-        for _, row in df.iterrows():
+        for idx, (_, row) in enumerate(df.iterrows(), start=1):
             name = str(row["name"]).strip() if pd.notna(row["name"]) else ""
             heavy = str(row["heavy"]).strip() if pd.notna(row["heavy"]) else ""
             light = str(row["light"]).strip() if pd.notna(row["light"]) else ""
@@ -138,17 +188,22 @@ def process_one_dataset_abb2(
             pdb_path = run_dir / f"{name}.pdb"
             if skip_existing and pdb_path.is_file():
                 n_skip += 1
+                if n_skip <= 3 or idx == n_total:
+                    print(f"  [{idx}/{n_total}] {name} skip (exists)", flush=True)
                 continue
 
+            print(f"  [{idx}/{n_total}] {name} predict+refine ...", flush=True)
+            t0 = time.monotonic()
             sequences = {"H": heavy, "L": light}
             try:
                 antibody = predictor.predict(sequences)
             except Exception as e:
-                print(f"  FAIL {name!r}: {e}", flush=True)
+                print(f"  [{idx}/{n_total}] FAIL {name!r}: {e}", flush=True)
                 n_fail += 1
                 continue
 
             if antibody is None:
+                print(f"  [{idx}/{n_total}] FAIL {name!r}: predict returned None", flush=True)
                 n_fail += 1
                 continue
 
@@ -159,8 +214,12 @@ def process_one_dataset_abb2(
                     n_threads=n_threads_save,
                 )
                 n_ok += 1
+                print(
+                    f"  [{idx}/{n_total}] {name} ok ({time.monotonic() - t0:.1f}s)",
+                    flush=True,
+                )
             except Exception as e:
-                print(f"  FAIL {name!r} (save): {e}", flush=True)
+                print(f"  [{idx}/{n_total}] FAIL {name!r} (save): {e}", flush=True)
                 n_fail += 1
 
         print(
@@ -170,6 +229,7 @@ def process_one_dataset_abb2(
 
 
 def main_abb2(args: argparse.Namespace) -> None:
+    print("ABB2: loading PyTorch and ImmuneBuilder (first start can take ~1 min) ...", flush=True)
     _early_set_cuda_visible_device(args.device)
     import torch
     from ImmuneBuilder import ABodyBuilder2
@@ -404,6 +464,9 @@ def process_one_dataset_abb3(
 
 
 def main_abb3(args: argparse.Namespace) -> None:
+    # Mask GPUs before any torch/lightning import (see main_abb2).
+    _early_set_cuda_visible_device(args.device)
+
     if args.runs < 1:
         raise SystemExit("--runs must be >= 1")
     if args.batch_size < 1:
@@ -426,6 +489,7 @@ def main_abb3(args: argparse.Namespace) -> None:
     if not abb3_src.is_dir():
         raise SystemExit(f"ABB3 source directory not found: {abb3_src} (set ABB3_SRC)")
     sys.path.insert(0, str(abb3_src))
+    _ensure_lightning_pytorch()
 
     from abodybuilder3.lightning_module import LitABB3
     from abodybuilder3.openfold.np.residue_constants import restype_order_with_x
@@ -435,7 +499,8 @@ def main_abb3(args: argparse.Namespace) -> None:
     print(f"Device: {device}", flush=True)
 
     print(f"Loading checkpoint: {ckpt}", flush=True)
-    module = LitABB3.load_from_checkpoint(str(ckpt), map_location=str(device))
+    # Load on CPU first; checkpoints may reference cuda:N from training (e.g. cuda:3).
+    module = LitABB3.load_from_checkpoint(str(ckpt), map_location="cpu")
     model = module.model
     model.eval()
     model.to(device)

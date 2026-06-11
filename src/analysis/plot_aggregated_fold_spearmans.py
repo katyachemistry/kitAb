@@ -22,12 +22,10 @@ from analysis.aggregated_csv import (
     fold_spearman_columns,
     is_gpr_run,
     is_our_source,
-    is_propermab_source,
     resolve_output_dir,
 )
 
 COLOR_OUR = "#FF69B4"
-COLOR_PM = "#1f77b4"
 ALPHA_DOT = 0.72
 ALPHA_BOX = 0.55
 DOT_SIZE = 28
@@ -77,7 +75,6 @@ def plot_dataset(
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Patch
     from matplotlib.transforms import blended_transform_factory
 
     sub = df[df[COL_DATASET].astype(str) == dataset_stem]
@@ -96,77 +93,71 @@ def plot_dataset(
 
     trans_xdata_yaxes = blended_transform_factory(ax.transData, ax.transAxes)
 
-    sides = [
-        ("our", is_our_source, COLOR_OUR, -strip_offset),
-        ("propermab", is_propermab_source, COLOR_PM, +strip_offset),
-    ]
-
     pooled_y: list[float] = []
 
     for ti, tgt in enumerate(targets):
-        for _side_label, side_fn, color, dx in sides:
-            xc = ti + dx
-            rows = sub[
-                sub[COL_SOURCE].astype(str).map(side_fn)
-                & (sub[COL_TARGET].astype(str) == tgt)
-            ]
-            if rows.empty:
+        xc = float(ti)
+        rows = sub[
+            sub[COL_SOURCE].astype(str).map(is_our_source)
+            & (sub[COL_TARGET].astype(str) == tgt)
+        ]
+        if rows.empty:
+            continue
+
+        sources = rows[COL_SOURCE].unique()
+        all_ys: list[float] = []
+        mean_spearmans: list[float] = []
+        for src in sources:
+            src_rows = rows[rows[COL_SOURCE] == src]
+            best = _best_row(src_rows, no_gpr=no_gpr)
+            if best is None:
                 continue
+            ys = _fold_ys(best, fc)
+            all_ys.extend(ys)
+            try:
+                v = float(best[COL_SPEAR])
+                if math.isfinite(v):
+                    mean_spearmans.append(v)
+            except (TypeError, ValueError):
+                pass
 
-            sources = rows[COL_SOURCE].unique()
-            all_ys: list[float] = []
-            mean_spearmans: list[float] = []
-            for src in sources:
-                src_rows = rows[rows[COL_SOURCE] == src]
-                best = _best_row(src_rows, no_gpr=no_gpr)
-                if best is None:
-                    continue
-                ys = _fold_ys(best, fc)
-                all_ys.extend(ys)
-                try:
-                    v = float(best[COL_SPEAR])
-                    if math.isfinite(v):
-                        mean_spearmans.append(v)
-                except (TypeError, ValueError):
-                    pass
+        if not all_ys:
+            continue
 
-            if not all_ys:
-                continue
+        pooled_y.extend(all_ys)
+        xs = xc + rng.uniform(-jitter, jitter, size=len(all_ys))
+        ax.scatter(
+            xs, all_ys, c=COLOR_OUR, s=DOT_SIZE, alpha=ALPHA_DOT, zorder=3, edgecolors="none"
+        )
+        ax.boxplot(
+            all_ys,
+            positions=[xc],
+            widths=strip_offset * 0.9,
+            patch_artist=True,
+            manage_ticks=False,
+            zorder=4,
+            notch=False,
+            showcaps=True,
+            showfliers=False,
+            medianprops=dict(color="white", linewidth=1.8),
+            boxprops=dict(facecolor=COLOR_OUR, alpha=ALPHA_BOX, linewidth=0.8),
+            whiskerprops=dict(color=COLOR_OUR, linewidth=0.9, linestyle="--"),
+            capprops=dict(color=COLOR_OUR, linewidth=1.0),
+        )
 
-            pooled_y.extend(all_ys)
-            xs = xc + rng.uniform(-jitter, jitter, size=len(all_ys))
-            ax.scatter(
-                xs, all_ys, c=color, s=DOT_SIZE, alpha=ALPHA_DOT, zorder=3, edgecolors="none"
+        if mean_spearmans:
+            mean_val = float(np.mean(mean_spearmans))
+            ax.text(
+                xc,
+                1.028,
+                f"{mean_val:.2f}",
+                ha="center",
+                va="bottom",
+                fontsize=7.5,
+                color=COLOR_OUR,
+                transform=trans_xdata_yaxes,
+                clip_on=False,
             )
-            ax.boxplot(
-                all_ys,
-                positions=[xc],
-                widths=strip_offset * 0.9,
-                patch_artist=True,
-                manage_ticks=False,
-                zorder=4,
-                notch=False,
-                showcaps=True,
-                showfliers=False,
-                medianprops=dict(color="white", linewidth=1.8),
-                boxprops=dict(facecolor=color, alpha=ALPHA_BOX, linewidth=0.8),
-                whiskerprops=dict(color=color, linewidth=0.9, linestyle="--"),
-                capprops=dict(color=color, linewidth=1.0),
-            )
-
-            if mean_spearmans:
-                mean_val = float(np.mean(mean_spearmans))
-                ax.text(
-                    xc,
-                    1.028,
-                    f"{mean_val:.2f}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=7.5,
-                    color=color,
-                    transform=trans_xdata_yaxes,
-                    clip_on=False,
-                )
 
     ax.axhline(0, color="0.80", lw=0.8, zorder=0)
     ax.grid(axis="y", alpha=0.3, lw=0.6)
@@ -197,17 +188,6 @@ def plot_dataset(
         y=1.02,
         va="top",
     )
-    fig.legend(
-        handles=[
-            Patch(facecolor=COLOR_OUR, label="our"),
-            Patch(facecolor=COLOR_PM, label="propermab"),
-        ],
-        loc="upper right",
-        fontsize=8,
-        framealpha=0.85,
-        borderpad=0.5,
-    )
-
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
@@ -224,7 +204,7 @@ def run_plot_fold_spearmans(
     height: float = 4.2,
     strip_offset: float = 0.18,
     jitter: float = 0.06,
-    seed: int = 0,
+    seed: int = 42,
 ) -> int:
     paths = expand_paths([str(x) for x in inputs])
     if not paths:
@@ -296,7 +276,7 @@ def main() -> None:
     p.add_argument("--height", type=float, default=4.2)
     p.add_argument("--strip-offset", type=float, default=0.18)
     p.add_argument("--jitter", type=float, default=0.06)
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
 
     raise SystemExit(

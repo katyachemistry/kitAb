@@ -6,13 +6,36 @@
 
 set -euo pipefail
 
-ABB3_CHECKPOINT="${ABB3_CHECKPOINT:-/home/kb/abodybuilder3/output/plddt-loss/best_second_stage.ckpt}"
-ABB3_DEVICE="${ABB3_DEVICE:-cuda:1}"
+# tmux keeps env vars from when the tmux *server* was first started. Older FASTAb
+# setups exported PYTHON="conda run python", which breaks conda run even in new sessions.
+unset PYTHON ABB3_PYTHON 2>/dev/null || true
+CONDA_RUN_BIN="${CONDA_EXE:-$(type -P conda || true)}"
+CONDA_RUN_BIN="${CONDA_RUN_BIN:-conda}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [[ -f "$REPO_ROOT/fastab.local.env" ]]; then
+    # shellcheck disable=SC1091
+    source "$REPO_ROOT/fastab.local.env"
+fi
+FASTAB_ENV_ABB2="${FASTAB_ENV_ABB2:-fastab-abb2}"
+FASTAB_ENV_ABB3="${FASTAB_ENV_ABB3:-fastab-abb3}"
+ABB3_PYTHON_BIN="$("$CONDA_RUN_BIN" run -n "$FASTAB_ENV_ABB3" python -c 'import sys; print(sys.executable)')"
+ABB2_PYTHON_BIN="$("$CONDA_RUN_BIN" run -n "$FASTAB_ENV_ABB2" python -c 'import sys; print(sys.executable)')"
+ABB2_ENV_BIN_DIR="$(dirname -- "$ABB2_PYTHON_BIN")"
+export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+
+FASTAB_ENV_ABB2="${FASTAB_ENV_ABB2:-fastab-abb2}"
+FASTAB_ENV_ABB3="${FASTAB_ENV_ABB3:-fastab-abb3}"
+ABB3_DIR="${ABB3_DIR:-$REPO_ROOT/vendor/abodybuilder3}"
+
+ABB3_CHECKPOINT="${ABB3_CHECKPOINT:-$ABB3_DIR/output/plddt-loss/best_second_stage.ckpt}"
+ABB3_DEVICE="${ABB3_DEVICE:-cuda:0}"
 ABB3_BATCH_SIZE="${ABB3_BATCH_SIZE:-4}"
 ABB2_DEVICE="${ABB2_DEVICE:-$ABB3_DEVICE}"
 ABB2_BATCH_SIZE="${ABB2_BATCH_SIZE:-$ABB3_BATCH_SIZE}"
-PYTHON="${PYTHON:-python3}"
-ABB2_PYTHON="${ABB2_PYTHON:-conda run -n abb2 python3}"
+ABB3_PYTHON_CMD=("$ABB3_PYTHON_BIN")
+ABB2_PYTHON_CMD=("$ABB2_PYTHON_BIN")
 
 BACKEND=abb3
 HAVE_ABB3=0
@@ -20,6 +43,7 @@ HAVE_ABB2=0
 RUNS=1
 SKIP_EXISTING=0
 DATA_DIR_CLI=""
+CSV_FILES=()
 OUT_DIR_CLI=""
 RENUMBER=1
 MINIMIZE=1
@@ -28,6 +52,7 @@ RENUMBER_ONLY=0
 STRUCTURES_DIRS=()
 ALLOW_PARTIAL_DOMAIN=0
 MINIMIZE_JOBS=8
+IN_PLACE=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -59,6 +84,14 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             DATA_DIR_CLI="$2"
+            shift 2
+            ;;
+        --csv)
+            if [[ $# -lt 2 ]]; then
+                echo "missing value for --csv" >&2
+                exit 1
+            fi
+            CSV_FILES+=("$2")
             shift 2
             ;;
         --output-root)
@@ -105,6 +138,10 @@ while [[ $# -gt 0 ]]; do
             MINIMIZE_JOBS="$2"
             shift 2
             ;;
+        --in-place)
+            IN_PLACE=1
+            shift
+            ;;
         -h|--help)
             sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
@@ -146,7 +183,6 @@ if [[ "$RENUMBER_ONLY" -eq 1 && ${#STRUCTURES_DIRS[@]} -eq 0 ]]; then
     exit 1
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STRUCTURE_DIR="$SCRIPT_DIR/structure"
 
 run_renumber() {
@@ -178,7 +214,8 @@ run_renumber() {
         extra+=(--allow-partial-domain)
     fi
 
-    $ABB2_PYTHON "$STRUCTURE_DIR/postprocess_structures.py" renumber "$input_dir" "${extra[@]}"
+    PATH="$ABB2_ENV_BIN_DIR:${PATH}" \
+        "${ABB2_PYTHON_CMD[@]}" "$STRUCTURE_DIR/postprocess_structures.py" renumber "$input_dir" "${extra[@]}"
 }
 
 run_minimization() {
@@ -215,7 +252,7 @@ run_minimization() {
         skip_args=(--skip-existing)
     fi
 
-    $ABB2_PYTHON "$STRUCTURE_DIR/postprocess_structures.py" minimize \
+    "${ABB3_PYTHON_CMD[@]}" "$STRUCTURE_DIR/postprocess_structures.py" minimize \
         --input-dir  "$input_dir" \
         --output-dir "$output_dir" \
         --jobs       "$MINIMIZE_JOBS" \
@@ -224,7 +261,6 @@ run_minimization() {
 
 run_postprocess_predict_dirs() {
     local backend_tag="$1"
-    local minimize_skip_flag="${2:-}"
 
     for csv in "${csv_files[@]}"; do
         local stem predict_dir
@@ -237,12 +273,14 @@ run_postprocess_predict_dirs() {
                 continue
             fi
 
-            if [[ "$RENUMBER" -eq 1 ]]; then
-                run_renumber "$predict_dir" 1 || exit 1
+            if [[ "$MINIMIZE" -eq 1 ]]; then
+                # ABB3 raw outputs can contain locally strained peptide bonds that
+                # OpenMM fixes cleanly before IMGT insertion-code renumbering.
+                run_minimization "$predict_dir" "" 1
             fi
 
-            if [[ "$MINIMIZE" -eq 1 ]]; then
-                run_minimization "$predict_dir" "$minimize_skip_flag" 1
+            if [[ "$RENUMBER" -eq 1 ]]; then
+                run_renumber "$predict_dir" 1 || exit 1
             fi
         done
     done
@@ -251,7 +289,7 @@ run_postprocess_predict_dirs() {
 if [[ "$RENUMBER_ONLY" -eq 1 ]]; then
     for dir in "${STRUCTURES_DIRS[@]}"; do
         abs_dir="$(cd "$dir" && pwd)"
-        run_renumber "$abs_dir" || exit 1
+        run_renumber "$abs_dir" "$IN_PLACE" || exit 1
     done
     echo ""
     echo "done"
@@ -266,12 +304,17 @@ if [[ "$MINIMIZATION_ONLY" -eq 1 ]]; then
 
     for dir in "${STRUCTURES_DIRS[@]}"; do
         abs_dir="$(cd "$dir" && pwd)"
-        run_minimization "$abs_dir" "$SKIP_FLAG"
+        run_minimization "$abs_dir" "$SKIP_FLAG" "$IN_PLACE"
     done
 
     echo ""
     echo "done"
     exit 0
+fi
+
+if [[ -n "$DATA_DIR_CLI" && ${#CSV_FILES[@]} -gt 0 ]]; then
+    echo "Use either --data-dir or --csv, not both" >&2
+    exit 1
 fi
 
 if [[ -n "$DATA_DIR_CLI" ]]; then
@@ -280,6 +323,8 @@ if [[ -n "$DATA_DIR_CLI" ]]; then
         exit 1
     fi
     DATA_DIR="$(cd "$DATA_DIR_CLI" && pwd)"
+elif [[ ${#CSV_FILES[@]} -gt 0 ]]; then
+    DATA_DIR=""
 else
     DATA_DIR="$SCRIPT_DIR/data"
 fi
@@ -298,11 +343,18 @@ if [[ "$SKIP_EXISTING" -eq 1 ]]; then
 fi
 
 shopt -s nullglob
-csv_files=("$DATA_DIR"/*.csv)
-
-if [[ ${#csv_files[@]} -eq 0 ]]; then
-    echo "No CSV files found in $DATA_DIR" >&2
+csv_files=()
+if [[ -n "$DATA_DIR" ]]; then
+    csv_files=("$DATA_DIR"/*.csv)
+    if [[ ${#csv_files[@]} -eq 0 ]]; then
+        echo "No CSV files found in $DATA_DIR" >&2
+        exit 1
+    fi
+elif [[ ${#CSV_FILES[@]} -eq 0 ]]; then
+    echo "No CSV files provided (use --data-dir or one or more --csv paths)" >&2
     exit 1
+else
+    csv_files=("${CSV_FILES[@]}")
 fi
 
 if [[ "$BACKEND" == "abb3" ]]; then
@@ -311,8 +363,17 @@ if [[ "$BACKEND" == "abb3" ]]; then
         exit 1
     fi
 
-    "$PYTHON" "$STRUCTURE_DIR/run_abb_batch_from_csv.py" abb3 \
-        --data-dir "$DATA_DIR" \
+    batch_csv_args=()
+    if [[ ${#CSV_FILES[@]} -gt 0 ]]; then
+        for csv_path in "${CSV_FILES[@]}"; do
+            batch_csv_args+=(--csv "$csv_path")
+        done
+    fi
+
+    echo "ABB3 Python: ${ABB3_PYTHON_CMD[*]}"
+    "${ABB3_PYTHON_CMD[@]}" "$STRUCTURE_DIR/run_abb_batch_from_csv.py" abb3 \
+        ${DATA_DIR:+--data-dir "$DATA_DIR"} \
+        "${batch_csv_args[@]}" \
         --output-root "$OUT_DIR" \
         --runs "$RUNS" \
         --checkpoint "$ABB3_CHECKPOINT" \
@@ -321,14 +382,20 @@ if [[ "$BACKEND" == "abb3" ]]; then
         "${SKIP_ARGS[@]}"
 
     if [[ "$RENUMBER" -eq 1 || "$MINIMIZE" -eq 1 ]]; then
-        minimize_skip_flag=""
-        [[ "$SKIP_EXISTING" -eq 1 ]] && minimize_skip_flag="--skip-existing"
-        run_postprocess_predict_dirs abb3 "$minimize_skip_flag"
+        run_postprocess_predict_dirs abb3
     fi
 
 else
-    "$PYTHON" "$STRUCTURE_DIR/run_abb_batch_from_csv.py" abb2 \
-        --data-dir "$DATA_DIR" \
+    batch_csv_args=()
+    if [[ ${#CSV_FILES[@]} -gt 0 ]]; then
+        for csv_path in "${CSV_FILES[@]}"; do
+            batch_csv_args+=(--csv "$csv_path")
+        done
+    fi
+
+    "${ABB2_PYTHON_CMD[@]}" "$STRUCTURE_DIR/run_abb_batch_from_csv.py" abb2 \
+        ${DATA_DIR:+--data-dir "$DATA_DIR"} \
+        "${batch_csv_args[@]}" \
         --output-root "$OUT_DIR" \
         --runs "$RUNS" \
         --device "$ABB2_DEVICE" \

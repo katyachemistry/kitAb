@@ -10,8 +10,6 @@ channels:
   - conda-forge
   - bioconda
 
-channel_priority: strict
-
 dependencies:
   - python=3.14.2
   - openmm=8.4.0

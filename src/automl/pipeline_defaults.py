@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-DEFAULT_RANDOM_STATES: tuple[int, ...] = (42, 100, 0)
-DEFAULT_RANDOM_STATE: int = DEFAULT_RANDOM_STATES[0]
+# Single seed for fixed splits, selectors, analysis permutations, descriptors, etc.
+DEFAULT_RANDOM_STATE: int = 42
+
+# Three seeds for shuffled CV only (see prepare_run_config ``random_seeds``).
+RANDOM_CV_SEEDS: tuple[int, ...] = (42, 43, 44)
 
 DEFAULT_FEATURES_FRACS: tuple[float, ...] = (0.15, 0.10, 0.08, 0.06, 0.04, 0.02)
 DEFAULT_FEATURES_FRAC: float = DEFAULT_FEATURES_FRACS[0]

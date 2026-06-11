@@ -14,6 +14,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+_SRC_DIR = Path(__file__).resolve().parents[1]
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
 from automl.pipeline_defaults import DEFAULT_FEATURES_FRAC
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]

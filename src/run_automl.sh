@@ -15,7 +15,7 @@ Usage:
 
 Legacy options: --name-col, --n-splits, --random-state, --features-frac, --jobs-file,
   --parallel-jobs, --py, --selector-name (required), --model-to-use, --eval-models,
-  --result-root, --no-preprocessing-skip, --no-clean-folds
+  --result-root, --no-preprocessing-skip, --clean-folds, --no-clean-folds
   -h, --help
 EOF
 }
@@ -78,6 +78,14 @@ for part in shlex.split(sys.argv[1]):
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
+if [[ -f "${REPO_ROOT}/fastab.local.env" ]]; then
+  # shellcheck disable=SC1091
+  source "${REPO_ROOT}/fastab.local.env"
+fi
+
+FASTAB_ENV="${FASTAB_ENV:-fastab}"
+DEFAULT_PY="conda run -n ${FASTAB_ENV} python"
+
 if [[ "${1:-}" == "--config" ]]; then
   shift
   if [[ $# -lt 1 ]]; then
@@ -87,7 +95,7 @@ if [[ "${1:-}" == "--config" ]]; then
   CONFIG_FILE="$1"
   shift
   _stage "Config mode: ${CONFIG_FILE}"
-  PY="${PY:-conda run -n developability python}"
+  PY="${PY:-$DEFAULT_PY}"
   run_py_cfg() {
     # shellcheck disable=SC2086
     ${PY} "$@"
@@ -108,7 +116,7 @@ MODEL_TO_USE="elasticnet"
 EVAL_MODELS="all"
 RESULT_ROOT=""
 NO_PREPROCESSING_SKIP="0"
-NO_CLEAN_FOLDS="0"
+NO_CLEAN_FOLDS="1"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -168,6 +176,10 @@ while [[ $# -gt 0 ]]; do
       NO_CLEAN_FOLDS="1"
       shift
       ;;
+    --clean-folds)
+      NO_CLEAN_FOLDS="0"
+      shift
+      ;;
     --)
       shift
       break
@@ -182,7 +194,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-PY="${PY:-conda run -n developability python}"
+PY="${PY:-$DEFAULT_PY}"
 
 if [[ $# -lt 4 ]]; then
   usage
@@ -305,7 +317,7 @@ _stage "Phase 2 complete — result JSON under RESULT_ROOT=${RESULT_ROOT}"
 _stage "Summary — JOBS_FILE=${JOBS_FILE} ($(wc -l < "${JOBS_FILE}") lines); fold data under RUN_DIR=${RUN_DIR}"
 
 if [[ "${NO_CLEAN_FOLDS}" == "0" ]]; then
-  _stage "(3/3) Phase 3 — removing fold *.parquet under RUN_DIR (pass --no-clean-folds to keep)"
+  _stage "(3/3) Phase 3 — removing fold *.parquet under RUN_DIR (--no-clean-folds keeps them)"
   _n_pq=$(find "${RUN_DIR}" -name "*.parquet" -type f 2>/dev/null | wc -l)
   if [[ "${_n_pq}" -gt 0 ]]; then
     find "${RUN_DIR}" -name "*.parquet" -type f -delete 2>/dev/null || true
@@ -314,7 +326,7 @@ if [[ "${NO_CLEAN_FOLDS}" == "0" ]]; then
     _stage "Phase 3: no *.parquet files to remove under RUN_DIR"
   fi
 else
-  _stage "(3/3) Phase 3 — skipped (--no-clean-folds): keeping fold parquets under RUN_DIR=${RUN_DIR}"
+  _stage "(3/3) Phase 3 — skipped (default): keeping fold parquets under RUN_DIR=${RUN_DIR}"
 fi
 
 _stage "Done."

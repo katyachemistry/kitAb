@@ -43,7 +43,7 @@ from utils.chemistry import (
     EXPOSURE_REL_ASA_THRESHOLD,
     GLN_ASN_RESIDUES,
     NONPOLAR_RESIDUES,
-    KYTE_DOOLITTLE,
+    residue_hydrophobicity,
     get_ff19sb_residue_region_charges,
 )
 from developability.structure_context import ResKey4, StructureContext
@@ -262,10 +262,10 @@ def main():
             """Relative side-chain SASA fraction [0, 1] from parse_sasa."""
             return float(getattr(ctx.sasa_residue[k], "total_side_rel", 0.0)) or 0.0
 
-        kyte_doolittle_sum_all = (
+        hyd_score_sum_all = (
             None
             if sasa_failed
-            else sum(KYTE_DOOLITTLE.get(k[0], 0.0) for k in ctx.sasa_residue.keys())
+            else sum(residue_hydrophobicity(k[0]) for k in ctx.sasa_residue.keys())
         )
 
         n_cdr_vicinity_in_sasa = (
@@ -278,7 +278,7 @@ def main():
             if sasa_failed
             else (
                 sum(
-                    KYTE_DOOLITTLE.get(k[0], 0.0) * _total_side_rel_weight(k)
+                    residue_hydrophobicity(k[0]) * _total_side_rel_weight(k)
                     for k in ctx.sasa_residue.keys()
                     if k in cdr_vicinity_keys
                 )
@@ -306,16 +306,16 @@ def main():
         )
         number_of_salt_bridges = len(salt_bridges)
 
-        avg_salt_cdr_vicinity_over_cdr_vicinity = calculate_salt_bridge_density_average(
-            args.pdb_file,
-            args.sasa_file,
-            args.pka_file,
-            pH=args.pH,
-            residues_for_density=cdr_vicinity_keys,
-            residues_for_average=cdr_vicinity_keys,
-            salt_bridges=salt_bridges,
-            allowed_chains=allowed_chains,
-        )
+        # avg_salt_cdr_vicinity_over_cdr_vicinity = calculate_salt_bridge_density_average(
+        #     args.pdb_file,
+        #     args.sasa_file,
+        #     args.pka_file,
+        #     pH=args.pH,
+        #     residues_for_density=cdr_vicinity_keys,
+        #     residues_for_average=cdr_vicinity_keys,
+        #     salt_bridges=salt_bridges,
+        #     allowed_chains=allowed_chains,
+        # )
 
         avg_hbond_energy = calculate_hbond_energy_density_dssp_backbone_only_average(
             args.pdb_file,
@@ -469,6 +469,7 @@ def main():
             pka_output_data,
             args.pH,
             surface_exposed_threshold=EXPOSURE_REL_ASA_THRESHOLD,
+            random_seed=42,
         )
 
         weights_raw = compute_hbond_density_raw(
@@ -491,16 +492,16 @@ def main():
         for ph in NET_CHARGE_PHS:
             net_charge_by_pH[ph] = net_charge_from_pka(pka_output_data, ph)  # PropKa-based
             
-        weighted_scm_score_by_pH = {}
-        for ph in NET_CHARGE_PHS:
-            weighted_scm_score_by_pH[ph] = scm_score_from_pka(
-                args.pdb_file,
-                args.sasa_file,
-                pka_output_data,
-                ph,
-                d_cutoff=10.0,
-                allowed_chains=allowed_chains,
-            )
+        # weighted_scm_score_by_pH = {}
+        # for ph in NET_CHARGE_PHS:
+        #     weighted_scm_score_by_pH[ph] = scm_score_from_pka(
+        #         args.pdb_file,
+        #         args.sasa_file,
+        #         pka_output_data,
+        #         ph,
+        #         d_cutoff=10.0,
+        #         allowed_chains=allowed_chains,
+        #     )
         scm_by_atoms = scm_score_by_atoms(
             args.pdb_file, d_cutoff=10.0, allowed_chains=allowed_chains
         ) or {}
@@ -516,24 +517,23 @@ def main():
         residue_keys_all = set(ctx.residue_keys)
         _sasa = ctx.sasa_residue
 
-        def _ff19sb_total_charge_for_residue(key4: ResKey4) -> float:
-            backbone_q, sidechain_q = get_ff19sb_residue_region_charges(
-                key4[0],
-                residue_atom_names=residue_atom_names_by_key.get(key4),
-            )
-            return float(backbone_q + sidechain_q)
-
         # ff19SB charges follow PDB protonation (HID/HIE vs HIP); may differ from net_charge_by_pH.
-        net_charge_ff19sb = sum(_ff19sb_total_charge_for_residue(k) for k in residue_keys_all)
+        # def _ff19sb_total_charge_for_residue(key4: ResKey4) -> float:
+        #     backbone_q, sidechain_q = get_ff19sb_residue_region_charges(
+        #         key4[0],
+        #         residue_atom_names=residue_atom_names_by_key.get(key4),
+        #     )
+        #     return float(backbone_q + sidechain_q)
+        # net_charge_ff19sb = sum(_ff19sb_total_charge_for_residue(k) for k in residue_keys_all)
 
-        hyd_asa_total = sum(
-            float(getattr(entry, "non_polar_abs", 0.0)) or 0.0
-            for entry in _sasa.values()
-        )
-        hph_asa_total = sum(
-            float(getattr(entry, "all_polar_abs", 0.0)) or 0.0
-            for entry in _sasa.values()
-        )
+        # hyd_asa_total = sum(
+        #     float(getattr(entry, "non_polar_abs", 0.0)) or 0.0
+        #     for entry in _sasa.values()
+        # )
+        # hph_asa_total = sum(
+        #     float(getattr(entry, "all_polar_abs", 0.0)) or 0.0
+        #     for entry in _sasa.values()
+        # )
 
         def _name_side_abs_sum(residue_keys: Set[ResKey4], res_set: Set[str]) -> float:
             """Sum side-chain abs SASA for residues with name in res_set."""
@@ -609,33 +609,31 @@ def main():
                     "neg_patch_cdr": neg_patch_area_cdr,
                     "nonpolar_patch_cdr": hyd_patch_area_cdr,
                     **total_side_abs_sums,
+                    # "freesasa_nonpolar_asa_total": hyd_asa_total,
+                    # "freesasa_polar_asa_total": hph_asa_total,
                     "aro_exposure_cdr": sum_aromatic_weighted_rel_side_asa_cdr_vicinity,
                     "nonpolar_exposure_cdr": sum_hydrophobic_weighted_rel_side_asa_cdr_vicinity,
                     "neg_exposure_cdr": sum_negative_weighted_rel_side_asa_cdr_vicinity,
                     "pos_exposure_cdr": sum_positive_weighted_rel_side_asa_cdr_vicinity,
-                    "exposure_weighted_nonpolar_score_cdr": avg_kd_times_total_side_rel_cdr_vicinity_over_cdr_vicinity,
-                    "exposure_weighted_salt_bridge_score_cdr": avg_salt_cdr_vicinity_over_cdr_vicinity,
+                    "exposure_weighted_hyd_score_cdr": avg_kd_times_total_side_rel_cdr_vicinity_over_cdr_vicinity,
+                    # "exposure_weighted_salt_bridge_score_cdr": avg_salt_cdr_vicinity_over_cdr_vicinity,
                     "hbond_density_cdr": avg_hbond_cdr_vicinity,
-                    "weighted_scm": weighted_scm_score_by_pH,
+                    # "weighted_scm": weighted_scm_score_by_pH,
                     "scm_neg_ff19sb": scm_neg_ff19sb,
                     "scm_pos_ff19sb": scm_pos_ff19sb,
                     **{k: _scalar_or_dict_sum(v) for k, v in sap_scores.items()},
                 },
-                "core": {
+                "general": {
                     "hbond_energy_density": avg_hbond_energy_dssp_weighted,
                     "inter_chain_buried_sasa": inter_chain_buried_sasa,
-                },
-                "general": {
                     "dipole_moment_ff19sb": dipole_moment_magnitude,
-                    "net_charge_ff19sb": net_charge_ff19sb,
+                    # "net_charge_ff19sb": net_charge_ff19sb,
                     "net_charge_by_pH": net_charge_by_pH,
                     "protein_pi": protein_pi,
                     "cdr3_length": cdr3_length,
                     "charge_symmetry": asymmetry_score,
-                    "hyd_score": kyte_doolittle_sum_all,
+                    "hyd_score": hyd_score_sum_all,
                     "number_of_salt_bridges": number_of_salt_bridges,
-                    "nonpolar_asa_total": hyd_asa_total,
-                    "polar_asa_total": hph_asa_total,
                     "fraction_gly_in_cdr": fraction_gly_in_cdr,
                     "fraction_pro_in_cdr": fraction_pro_in_cdr,
                     "fraction_aro_in_cdr": fraction_aromatic_in_cdr,
