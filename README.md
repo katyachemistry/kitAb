@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="kitAb_logo.png" alt="kitAb logo" width="300">
+  <img src="kitAb_logo.png" alt="kitAb logo" width="160">
 </p>
 
 # kitAb
