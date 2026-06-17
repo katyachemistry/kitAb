@@ -49,6 +49,9 @@ NAMES_FROM_CSV=""
 SANITY_CHECK_ABB2=false
 REMOVE_HELPER_OUTPUTS=false
 CLEAN_EXTERNAL_OUTPUTS=false
+SKIP_EXISTING=false
+SKIP_FAILED=false
+BATCH_SIZE=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -99,6 +102,22 @@ while [[ $# -gt 0 ]]; do
         --clean-external-outputs)
             CLEAN_EXTERNAL_OUTPUTS=true
             shift
+            ;;
+        --skip-existing)
+            SKIP_EXISTING=true
+            shift
+            ;;
+        --skip-failed)
+            SKIP_FAILED=true
+            shift
+            ;;
+        --batch-size)
+            if [[ $# -lt 2 || ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+                echo "Error: --batch-size requires a positive integer." >&2
+                exit 1
+            fi
+            BATCH_SIZE="$2"
+            shift 2
             ;;
         [0-9]*)
             NUM_JOBS="$1"
@@ -177,9 +196,11 @@ if [[ ${#STRUCTURES_DIRS[@]} -eq 0 ]]; then
     echo "  --output-dir DIR: write per-dataset outputs under DIR/<basename>/ instead of ./developability_descriptors/<basename>/." >&2
     echo "  --parent-dir: run on every immediate subdirectory of DIR that contains at least one .pdb file." >&2
     echo "  --sanity_check_abb2: skip PDBs whose ATOM B-factors are all 0.00; log skipped names under the output dir." >&2
-    echo "  --remove_helper_outputs: delete dssp/propka/freesasa files after a structure's descriptor JSON is written." >&2
-    echo "  --clean-external-outputs: after all descriptors for a dataset, remove dssp/, propka/, and sasa/ subdirs." >&2
-    exit 1
+  echo "  --remove_helper_outputs: delete dssp/propka/freesasa files after a structure's descriptor JSON is written." >&2
+  echo "  --clean-external-outputs: after all descriptors for a dataset, remove dssp/, propka/, and sasa/ subdirs." >&2
+  echo "  --skip-existing: skip any PDB whose descriptor JSON already exists (non-empty) in the results/ dir." >&2
+  echo "  --skip-failed: skip structures logged as failed in pipeline.log (DSSP/SASA/PROPKA/DESCRIPTORS)." >&2
+  exit 1
 fi
 
 declare -A _seen_structure_dirs=()
@@ -224,6 +245,7 @@ export PH_VALUE
 export SANITY_CHECK_ABB2
 export REMOVE_HELPER_OUTPUTS
 export CLEAN_EXTERNAL_OUTPUTS
+export SKIP_EXISTING
 
 _remove_helper_outputs_for_stem() {
     local basename="$1"
@@ -232,6 +254,8 @@ _remove_helper_outputs_for_stem() {
         "${DSSP_DIR}/${basename}.dssp" \
         "${PKA_DIR}/${basename}_full.pka" \
         "${PKA_DIR}/${basename}_full.log" \
+        "${PKA_DIR}/tmp_structures/${basename}_full.pdb" \
+        "${PKA_DIR}/tmp_structures/${basename}_full.propka_map.json" \
         "${SASA_DIR}/${basename}_full.sasa" \
         "${SASA_DIR}/${basename}_H_full.sasa" \
         "${SASA_DIR}/${basename}_L_full.sasa"
@@ -415,17 +439,30 @@ _is_pipeline_pdb_stem() {
 
 pipeline_pdb_paths() {
     local dir="$1"
-    # Top-level antibody PDBs only; skip hidden staging dirs and pipeline artifacts.
-    find "$dir" -maxdepth 1 -name "*.pdb" -type f ! -path '*/.*/*' ! -name "*_H.pdb" ! -name "*_L.pdb" -print0 | while IFS= read -r -d '' pdb; do
-        local stem="${pdb##*/}"
-        stem="${stem%.pdb}"
-        if _is_pipeline_pdb_stem "$stem"; then
-            if [[ "$SANITY_CHECK_ABB2" == true ]] && _is_abb2_sanity_skipped_stem "$stem"; then
+    if [[ ${#ALLOWED_NAMES[@]} -gt 0 ]]; then
+        # Fast-path: allowed names are known — stat each file directly, no directory scan.
+        local name pdb
+        for name in "${ALLOWED_NAMES[@]}"; do
+            pdb="$dir/${name}.pdb"
+            [[ -f "$pdb" ]] || continue
+            if [[ "$SANITY_CHECK_ABB2" == true ]] && _is_abb2_sanity_skipped_stem "$name"; then
                 continue
             fi
             printf '%s\0' "$pdb"
-        fi
-    done
+        done
+    else
+        # Full scan: enumerate every top-level pipeline PDB.
+        find "$dir" -maxdepth 1 -name "*.pdb" -type f ! -path '*/.*/*' ! -name "*_H.pdb" ! -name "*_L.pdb" -print0 | while IFS= read -r -d '' pdb; do
+            local stem="${pdb##*/}"
+            stem="${stem%.pdb}"
+            if _is_pipeline_pdb_stem "$stem"; then
+                if [[ "$SANITY_CHECK_ABB2" == true ]] && _is_abb2_sanity_skipped_stem "$stem"; then
+                    continue
+                fi
+                printf '%s\0' "$pdb"
+            fi
+        done
+    fi
 }
 
 count_pipeline_pdbs() {
@@ -434,6 +471,38 @@ count_pipeline_pdbs() {
         n=$((n + 1))
     done < <(pipeline_pdb_paths "$1")
     echo "$n"
+}
+
+declare -A PIPELINE_FAILED_STEMS=()
+
+_load_pipeline_failed_stems() {
+    local log_file="$1"
+    PIPELINE_FAILED_STEMS=()
+    [[ -f "$log_file" ]] || return 0
+    while IFS= read -r stem; do
+        [[ -n "$stem" ]] && PIPELINE_FAILED_STEMS["$stem"]=1
+    done < <("${PY_ARR[@]}" -c '
+import re
+import sys
+from pathlib import Path
+
+p = Path(sys.argv[1])
+if not p.is_file():
+    raise SystemExit(0)
+pat = re.compile(r"\] (?:DSSP|SASA|PROPKA|DESCRIPTORS) ✗ ([^: ]+)")
+seen = set()
+with p.open(errors="replace") as handle:
+    for line in handle:
+        m = pat.search(line)
+        if m:
+            seen.add(m.group(1))
+for s in sorted(seen):
+    print(s)
+' "$log_file")
+}
+
+_is_pipeline_failed_stem() {
+    [[ -n "${PIPELINE_FAILED_STEMS[$1]:-}" ]]
 }
 
 USE_GNU_PARALLEL=false
@@ -455,6 +524,14 @@ for STRUCTURES_DIR in "${STRUCTURES_DIRS[@]}"; do
     DEV_JSON_OUTPUT_DIR="${DATASET_DESCRIPTOR_DIR}/results"
     mkdir -p "$DSSP_OUTPUT_DIR" "$PROPKA_OUTPUT_DIR" "$SASA_OUTPUT_DIR" "$DEV_JSON_OUTPUT_DIR"
 
+    PIPELINE_LOG="${DATASET_DESCRIPTOR_DIR}/pipeline.log"
+    export PIPELINE_LOG
+    echo "[$(date -Iseconds)] Pipeline started for ${BASE_NAME}" >> "$PIPELINE_LOG"
+
+    if [[ "$SKIP_FAILED" == true ]]; then
+        _load_pipeline_failed_stems "$PIPELINE_LOG"
+    fi
+
     if [[ "$SANITY_CHECK_ABB2" == true ]]; then
         ABB2_SANITY_SKIP_LOG="${DATASET_DESCRIPTOR_DIR}/abb2_sanity_skip.log"
         _build_abb2_sanity_skip_set "$STRUCTURES_DIR" "$ABB2_SANITY_SKIP_LOG"
@@ -465,9 +542,13 @@ for STRUCTURES_DIR in "${STRUCTURES_DIRS[@]}"; do
         unset ABB2_SANITY_SKIP_LOG
     fi
 
-    N_PDB=$(count_pipeline_pdbs "$STRUCTURES_DIR")
-    TOTAL_STRUCTURES=$((TOTAL_STRUCTURES + N_PDB))
-
+    # ----------------------------------------------------------------
+    # _run_pipeline_stages: runs the 4 pipeline stages (DSSP, FreeSASA,
+    # PropKa, Developability) for the ALLOWED_NAMES / ALLOWED_NAMES_CSV
+    # currently set in the global scope.  Defined per STRUCTURES_DIR
+    # iteration so all per-dataset globals are in scope at call time.
+    # ----------------------------------------------------------------
+    _run_pipeline_stages() {
     for MODE in "${PIPELINE_ORDER[@]}"; do
     case "$MODE" in
         dssp)
@@ -485,23 +566,27 @@ for STRUCTURES_DIR in "${STRUCTURES_DIRS[@]}"; do
                         echo "CRYST1    1.000    1.000    1.000  90.00  90.00  90.00 P 1           1          "
                         awk '!/^REMARK/ && !/^CRYST1/' "$pdb_file"
                     } > "$temp_pdb"
-                    if ! _fastab_run "$DSSP_BIN" "$temp_pdb" "$output_file" &>/dev/null; then
+                    local dssp_err
+                    if ! dssp_err=$(_fastab_run "$DSSP_BIN" "$temp_pdb" "$output_file" 2>&1 >/dev/null); then
                         echo "✗ $basename (failed)"
+                        echo "[$(date -Iseconds)] DSSP ✗ ${basename}: ${dssp_err}" >> "$PIPELINE_LOG"
                         rm -f "$output_file"
                     elif [[ ! -s "$output_file" ]]; then
                         echo "✗ $basename (no DSSP output)"
+                        echo "[$(date -Iseconds)] DSSP ✗ ${basename}: empty output" >> "$PIPELINE_LOG"
                         rm -f "$output_file"
                     fi
                     rm -f "$temp_pdb"
                 }
                 export -f process_file _fastab_run
-                export DSSP_BIN FASTAB_ENV
+                export DSSP_BIN FASTAB_ENV PIPELINE_LOG
                 pipeline_pdb_paths "$STRUCTURES_DIR" | parallel -0 -j "$NUM_JOBS" process_file {}
             else
                 export STRUCTURES_DIR DSSP_BIN FASTAB_ENV
                 "${PY_ARR[@]}" << 'DSSP_PY'
 import os
 import shutil
+from datetime import datetime
 from pathlib import Path
 from multiprocessing import Pool, cpu_count
 import subprocess
@@ -511,6 +596,7 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
 SCRIPT_DIR = os.environ.get("SCRIPT_DIR", ".")
 DSSP_BIN = os.environ.get("DSSP_BIN", "mkdssp")
 FASTAB_ENV = os.environ.get("FASTAB_ENV", "fastab")
+PIPELINE_LOG = os.environ.get("PIPELINE_LOG", "")
 num_jobs = int(os.environ.get("NUM_JOBS", str(cpu_count())))
 
 def run_in_fastab(args, **kwargs):
@@ -518,6 +604,12 @@ def run_in_fastab(args, **kwargs):
         if shutil.which(conda):
             return subprocess.run([conda, "run", "-n", FASTAB_ENV, *args], **kwargs)
     return subprocess.run(args, **kwargs)
+
+def _log(msg):
+    if PIPELINE_LOG:
+        ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        with open(PIPELINE_LOG, "a") as lf:
+            lf.write(f"[{ts}] {msg}\n")
 
 def process_file(pdb_path):
     pdb_file = Path(pdb_path)
@@ -537,25 +629,39 @@ def process_file(pdb_path):
         Path(path).unlink(missing_ok=True)
         if r.returncode != 0:
             output_file.unlink(missing_ok=True)
+            _log(f"DSSP ✗ {basename}: {r.stderr.strip()}")
             return f"✗ {basename} (failed)"
         if not output_file.is_file() or output_file.stat().st_size == 0:
             output_file.unlink(missing_ok=True)
+            _log(f"DSSP ✗ {basename}: empty output")
             return f"✗ {basename} (no DSSP output)"
         return None
     except Exception as e:
+        _log(f"DSSP ✗ {basename}: {e}")
         return f"✗ {basename} (error: {str(e)[:50]})"
 
-allowed_names = set(filter(None, os.environ.get("ALLOWED_NAMES_CSV", "").split(",")))
+_anf = os.environ.get("ALLOWED_NAMES_FILE", "")
+if _anf and Path(_anf).is_file():
+    allowed_names = set(n for n in Path(_anf).read_text().splitlines() if n.strip())
+else:
+    allowed_names = set(filter(None, os.environ.get("ALLOWED_NAMES_CSV", "").split(",")))
 abb2_skip_stems = set(filter(None, os.environ.get("ABB2_SKIP_STEMS_CSV", "").split(",")))
 
 def pipeline_pdb_files(structures_dir):
     root = Path(structures_dir)
     out = []
+    if allowed_names:
+        # Fast-path: names are known — stat each file directly, no glob.
+        for name in sorted(allowed_names):
+            if name in abb2_skip_stems:
+                continue
+            p = root / f"{name}.pdb"
+            if p.is_file():
+                out.append(p)
+        return out
     for p in sorted(root.glob("*.pdb")):
         stem = p.stem
         if stem.endswith(("_H", "_L", "_full_atom_sasa", "_H_chain", "_L_chain")):
-            continue
-        if allowed_names and stem not in allowed_names:
             continue
         if stem in abb2_skip_stems:
             continue
@@ -600,21 +706,25 @@ DSSP_PY
                         }
                     }' "$pdbfile"
 
-                    if ! _fastab_run freesasa --shrake-rupley --format=rsa --depth=residue "$pdbfile" > "$sasa_full" 2>/dev/null; then
+                    local sasa_err
+                    if ! sasa_err=$(_fastab_run freesasa --shrake-rupley --format=rsa --depth=residue "$pdbfile" > "$sasa_full" 2>&1); then
                         echo "✗ $filename (full failed)"
+                        echo "[$(date -Iseconds)] SASA ✗ ${filename}: ${sasa_err}" >> "$PIPELINE_LOG"
                         rm -f "$sasa_full"
                     fi
 
                     if grep -q "^ATOM" "$tmp_H"; then
-                        if ! _fastab_run freesasa --shrake-rupley --format=rsa --depth=residue "$tmp_H" > "$sasa_H" 2>/dev/null; then
+                        if ! sasa_err=$(_fastab_run freesasa --shrake-rupley --format=rsa --depth=residue "$tmp_H" > "$sasa_H" 2>&1); then
                             echo "✗ $filename (H-only failed)"
+                            echo "[$(date -Iseconds)] SASA ✗ ${filename} H-chain: ${sasa_err}" >> "$PIPELINE_LOG"
                             rm -f "$sasa_H"
                         fi
                     fi
 
                     if grep -q "^ATOM" "$tmp_L"; then
-                        if ! _fastab_run freesasa --shrake-rupley --format=rsa --depth=residue "$tmp_L" > "$sasa_L" 2>/dev/null; then
+                        if ! sasa_err=$(_fastab_run freesasa --shrake-rupley --format=rsa --depth=residue "$tmp_L" > "$sasa_L" 2>&1); then
                             echo "✗ $filename (L-only failed)"
+                            echo "[$(date -Iseconds)] SASA ✗ ${filename} L-chain: ${sasa_err}" >> "$PIPELINE_LOG"
                             rm -f "$sasa_L"
                         fi
                     fi
@@ -622,13 +732,14 @@ DSSP_PY
                     rm -f "$tmp_H" "$tmp_L"
                 }
                 export -f process_file _fastab_run
-                export SASA_DIR FASTAB_ENV
+                export SASA_DIR FASTAB_ENV PIPELINE_LOG
                 pipeline_pdb_paths "$STRUCTURES_DIR" | parallel -0 -j "$NUM_JOBS" process_file {}
             else
-                export STRUCTURES_DIR SASA_DIR FASTAB_ENV
+                export STRUCTURES_DIR SASA_DIR FASTAB_ENV PIPELINE_LOG
                 "${PY_ARR[@]}" << 'FREESASA_PY'
 import os
 import shutil
+from datetime import datetime
 from pathlib import Path
 from multiprocessing import Pool, cpu_count
 import subprocess
@@ -636,6 +747,7 @@ import tempfile
 STRUCTURES_DIR = os.environ.get("STRUCTURES_DIR", ".")
 SASA_DIR = os.environ.get("SASA_DIR", ".")
 FASTAB_ENV = os.environ.get("FASTAB_ENV", "fastab")
+PIPELINE_LOG = os.environ.get("PIPELINE_LOG", "")
 num_jobs = int(os.environ.get("NUM_JOBS", str(cpu_count())))
 
 def run_in_fastab(args, **kwargs):
@@ -643,6 +755,12 @@ def run_in_fastab(args, **kwargs):
         if shutil.which(conda):
             return subprocess.run([conda, "run", "-n", FASTAB_ENV, *args], **kwargs)
     return subprocess.run(args, **kwargs)
+
+def _log(msg):
+    if PIPELINE_LOG:
+        ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        with open(PIPELINE_LOG, "a") as lf:
+            lf.write(f"[{ts}] {msg}\n")
 
 def process_file(pdb_path):
     pdb_file = Path(pdb_path)
@@ -675,11 +793,13 @@ def process_file(pdb_path):
     )
     if r.returncode != 0:
         errors.append(f"✗ {basename} (full failed)")
+        _log(f"SASA ✗ {basename} full: {r.stderr.strip()}")
         sasa_full.unlink(missing_ok=True)
     else:
         sasa_full.write_text(r.stdout)
         if sasa_full.stat().st_size == 0:
             errors.append(f"✗ {basename} (full failed)")
+            _log(f"SASA ✗ {basename} full: empty output")
             sasa_full.unlink(missing_ok=True)
 
     has_H_atoms = any(l.startswith("ATOM") for l in tmp_H_path.read_text().splitlines())
@@ -690,6 +810,7 @@ def process_file(pdb_path):
         )
         if r.returncode != 0:
             errors.append(f"✗ {basename} (H-only failed)")
+            _log(f"SASA ✗ {basename} H-chain: {r.stderr.strip()}")
         else:
             sasa_H.write_text(r.stdout)
 
@@ -701,6 +822,7 @@ def process_file(pdb_path):
         )
         if r.returncode != 0:
             errors.append(f"✗ {basename} (L-only failed)")
+            _log(f"SASA ✗ {basename} L-chain: {r.stderr.strip()}")
         else:
             sasa_L.write_text(r.stdout)
 
@@ -715,17 +837,28 @@ def process_file(pdb_path):
 
     return "; ".join(errors) if errors else None
 
-allowed_names = set(filter(None, os.environ.get("ALLOWED_NAMES_CSV", "").split(",")))
+_anf = os.environ.get("ALLOWED_NAMES_FILE", "")
+if _anf and Path(_anf).is_file():
+    allowed_names = set(n for n in Path(_anf).read_text().splitlines() if n.strip())
+else:
+    allowed_names = set(filter(None, os.environ.get("ALLOWED_NAMES_CSV", "").split(",")))
 abb2_skip_stems = set(filter(None, os.environ.get("ABB2_SKIP_STEMS_CSV", "").split(",")))
 
 def pipeline_pdb_files(structures_dir):
     root = Path(structures_dir)
     out = []
+    if allowed_names:
+        # Fast-path: names are known — stat each file directly, no glob.
+        for name in sorted(allowed_names):
+            if name in abb2_skip_stems:
+                continue
+            p = root / f"{name}.pdb"
+            if p.is_file():
+                out.append(p)
+        return out
     for p in sorted(root.glob("*.pdb")):
         stem = p.stem
         if stem.endswith(("_H", "_L", "_full_atom_sasa", "_H_chain", "_L_chain")):
-            continue
-        if allowed_names and stem not in allowed_names:
             continue
         if stem in abb2_skip_stems:
             continue
@@ -838,17 +971,28 @@ def process_file(pdb_path):
     except Exception as e:
         return f"✗ {basename} (error: {str(e)[:80]})"
 
-allowed_names = set(filter(None, os.environ.get("ALLOWED_NAMES_CSV", "").split(",")))
+_anf = os.environ.get("ALLOWED_NAMES_FILE", "")
+if _anf and Path(_anf).is_file():
+    allowed_names = set(n for n in Path(_anf).read_text().splitlines() if n.strip())
+else:
+    allowed_names = set(filter(None, os.environ.get("ALLOWED_NAMES_CSV", "").split(",")))
 abb2_skip_stems = set(filter(None, os.environ.get("ABB2_SKIP_STEMS_CSV", "").split(",")))
 
 def pipeline_pdb_files(structures_dir):
     root = Path(structures_dir)
     out = []
+    if allowed_names:
+        # Fast-path: names are known — stat each file directly, no glob.
+        for name in sorted(allowed_names):
+            if name in abb2_skip_stems:
+                continue
+            p = root / f"{name}.pdb"
+            if p.is_file():
+                out.append(p)
+        return out
     for p in sorted(root.glob("*.pdb")):
         stem = p.stem
         if stem.endswith(("_H", "_L", "_full_atom_sasa", "_H_chain", "_L_chain")):
-            continue
-        if allowed_names and stem not in allowed_names:
             continue
         if stem in abb2_skip_stems:
             continue
@@ -888,24 +1032,26 @@ PROPKA_PY
                     local -a cmd=(python developability/calculate_descriptors.py "$pdb_file" "$sasa_file")
                     if [ ! -f "$sasa_file" ]; then
                         echo "✗ $basename (SASA file not found)"
+                        echo "[$(date -Iseconds)] DESCRIPTORS ✗ ${basename}: SASA file not found: ${sasa_file}" >> "$PIPELINE_LOG"
                         return
                     fi
                     [ -f "$dssp_file" ] && cmd+=("--dssp-file" "$dssp_file")
                     [ -f "$pka_file" ] && cmd+=("--pka-file" "$pka_file")
                     cmd+=("--pH" "$PH_VALUE")
                     cmd+=("--output" "$output_file")
+                    cmd+=("--log-file" "$PIPELINE_LOG")
                     if ! output=$(cd "$SCRIPT_DIR" && _fastab_run "${cmd[@]}" 2>&1); then
                         echo "✗ $basename (failed)"
-                        printf '%s\n' "$output"
+                        echo "[$(date -Iseconds)] DESCRIPTORS ✗ ${basename}: ${output}" >> "$PIPELINE_LOG"
                     elif [[ -s "$output_file" ]]; then
                         _remove_helper_outputs_for_stem "$basename"
                     fi
                 }
                 export -f process_file _fastab_run _remove_helper_outputs_for_stem
-                export SASA_DIR DSSP_DIR PKA_DIR OUTPUT_DIR PH_VALUE SCRIPT_DIR FASTAB_ENV REMOVE_HELPER_OUTPUTS
+                export SASA_DIR DSSP_DIR PKA_DIR OUTPUT_DIR PH_VALUE SCRIPT_DIR FASTAB_ENV REMOVE_HELPER_OUTPUTS PIPELINE_LOG
                 pipeline_pdb_paths "$STRUCTURES_DIR" | parallel -0 -j "$NUM_JOBS" process_file {}
             else
-                export PY REMOVE_HELPER_OUTPUTS
+                export PY REMOVE_HELPER_OUTPUTS PIPELINE_LOG
                 "${PY_ARR[@]}" << 'DEV_PY'
 import os
 import shlex
@@ -918,6 +1064,7 @@ DSSP_DIR = os.environ.get("DSSP_DIR", ".")
 PKA_DIR = os.environ.get("PKA_DIR", ".")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
 SCRIPT_DIR = os.environ.get("SCRIPT_DIR", ".")
+PIPELINE_LOG = os.environ.get("PIPELINE_LOG", "")
 num_jobs = int(os.environ.get('NUM_JOBS', cpu_count()))
 ph_value = os.environ.get('PH_VALUE', '7.5')
 py_cmd = shlex.split(os.environ.get("PY", "python3"))
@@ -930,6 +1077,8 @@ def remove_helper_outputs_for_stem(basename):
         Path(DSSP_DIR) / f"{basename}.dssp",
         Path(PKA_DIR) / f"{basename}_full.pka",
         Path(PKA_DIR) / f"{basename}_full.log",
+        Path(PKA_DIR) / "tmp_structures" / f"{basename}_full.pdb",
+        Path(PKA_DIR) / "tmp_structures" / f"{basename}_full.propka_map.json",
         Path(SASA_DIR) / f"{basename}_full.sasa",
         Path(SASA_DIR) / f"{basename}_H_full.sasa",
         Path(SASA_DIR) / f"{basename}_L_full.sasa",
@@ -952,6 +1101,8 @@ def process_file(pdb_path):
         cmd.extend(["--pka-file", str(pka_file)])
     cmd.extend(["--pH", ph_value])
     cmd.extend(["--output", str(output_file)])
+    if PIPELINE_LOG:
+        cmd.extend(["--log-file", PIPELINE_LOG])
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, cwd=SCRIPT_DIR)
         if r.returncode != 0:
@@ -962,17 +1113,28 @@ def process_file(pdb_path):
     except Exception as e:
         return f"✗ {basename} (error: {str(e)[:200]})"
 
-allowed_names = set(filter(None, os.environ.get("ALLOWED_NAMES_CSV", "").split(",")))
+_anf = os.environ.get("ALLOWED_NAMES_FILE", "")
+if _anf and Path(_anf).is_file():
+    allowed_names = set(n for n in Path(_anf).read_text().splitlines() if n.strip())
+else:
+    allowed_names = set(filter(None, os.environ.get("ALLOWED_NAMES_CSV", "").split(",")))
 abb2_skip_stems = set(filter(None, os.environ.get("ABB2_SKIP_STEMS_CSV", "").split(",")))
 
 def pipeline_pdb_files(structures_dir):
     root = Path(structures_dir)
     out = []
+    if allowed_names:
+        # Fast-path: names are known — stat each file directly, no glob.
+        for name in sorted(allowed_names):
+            if name in abb2_skip_stems:
+                continue
+            p = root / f"{name}.pdb"
+            if p.is_file():
+                out.append(p)
+        return out
     for p in sorted(root.glob("*.pdb")):
         stem = p.stem
         if stem.endswith(("_H", "_L", "_full_atom_sasa", "_H_chain", "_L_chain")):
-            continue
-        if allowed_names and stem not in allowed_names:
             continue
         if stem in abb2_skip_stems:
             continue
@@ -992,7 +1154,154 @@ DEV_PY
             fi
             ;;
     esac
-    done
+    done  # for MODE
+    }  # _run_pipeline_stages
+
+    # ----------------------------------------------------------------
+    # Dispatch: stream find output into batches when BATCH_SIZE>0 and no
+    # pre-set name filter (no --names-from-csv).  The first batch fires
+    # as soon as BATCH_SIZE stems arrive — no full upfront enumeration.
+    # Fall back to a single pass for BATCH_SIZE=0 or when names are
+    # already known from --names-from-csv.
+    # ----------------------------------------------------------------
+    if [[ "$BATCH_SIZE" -gt 0 && ${#ALLOWED_NAMES[@]} -eq 0 ]]; then
+        _batch_stems=()
+        _BATCH_NUM=0
+        _batch_total=0
+        _sp_skipped_done=0
+        _sp_skipped_failed=0
+        while IFS= read -r -d '' _pdb; do
+            _stem="${_pdb##*/}"
+            _stem="${_stem%.pdb}"
+            # Inline filter matching _is_pipeline_pdb_stem (no ALLOWED_NAMES yet).
+            case "$_stem" in *_full_atom_sasa|*_H_chain|*_L_chain|*_H|*_L) continue ;; esac
+            if [[ "$SANITY_CHECK_ABB2" == true ]] && _is_abb2_sanity_skipped_stem "$_stem"; then
+                continue
+            fi
+            if [[ "$SKIP_EXISTING" == true ]] && [[ -s "$DEV_JSON_OUTPUT_DIR/${_stem}.json" ]]; then
+                _sp_skipped_done=$((_sp_skipped_done + 1))
+                continue
+            fi
+            if [[ "$SKIP_FAILED" == true ]] && _is_pipeline_failed_stem "$_stem"; then
+                _sp_skipped_failed=$((_sp_skipped_failed + 1))
+                continue
+            fi
+            _batch_stems+=("$_stem")
+            if [[ ${#_batch_stems[@]} -ge "$BATCH_SIZE" ]]; then
+                _BATCH_NUM=$(( _BATCH_NUM + 1 ))
+                ALLOWED_NAMES=("${_batch_stems[@]}")
+                # Write names to a temp file so the env stays small.
+                _ALLOWED_NAMES_FILE=$(mktemp)
+                printf '%s\n' "${ALLOWED_NAMES[@]}" > "$_ALLOWED_NAMES_FILE"
+                ALLOWED_NAMES_CSV=""
+                export ALLOWED_NAMES_CSV ALLOWED_NAMES_FILE="$_ALLOWED_NAMES_FILE"
+                echo "  [Batch $_BATCH_NUM] ${#ALLOWED_NAMES[@]} structures ..."
+                echo "[$(date -Iseconds)] Batch $_BATCH_NUM start (${#ALLOWED_NAMES[@]} structures)" >> "$PIPELINE_LOG"
+                _run_pipeline_stages
+                rm -f "$_ALLOWED_NAMES_FILE"
+                unset ALLOWED_NAMES_FILE
+                _batch_total=$(( _batch_total + ${#ALLOWED_NAMES[@]} ))
+                _batch_stems=()
+            fi
+        done < <(find "$STRUCTURES_DIR" -maxdepth 1 -name "*.pdb" -type f \
+                      ! -path '*/.*/*' ! -name "*_H.pdb" ! -name "*_L.pdb" -print0)
+        # Remaining partial batch (last batch, may be smaller than BATCH_SIZE).
+        if [[ ${#_batch_stems[@]} -gt 0 ]]; then
+            _BATCH_NUM=$(( _BATCH_NUM + 1 ))
+            ALLOWED_NAMES=("${_batch_stems[@]}")
+            _ALLOWED_NAMES_FILE=$(mktemp)
+            printf '%s\n' "${ALLOWED_NAMES[@]}" > "$_ALLOWED_NAMES_FILE"
+            ALLOWED_NAMES_CSV=""
+            export ALLOWED_NAMES_CSV ALLOWED_NAMES_FILE="$_ALLOWED_NAMES_FILE"
+            echo "  [Batch $_BATCH_NUM (final)] ${#ALLOWED_NAMES[@]} structures ..."
+            echo "[$(date -Iseconds)] Batch $_BATCH_NUM final (${#ALLOWED_NAMES[@]} structures)" >> "$PIPELINE_LOG"
+            _run_pipeline_stages
+            rm -f "$_ALLOWED_NAMES_FILE"
+            unset ALLOWED_NAMES_FILE
+            _batch_total=$(( _batch_total + ${#ALLOWED_NAMES[@]} ))
+        fi
+        TOTAL_STRUCTURES=$(( TOTAL_STRUCTURES + _batch_total ))
+        if [[ "$SKIP_EXISTING" == true && $_sp_skipped_done -gt 0 ]]; then
+            echo "  skip-existing: $_sp_skipped_done already-done structure(s) skipped"
+        fi
+        if [[ "$SKIP_FAILED" == true && $_sp_skipped_failed -gt 0 ]]; then
+            echo "  skip-failed: $_sp_skipped_failed previously-failed structure(s) skipped (pipeline.log)"
+        fi
+        echo "  Batch mode done: $_batch_total structure(s) in $_BATCH_NUM batch(es)"
+        ALLOWED_NAMES=()
+        ALLOWED_NAMES_CSV=""
+        export ALLOWED_NAMES_CSV
+    else
+        # Single-pass: BATCH_SIZE=0, or names already set from --names-from-csv.
+
+        # --skip-existing / --skip-failed: remove finished or failed stems from the work list.
+        if [[ "$SKIP_EXISTING" == true || "$SKIP_FAILED" == true ]]; then
+            _sp_filtered=()
+            _sp_skipped_done=0
+            _sp_skipped_failed=0
+            if [[ ${#ALLOWED_NAMES[@]} -gt 0 ]]; then
+                # Pre-set name list (e.g. from --names-from-csv): filter in-memory.
+                for _sp_name in "${ALLOWED_NAMES[@]}"; do
+                    if [[ "$SKIP_EXISTING" == true ]] && [[ -s "$DEV_JSON_OUTPUT_DIR/${_sp_name}.json" ]]; then
+                        _sp_skipped_done=$((_sp_skipped_done + 1))
+                        continue
+                    fi
+                    if [[ "$SKIP_FAILED" == true ]] && _is_pipeline_failed_stem "$_sp_name"; then
+                        _sp_skipped_failed=$((_sp_skipped_failed + 1))
+                        continue
+                    fi
+                    _sp_filtered+=("$_sp_name")
+                done
+                [[ "$SKIP_EXISTING" == true && $_sp_skipped_done -gt 0 ]] && echo "  skip-existing: $_sp_skipped_done already-done structure(s) skipped"
+                [[ "$SKIP_FAILED" == true && $_sp_skipped_failed -gt 0 ]] && echo "  skip-failed: $_sp_skipped_failed previously-failed structure(s) skipped (pipeline.log)"
+                ALLOWED_NAMES=("${_sp_filtered[@]}")
+                ALLOWED_NAMES_CSV="$(printf '%s,' "${ALLOWED_NAMES[@]}")"
+                export ALLOWED_NAMES_CSV
+            else
+                # No pre-set names: scan PDB files, exclude done and/or previously failed.
+                _SP_NAMES_FILE=$(mktemp)
+                while IFS= read -r -d '' _sp_pdb; do
+                    _sp_stem="${_sp_pdb##*/}"; _sp_stem="${_sp_stem%.pdb}"
+                    case "$_sp_stem" in *_full_atom_sasa|*_H_chain|*_L_chain|*_H|*_L) continue ;; esac
+                    if [[ "$SANITY_CHECK_ABB2" == true ]] && _is_abb2_sanity_skipped_stem "$_sp_stem"; then continue; fi
+                    if [[ "$SKIP_EXISTING" == true ]] && [[ -s "$DEV_JSON_OUTPUT_DIR/${_sp_stem}.json" ]]; then
+                        _sp_skipped_done=$((_sp_skipped_done + 1))
+                        continue
+                    fi
+                    if [[ "$SKIP_FAILED" == true ]] && _is_pipeline_failed_stem "$_sp_stem"; then
+                        _sp_skipped_failed=$((_sp_skipped_failed + 1))
+                        continue
+                    fi
+                    _sp_filtered+=("$_sp_stem")
+                    echo "$_sp_stem" >> "$_SP_NAMES_FILE"
+                done < <(find "$STRUCTURES_DIR" -maxdepth 1 -name "*.pdb" -type f \
+                              ! -path '*/.*/*' ! -name "*_H.pdb" ! -name "*_L.pdb" -print0)
+                [[ "$SKIP_EXISTING" == true && $_sp_skipped_done -gt 0 ]] && echo "  skip-existing: $_sp_skipped_done already-done structure(s) skipped"
+                [[ "$SKIP_FAILED" == true && $_sp_skipped_failed -gt 0 ]] && echo "  skip-failed: $_sp_skipped_failed previously-failed structure(s) skipped (pipeline.log)"
+                if [[ ${#_sp_filtered[@]} -gt 0 ]]; then
+                    ALLOWED_NAMES=("${_sp_filtered[@]}")
+                    ALLOWED_NAMES_CSV=""
+                    export ALLOWED_NAMES_CSV ALLOWED_NAMES_FILE="$_SP_NAMES_FILE"
+                else
+                    rm -f "$_SP_NAMES_FILE"
+                    unset _SP_NAMES_FILE
+                fi
+            fi
+        fi
+
+        if [[ "$BATCH_SIZE" -eq 0 ]]; then
+            N_PDB=$(count_pipeline_pdbs "$STRUCTURES_DIR")
+            TOTAL_STRUCTURES=$(( TOTAL_STRUCTURES + N_PDB ))
+        else
+            # BATCH_SIZE>0 but ALLOWED_NAMES already known from --names-from-csv.
+            TOTAL_STRUCTURES=$(( TOTAL_STRUCTURES + ${#ALLOWED_NAMES[@]} ))
+        fi
+        _run_pipeline_stages
+        if [[ -n "${_SP_NAMES_FILE:-}" ]]; then
+            rm -f "$_SP_NAMES_FILE"
+            unset ALLOWED_NAMES_FILE _SP_NAMES_FILE
+        fi
+    fi
 
     if [[ -n "$NAMES_FROM_CSV" ]]; then
         _validate_descriptor_outputs_for_csv "$NAMES_FROM_CSV" "$DEV_JSON_OUTPUT_DIR"

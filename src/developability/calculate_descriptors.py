@@ -2,8 +2,10 @@
 
 import argparse
 import json
+import logging
 import re
 import sys
+import traceback
 from collections import defaultdict
 from pathlib import Path
 import math
@@ -120,7 +122,7 @@ def main():
         type=str,
         nargs='?',
         default=None,
-        help='Path to SASA file (FreeSASA format). Required unless --wcn-only.'
+        help='Path to SASA file (FreeSASA format).'
     )
     
     parser.add_argument(
@@ -162,9 +164,33 @@ def main():
         default=None,
         help='Output file path (default: print to stdout)'
     )
-    
+
+    parser.add_argument(
+        '--log-file',
+        type=str,
+        default=None,
+        help='Append warnings and errors to this file in addition to stderr. '
+             'All sub-module logging (PropKa, SASA, DSSP) flows here too.'
+    )
+
     args = parser.parse_args()
-    
+
+    # Configure logging. File handler (DEBUG+) captures everything from all
+    # sub-modules (propka_pdb, structure_context, descriptor_utils). A stderr
+    # handler at WARNING keeps the console quiet during large batch runs.
+    _log_handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+    _log_handlers[0].setLevel(logging.WARNING)
+    if args.log_file:
+        _fh = logging.FileHandler(args.log_file, mode="a", encoding="utf-8")
+        _fh.setLevel(logging.DEBUG)
+        _fh.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S",
+        ))
+        _log_handlers.append(_fh)
+    logging.basicConfig(level=logging.DEBUG, handlers=_log_handlers)
+    logger = logging.getLogger(__name__)
+
     if args.sasa_file:
         sasa_path = Path(args.sasa_file)
         if "_full" not in sasa_path.stem:
@@ -172,14 +198,14 @@ def main():
             args.sasa_file = str(sasa_path.with_name(new_stem + sasa_path.suffix))
     
     if not Path(args.pdb_file).exists():
-        print(f"Error: PDB file not found: {args.pdb_file}", file=sys.stderr)
+        logger.error("PDB file not found: %s", args.pdb_file)
         sys.exit(1)
-    
+
     if args.sasa_file is None:
-        print(f"Error: SASA file is required.", file=sys.stderr)
+        logger.error("SASA file is required.")
         sys.exit(1)
     if not Path(args.sasa_file).exists():
-        print(f"Error: SASA file not found: {args.sasa_file}", file=sys.stderr)
+        logger.error("SASA file not found: %s", args.sasa_file)
         sys.exit(1)
     
     allowed_chains = [args.heavy_chain, args.light_chain]
@@ -782,9 +808,8 @@ def main():
 
     
     except Exception as e:
-        print(f"Error calculating developability descriptors: {e}", file=sys.stderr)
-        import traceback
-        traceback.print_exc()
+        logger.error("Error calculating developability descriptors for %s: %s", args.pdb_file, e)
+        logger.debug(traceback.format_exc())
         sys.exit(1)
 
 

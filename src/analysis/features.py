@@ -28,7 +28,6 @@ from .aggregated_csv import (
 
 DEVELOPABILITY_JSON_GROUPS: tuple[str, ...] = (
     "surface",
-    "core",
     "general",
     "sequence_motives",
 )

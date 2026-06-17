@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ABB2 / ABB3 batch structure prediction from CSV (name, heavy, light)."""
+"""ABB2 / ABB3 / FlashABB batch structure prediction from CSV (name, heavy, light)."""
 
 from __future__ import annotations
 
@@ -13,11 +13,16 @@ _src_dir = Path(__file__).resolve().parents[1]
 if str(_src_dir) not in sys.path:
     sys.path.insert(0, str(_src_dir))
 
-ABB3_SRC_DEFAULT = os.environ.get("ABB3_SRC", "/home/kb/abodybuilder3/src")
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_ABB3_DIR_DEFAULT = Path(
+    os.environ.get("ABB3_DIR", _REPO_ROOT / "vendor" / "abodybuilder3")
+)
+ABB3_SRC_DEFAULT = os.environ.get("ABB3_SRC", str(_ABB3_DIR_DEFAULT / "src"))
 CKPT_DEFAULT = os.environ.get(
     "ABB3_CHECKPOINT",
-    "/home/kb/abodybuilder3/output/plddt-loss/best_second_stage.ckpt",
+    str(_ABB3_DIR_DEFAULT / "output" / "plddt-loss" / "best_second_stage.ckpt"),
 )
+_DEFAULT_DEVICE = "cuda:0"
 
 
 def _build_dataset_jobs(
@@ -111,7 +116,7 @@ def _early_set_cuda_visible_device(device_arg: str) -> None:
     if not dev:
         dev = os.environ.get("ABB2_DEVICE", "").strip()
     if not dev:
-        dev = "cuda:1"
+        dev = os.environ.get("ABB3_DEVICE", _DEFAULT_DEVICE).strip() or _DEFAULT_DEVICE
     if dev == "cpu":
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
         return
@@ -528,6 +533,150 @@ def main_abb3(args: argparse.Namespace) -> None:
     print(f"\nDone. Outputs under {out_root}", flush=True)
 
 
+def process_one_dataset_flashabb(
+    csv_path: Path,
+    dataset: str,
+    model,
+    out_root: Path,
+    runs: int,
+    batch_size: int,
+    skip_existing: bool,
+) -> None:
+    import time
+
+    import pandas as pd
+
+    df = pd.read_csv(csv_path)
+    missing = [c for c in ("name", "heavy", "light") if c not in df.columns]
+    if missing:
+        raise SystemExit(f"{csv_path}: missing columns {missing}")
+
+    print(f"\n>>> Dataset {dataset!r} ({csv_path.name}, {len(df)} antibodies)", flush=True)
+
+    for run in range(1, runs + 1):
+        run_dir = out_root / f"{dataset}_flashabb_{run}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        print(f"=== run {run}/{runs} -> {run_dir} ===", flush=True)
+
+        n_ok, n_skip, n_fail = 0, 0, 0
+        buf_names: list[str] = []
+        buf_seqs: list[str] = []
+
+        def flush_buffer() -> None:
+            nonlocal n_ok, n_fail, buf_names, buf_seqs
+            if not buf_names:
+                return
+            t0 = time.monotonic()
+            try:
+                import torch
+
+                with torch.no_grad():
+                    result = model(buf_seqs)
+                result.to_pdbs(buf_names, pdb_dir=str(run_dir))
+                elapsed = time.monotonic() - t0
+                print(
+                    f"  batch of {len(buf_names)} ok ({elapsed:.1f}s)",
+                    flush=True,
+                )
+                n_ok += len(buf_names)
+            except Exception as e:
+                print(f"  FAIL batch {buf_names}: {e}", flush=True)
+                n_fail += len(buf_names)
+            buf_names.clear()
+            buf_seqs.clear()
+
+        for _, row in df.iterrows():
+            name = str(row["name"]).strip() if pd.notna(row["name"]) else ""
+            heavy = str(row["heavy"]).strip() if pd.notna(row["heavy"]) else ""
+            light = str(row["light"]).strip() if pd.notna(row["light"]) else ""
+            if not name or not heavy or not light:
+                n_fail += 1
+                continue
+
+            pdb_path = run_dir / f"{name}.pdb"
+            if skip_existing and pdb_path.is_file():
+                n_skip += 1
+                continue
+
+            buf_names.append(name)
+            buf_seqs.append(f"{heavy}|{light}")
+            if len(buf_names) >= batch_size:
+                flush_buffer()
+
+        flush_buffer()
+
+        print(
+            f"  run {run}: wrote {n_ok}, skipped {n_skip}, failed {n_fail}",
+            flush=True,
+        )
+
+
+def main_flashabb(args: argparse.Namespace) -> None:
+    print(
+        "FlashABB: loading PyTorch and flash-abb (first start can take ~30s) ...",
+        flush=True,
+    )
+    _early_set_cuda_visible_device(args.device)
+    import torch
+
+    if args.runs < 1:
+        raise SystemExit("--runs must be >= 1")
+    if args.batch_size < 1:
+        raise SystemExit("--batch-size must be >= 1")
+
+    # Guard: filter out empty strings that could arrive from the shell via --csv "".
+    # An empty Path resolves to cwd, which is a directory, not a CSV file.
+    raw_csv_args = [x for x in (args.csv or []) if x]
+    csv_arg_list = [Path(x) for x in raw_csv_args] if raw_csv_args else None
+    dataset_names = list(args.dataset) if args.dataset else None
+    jobs = _build_dataset_jobs(csv_arg_list, args.data_dir, dataset_names)
+
+    for csv_path, _stem in jobs:
+        if not csv_path.is_file():
+            raise SystemExit(
+                f"Not a file: {csv_path}\n"
+                f"  (passed as --csv; check the path is valid and the file exists)"
+            )
+        _validate_csv_columns(csv_path)
+
+    # Import flash_abb from the vendored local directory so it doesn't need to
+    # be on PYTHONPATH — the FLASHABB_DIR env var points to the FlashABB/ root.
+    flashabb_dir = os.environ.get("FLASHABB_DIR", "")
+    if flashabb_dir and Path(flashabb_dir).is_dir():
+        if str(flashabb_dir) not in sys.path:
+            sys.path.insert(0, str(flashabb_dir))
+
+    from flash_abb import pretrained
+
+    print(f"PyTorch CUDA available: {torch.cuda.is_available()}", flush=True)
+    device = _resolve_torch_device(args.device)
+    print(f"Device: {device}", flush=True)
+
+    print("Loading FlashABB model weights ...", flush=True)
+    model = pretrained(device=str(device))
+    print("FlashABB model loaded.", flush=True)
+
+    out_root = args.output_root.resolve()
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    print(f"Datasets to run ({len(jobs)}):", flush=True)
+    for csv_path, stem in jobs:
+        print(f"  - {stem!r} <- {csv_path}", flush=True)
+
+    for csv_path, dataset in jobs:
+        process_one_dataset_flashabb(
+            csv_path,
+            dataset,
+            model,
+            out_root,
+            args.runs,
+            args.batch_size,
+            args.skip_existing,
+        )
+
+    print(f"\nDone. Outputs under {out_root}", flush=True)
+
+
 def _add_shared_csv_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--csv",
@@ -565,8 +714,8 @@ def _add_shared_csv_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--device",
-        default="cuda:1",
-        help='Torch / CUDA device hint (default cuda:1). Use cpu to force CPU.',
+        default=_DEFAULT_DEVICE,
+        help=f"Torch / CUDA device hint (default {_DEFAULT_DEVICE}). Use cpu to force CPU.",
     )
 
 
@@ -603,9 +752,18 @@ def main(argv: list[str] | None = None) -> None:
         help="LitABB3 checkpoint (default or ABB3_CHECKPOINT env)",
     )
 
+    fabb_p = sub.add_parser(
+        "flashabb",
+        help="FlashABB batched inference (flash-abb)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_shared_csv_args(fabb_p)
+
     args = parser.parse_args(argv)
     if args.backend == "abb2":
         main_abb2(args)
+    elif args.backend == "flashabb":
+        main_flashabb(args)
     else:
         main_abb3(args)
 

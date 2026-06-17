@@ -1106,10 +1106,32 @@ def refine_once(input_file, output_file, check_for_strained_bonds=True, n=6, n_t
 
             tests = bond_check(topology, positions) and cis_check(topology, positions)
             if needs_recheck:
-                tests = tests and strained_sidechain_bonds_check(topology, positions)
+                tests = tests and not strained_sidechain_bonds_check(topology, positions)
             if tests and stereo_check(topology, positions) and clash_check(topology, positions):
                 success = True
                 break
+
+    # If all minimization attempts failed the structure was reset to the PDBFixer heavy-atom
+    # topology (no hydrogens).  Try to add hydrogens as a last resort so that downstream tools
+    # (e.g. ProperMAB) don't fail with "No template found … missing N hydrogen atoms".
+    if not success:
+        h_count = sum(1 for a in topology.atoms() if a.element is not None and a.element.symbol == "H")
+        if h_count == 0:
+            try:
+                modeller = app.Modeller(topology, positions)
+                modeller.addHydrogens(forcefield)
+                topology, positions = modeller.topology, modeller.positions
+                print(
+                    f"[refine] minimization failed for {input_file}; "
+                    "wrote heavy-atom structure with fallback H addition.",
+                    flush=True,
+                )
+            except Exception as h_err:
+                print(
+                    f"[refine] minimization failed for {input_file} and fallback H addition "
+                    f"also failed ({h_err}); writing heavy-atom structure.",
+                    flush=True,
+                )
 
     with open(output_file, "w") as out_handle:
         app.PDBFile.writeFile(topology, positions, out_handle, keepIds=True)

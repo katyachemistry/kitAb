@@ -226,13 +226,50 @@ def _folder_has_pipeline_structures(folder: Path) -> bool:
     return False
 
 
-def _discover_structure_only_jobs(structures_path: Path) -> list[Path]:
+def _discover_structure_only_jobs(
+    structures_path: Path,
+    *,
+    layout: str = "auto",
+) -> list[Path]:
     """Discover structure folders for descriptors-only runs (no CSV pairing).
 
-    If ``structures_path`` contains subdirectories with pipeline structures, each
-    subdirectory is one job. Otherwise the root folder itself is a single job
-    when it contains top-level PDB/mmCIF files.
+    layout:
+      ``auto``    – (default) check for subdirectories first; fall back to the
+                    root folder when none are found.
+      ``flat``    – treat the root folder itself as a single job; no directory
+                    scan at all. Use this when the folder contains millions of
+                    PDB/mmCIF files directly to avoid slow enumeration.
+      ``subdirs`` – expect one job per subdirectory; raise an error if none found.
     """
+    if layout not in ("auto", "flat", "subdirs"):
+        raise SystemExit(
+            f"structures_layout must be 'auto', 'flat', or 'subdirs'; got {layout!r}"
+        )
+
+    if layout == "flat":
+        if not _folder_has_pipeline_structures(structures_path):
+            raise SystemExit(
+                f"No PDB/mmCIF structures found in {structures_path} "
+                f"(structures_layout: flat)"
+            )
+        return [structures_path]
+
+    if layout == "subdirs":
+        subdirs = [
+            sub_dir
+            for sub_dir in sorted(structures_path.iterdir())
+            if sub_dir.is_dir()
+            and not sub_dir.name.startswith(".")
+            and _folder_has_pipeline_structures(sub_dir)
+        ]
+        if not subdirs:
+            raise SystemExit(
+                f"No subdirectories with PDB/mmCIF found under {structures_path} "
+                f"(structures_layout: subdirs)"
+            )
+        return subdirs
+
+    # auto: original behaviour — subdirs first, root as fallback
     subdirs = [
         sub_dir
         for sub_dir in sorted(structures_path.iterdir())
@@ -284,6 +321,30 @@ def _match_descriptor_suffix(folder_name: str, allowed_suffixes: list[str]) -> s
     return None
 
 
+def _normalize_allowed_suffixes(pred_desc: dict[str, Any]) -> list[str] | None:
+    allowed_suffixes = pred_desc.get("allowed_suffixes")
+    if allowed_suffixes is None:
+        return None
+    if not isinstance(allowed_suffixes, list):
+        raise SystemExit("predefined_descriptors.allowed_suffixes must be a list of suffixes")
+    if not allowed_suffixes:
+        return None
+    return [str(s) for s in allowed_suffixes]
+
+
+def _dataset_stem_from_run_name(
+    run_name: str,
+    allowed_suffixes: list[str] | None,
+) -> str | None:
+    if allowed_suffixes is None:
+        return run_name
+    matched_suffix = _match_descriptor_suffix(run_name, allowed_suffixes)
+    if not matched_suffix:
+        return None
+    dataset_stem = run_name[: -len(matched_suffix)]
+    return dataset_stem or None
+
+
 _DEFAULT_FEATURES_CSV_NAME = "features.csv"
 _RESULTS_SUBDIR_NAME = "results"
 
@@ -312,12 +373,20 @@ def _predefined_descriptors_config_block(raw: dict[str, Any]) -> dict[str, Any] 
 def _has_matching_run_subfolders(
     folder_path: Path,
     *,
-    allowed_suffixes: list[str],
+    allowed_suffixes: list[str] | None,
+    features_filename: str,
 ) -> bool:
     for sub_dir in folder_path.iterdir():
-        if sub_dir.is_dir() and not sub_dir.name.startswith("."):
+        if not sub_dir.is_dir() or sub_dir.name.startswith("."):
+            continue
+        if allowed_suffixes is not None:
             if _match_descriptor_suffix(sub_dir.name, allowed_suffixes):
                 return True
+            continue
+        if _resolve_descriptor_source_in_run_dir(
+            sub_dir, features_filename=features_filename
+        ):
+            return True
     return False
 
 
@@ -392,18 +461,20 @@ def _load_predefined_descriptor_runs(
 ) -> tuple[Path, list[dict[str, Any]]]:
     """Discover external developability runs (any vendor) under one folder.
 
-    Per matching run name ``{dataset_stem}{suffix}``:
+    Per matching run name ``{dataset_stem}`` or ``{dataset_stem}{suffix}``:
 
     - If any such subfolders exist: each must have ``features.csv`` (or
       ``features_filename``) or ``results/*.json``.
-    - Otherwise: flat ``{dataset_stem}{suffix}.csv`` files in the folder root.
+    - Otherwise: flat ``{dataset_stem}.csv`` or ``{dataset_stem}{suffix}.csv`` files
+      in the folder root.
+
+  ``allowed_suffixes`` is optional; omit it when run folders are named after datasets
+    (e.g. ``descriptors_tap/ab21/features.csv``).
     """
     folder_name = pred_desc.get("folder")
-    allowed_suffixes = pred_desc.get("allowed_suffixes")
     if not folder_name:
         raise SystemExit("predefined_descriptors.folder is required")
-    if not allowed_suffixes or not isinstance(allowed_suffixes, list):
-        raise SystemExit("predefined_descriptors.allowed_suffixes must be a list of suffixes")
+    allowed_suffixes = _normalize_allowed_suffixes(pred_desc)
 
     features_filename = str(
         pred_desc.get("features_filename") or _DEFAULT_FEATURES_CSV_NAME
@@ -426,27 +497,31 @@ def _load_predefined_descriptor_runs(
     )
 
     runs: list[dict[str, Any]] = []
-    if _has_matching_run_subfolders(folder_path, allowed_suffixes=allowed_suffixes):
+    if _has_matching_run_subfolders(
+        folder_path,
+        allowed_suffixes=allowed_suffixes,
+        features_filename=features_filename,
+    ):
         for sub_dir in sorted(folder_path.iterdir()):
             if not sub_dir.is_dir() or sub_dir.name.startswith("."):
                 continue
-            matched_suffix = _match_descriptor_suffix(sub_dir.name, allowed_suffixes)
-            if not matched_suffix:
-                continue
-            dataset_stem = sub_dir.name[: -len(matched_suffix)]
+            dataset_stem = _dataset_stem_from_run_name(sub_dir.name, allowed_suffixes)
             if not dataset_stem:
-                raise SystemExit(
-                    f"predefined_descriptors: folder {sub_dir.name!r} matches suffix "
-                    f"{matched_suffix!r} but has no dataset stem prefix"
-                )
+                continue
             resolved = _resolve_descriptor_source_in_run_dir(
                 sub_dir, features_filename=features_filename
             )
             if resolved is None:
-                raise SystemExit(
-                    f"predefined_descriptors: {sub_dir} matches suffix {matched_suffix!r} "
-                    f"but has neither {features_filename!r} nor {_RESULTS_SUBDIR_NAME}/*.json"
-                )
+                if allowed_suffixes is not None:
+                    matched_suffix = _match_descriptor_suffix(
+                        sub_dir.name, allowed_suffixes
+                    )
+                    raise SystemExit(
+                        f"predefined_descriptors: {sub_dir} matches suffix "
+                        f"{matched_suffix!r} but has neither {features_filename!r} "
+                        f"nor {_RESULTS_SUBDIR_NAME}/*.json"
+                    )
+                continue
             developability_path, kind = resolved
             feat_csv = (sub_dir / features_filename) if kind == "csv" else None
             entry = _build_descriptor_run_entry(
@@ -466,15 +541,9 @@ def _load_predefined_descriptor_runs(
             if not feat_csv.is_file():
                 continue
             run_name = feat_csv.stem
-            matched_suffix = _match_descriptor_suffix(run_name, allowed_suffixes)
-            if not matched_suffix:
-                continue
-            dataset_stem = run_name[: -len(matched_suffix)]
+            dataset_stem = _dataset_stem_from_run_name(run_name, allowed_suffixes)
             if not dataset_stem:
-                raise SystemExit(
-                    f"predefined_descriptors: file {feat_csv.name!r} matches suffix "
-                    f"{matched_suffix!r} but has no dataset stem prefix"
-                )
+                continue
             entry = _build_descriptor_run_entry(
                 run_key=run_name,
                 dataset_stem=dataset_stem,
@@ -484,18 +553,26 @@ def _load_predefined_descriptor_runs(
             )
             if entry is not None:
                 runs.append(entry)
-        layout = "flat *.csv files named {dataset_stem}{suffix}.csv"
+        if allowed_suffixes is None:
+            layout = "flat *.csv files named {dataset_stem}.csv"
+        else:
+            layout = "flat *.csv files named {dataset_stem}{suffix}.csv"
 
     if not runs:
+        suffix_hint = (
+            "matching dataset CSVs"
+            if allowed_suffixes is None
+            else f"suffixes {allowed_suffixes!r} and matching dataset CSVs"
+        )
         raise SystemExit(
             f"No predefined_descriptors runs under {folder_path} (tried {layout}); "
-            f"need suffixes {allowed_suffixes!r} and matching dataset CSVs in {input_csvs_path}"
+            f"need {suffix_hint} in {input_csvs_path}"
         )
 
     return folder_path, runs
 
 
-def load_generic_config(config_path: Path, repo_root: Path) -> dict[str, Any]:
+def load_generic_config(config_path: Path, repo_root: Path, *, resume: bool = False) -> dict[str, Any]:
     yaml = _require_yaml()
     cfg_path = config_path.resolve()
     if not cfg_path.is_file():
@@ -511,6 +588,7 @@ def load_generic_config(config_path: Path, repo_root: Path) -> dict[str, Any]:
         "result_folder",
         "structure_prediction",
         "input_structures_folder",
+        "structures_layout",
         "calculate_descriptors",
         "predefined_descriptors",
         "csv_features",
@@ -519,6 +597,8 @@ def load_generic_config(config_path: Path, repo_root: Path) -> dict[str, Any]:
         "automl",
         "structures_processing",
         "n_cpu",
+        "cleanup",
+        "descriptor_batch_size",
     }
     for k, v in raw.items():
         if k not in known_keys:
@@ -557,7 +637,8 @@ def load_generic_config(config_path: Path, repo_root: Path) -> dict[str, Any]:
             "config must set input_csvs_folder and/or input_structures_folder"
         )
 
-    _ensure_result_folder_absent(repo_root, str(result_folder), config_path=cfg_path)
+    if not resume:
+        _ensure_result_folder_absent(repo_root, str(result_folder), config_path=cfg_path)
 
     if not input_csvs:
         if not calc_desc:
@@ -573,12 +654,14 @@ def load_generic_config(config_path: Path, repo_root: Path) -> dict[str, Any]:
         if not structures_path.is_dir():
             raise SystemExit(f"input_structures_folder not found: {structures_path}")
 
+        structures_layout = str(raw.get("structures_layout") or "auto").strip().lower()
+
         structure_runs = [
             {
                 "folder_name": folder.name,
                 "structure_dir": _rel(repo_root, folder),
             }
-            for folder in _discover_structure_only_jobs(structures_path)
+            for folder in _discover_structure_only_jobs(structures_path, layout=structures_layout)
         ]
         if raw.get("automl") is True:
             print(
@@ -702,14 +785,16 @@ def load_generic_config(config_path: Path, repo_root: Path) -> dict[str, Any]:
             raise SystemExit("structure_prediction must be a mapping")
 
         model = str(sp.get("model") or "abb3").strip().lower()
-        if model not in {"abb2", "abb3"}:
-            raise SystemExit(f"structure_prediction.model must be abb2 or abb3 (got {model!r})")
+        if model not in {"abb2", "abb3", "flashabb"}:
+            raise SystemExit(f"structure_prediction.model must be abb2, abb3, or flashabb (got {model!r})")
 
         runs = int(sp.get("runs") or 1)
         if runs < 1:
             raise SystemExit("structure_prediction.runs must be >= 1")
 
-        batch_size = int(sp.get("batch_size") or 4)
+        # FlashABB is efficient at larger batches; use 50 as default vs 4 for ABB2/ABB3.
+        _batch_size_default = 50 if model == "flashabb" else 4
+        batch_size = int(sp.get("batch_size") or _batch_size_default)
         if batch_size < 1:
             raise SystemExit("structure_prediction.batch_size must be >= 1")
 
@@ -876,10 +961,15 @@ def main() -> None:
     )
     parser.add_argument("config", type=Path, help="Generic config (e.g. configs/scenario1.yaml)")
     parser.add_argument("--repo-root", type=Path, required=True)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip the result_folder-already-exists guard (for resuming interrupted runs)",
+    )
     args = parser.parse_args()
 
     repo_root = args.repo_root.resolve()
-    generic = load_generic_config(args.config, repo_root)
+    generic = load_generic_config(args.config, repo_root, resume=args.resume)
     run_config = build_run_config(generic, repo_root)
     out_path = write_run_config(
         run_config,

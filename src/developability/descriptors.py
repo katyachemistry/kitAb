@@ -60,6 +60,7 @@ from utils.chemistry import (
     MIN_HBOND_ANGLE,
     NEGATIVE_ATOMS,
     NEGATIVE_CHARGED_RESIDUES,
+    SALT_BRIDGE_NEGATIVE_ATOMS,
     NTERM_PKA,  # kept for commented standard termini pKa fallback
     PCF_CLUSTER_BIN_STARTS_DEFAULT,
     PCF_CLUSTER_BIN_WIDTHS_DEFAULT,
@@ -457,11 +458,9 @@ def compute_sap_shell_synergy_scores(
     """SAP-style surface metrics: aromatic/histidine exposure and charge–aromatic synergy.
 
     Per residue i, sum SASA-weighted neighbor env (pos, neg, aro, his), then
-    sap_aromatic_score, sap_histidine_score, sap_pos_aro_synergy, sap_aro_neg_contrast.
+    sap_aro_score, sap_his_score, sap_pos_aro_synergy, sap_aro_neg_contrast.
     """
     out: Dict[str, float] = {
-        "sap_aromatic_score": 0.0,
-        "sap_histidine_score": 0.0,
         "sap_pos_aro_synergy": 0.0,
         "sap_aro_neg_contrast": 0.0,
     }
@@ -645,7 +644,7 @@ def _find_salt_bridge_contacts(
     negative_atoms = [
         atom
         for atom in atoms
-        if (atom.name, atom.residue_name) in NEGATIVE_ATOMS
+        if (atom.name, atom.residue_name) in SALT_BRIDGE_NEGATIVE_ATOMS
         and residue_key_from_atom(atom) in charged_neg_residues
     ]
 

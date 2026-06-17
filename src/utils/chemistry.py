@@ -90,6 +90,17 @@ NEGATIVE_ATOMS = frozenset(
     }
 )
 
+# Only canonical strong-acid residues form proper salt bridges; TYR/CYS are
+# ionizable but too weakly acidic at physiological pH to be salt-bridge partners.
+SALT_BRIDGE_NEGATIVE_ATOMS = frozenset(
+    {
+        ("OD1", "ASP"),
+        ("OD2", "ASP"),
+        ("OE1", "GLU"),
+        ("OE2", "GLU"),
+    }
+)
+
 GLN_ASN_RESIDUES = frozenset({"GLN", "ASN"})
 
 # Kyte-Doolittle (inactive in pipeline; legacy export for run_developability_fix_results.py).

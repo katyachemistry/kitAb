@@ -69,6 +69,7 @@ usage() {
     echo "Options:"
     echo "  --no-clean-batch          Keep per-dataset JSON subdirs under <result>/automl after analysis"
     echo "  --clean-external-outputs  After descriptors, remove dssp/, propka/, and sasa/ under each dataset"
+    echo "  --resume                  Continue an interrupted run; skip existing descriptor JSON and prior pipeline.log failures"
 }
 
 read_generic() {
@@ -181,18 +182,35 @@ repo_root = Path(sys.argv[1]).resolve()
 run_config = yaml.safe_load(open(sys.argv[2]))
 result_folder = sys.argv[3]
 
+missing: list[tuple[str, str]] = []
+jobs: list[tuple[Path, Path | None]] = []
+
 for key, block in run_config.items():
     if key == "batch_result_root" or not isinstance(block, dict):
         continue
     struct_rel = block.get("structure_dir") or f"{result_folder}/structures/{key}"
     struct_dir = (repo_root / struct_rel).resolve()
     if not struct_dir.is_dir():
-        raise SystemExit(f"Structure folder not found for {key!r}: {struct_dir}")
+        missing.append((key, str(struct_dir)))
+        continue
     csv_rel = block.get("path")
+    csv_path: Path | None = None
     if csv_rel:
         csv_path = (repo_root / csv_rel).resolve()
         if not csv_path.is_file():
             raise SystemExit(f"CSV not found for {key!r}: {csv_path}")
+    jobs.append((struct_dir, csv_path))
+
+if missing:
+    for key, path in missing:
+        print(f"Structure folder not found for {key!r}: {path}", file=sys.stderr)
+    raise SystemExit(
+        f"{len(missing)} structure folder(s) missing; finish structure prediction "
+        f"or fix structure_dir entries in {sys.argv[2]}"
+    )
+
+for struct_dir, csv_path in jobs:
+    if csv_path is not None:
         print(f"{struct_dir}\t{csv_path}")
     else:
         print(f"{struct_dir}\t")
@@ -227,6 +245,7 @@ for _key, block in run_config.items():
 
 NO_CLEAN_BATCH="${FASTAB_NO_CLEAN_BATCH:-0}"
 CLEAN_EXTERNAL_OUTPUTS=0
+RESUME_MODE=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no-clean-batch)
@@ -235,6 +254,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --clean-external-outputs)
             CLEAN_EXTERNAL_OUTPUTS=1
+            shift
+            ;;
+        --resume)
+            RESUME_MODE=1
             shift
             ;;
         -h|--help)
@@ -270,7 +293,10 @@ if [[ -z "$RESULT_FOLDER" ]]; then
 fi
 RESULT_ROOT="$REPO_ROOT/$RESULT_FOLDER"
 if [[ -d "$RESULT_ROOT" ]]; then
-    _die "result_folder already exists: $RESULT_ROOT (remove or rename it before re-running)"
+    if [[ "$RESUME_MODE" -eq 0 ]]; then
+        _die "result_folder already exists: $RESULT_ROOT (remove or rename it before re-running, or use --resume to continue)"
+    fi
+    _stage "Resuming into existing result_folder: $RESULT_ROOT"
 fi
 
 # ---------------------------------------------------------------------------
@@ -278,17 +304,21 @@ fi
 # ---------------------------------------------------------------------------
 
 _stage "Preparing run config from $GENERIC_CONFIG"
-RUN_CONFIG="$(run_py "$PREPARE_SCRIPT" "$GENERIC_CONFIG" --repo-root "$REPO_ROOT")"
+_prepare_extra=()
+[[ "$RESUME_MODE" -eq 1 ]] && _prepare_extra+=(--resume)
+RUN_CONFIG="$(run_py "$PREPARE_SCRIPT" "$GENERIC_CONFIG" --repo-root "$REPO_ROOT" "${_prepare_extra[@]}")"
 _stage "Run config: $RUN_CONFIG"
 
 CALCULATE_DESCRIPTORS="$(run_py -c "import yaml,sys; cfg=yaml.safe_load(open(sys.argv[1])); print(cfg.get('calculate_descriptors', True))" "$GENERIC_CONFIG")"
 SKIP_AUTOML="$(run_py -c "import yaml,sys; cfg=yaml.safe_load(open(sys.argv[1])); print(cfg.get('automl', True) is False)" "$GENERIC_CONFIG")"
+CLEANUP_INTERMEDIATES="$(run_py -c "import yaml,sys; cfg=yaml.safe_load(open(sys.argv[1])); print(bool(cfg.get('cleanup', False)))" "$GENERIC_CONFIG")"
 USE_EXTERNAL_DESCRIPTORS=0
 if [[ "$(read_generic_has_key predefined_descriptors)" == "True" ]] \
     || [[ "$(read_generic_has_key csv_features)" == "True" ]]; then
     USE_EXTERNAL_DESCRIPTORS=1
 fi
 N_CPU="$(read_generic_optional n_cpu)"
+DESCRIPTOR_BATCH_SIZE="$(read_generic_optional descriptor_batch_size)"
 
 PARALLEL_JOBS="${N_CPU:-$(nproc)}"
 
@@ -462,7 +492,11 @@ DESCRIPTORS_ROOT="$REPO_ROOT/$RESULT_FOLDER/descriptors"
 mkdir -p "$DESCRIPTORS_ROOT"
 
 if [[ "$USE_EXISTING_STRUCTURES" -eq 1 ]]; then
-    INPUT_STRUCTURES_ROOT="$REPO_ROOT/$INPUT_STRUCTURES_FOLDER"
+    if [[ "$INPUT_STRUCTURES_FOLDER" == /* ]]; then
+        INPUT_STRUCTURES_ROOT="$INPUT_STRUCTURES_FOLDER"
+    else
+        INPUT_STRUCTURES_ROOT="$REPO_ROOT/$INPUT_STRUCTURES_FOLDER"
+    fi
     STRUCTURES_ROOT="$INPUT_STRUCTURES_ROOT"
     if [[ ! -d "$INPUT_STRUCTURES_ROOT" ]]; then
         _die "input_structures_folder not found: $INPUT_STRUCTURES_ROOT"
@@ -512,11 +546,19 @@ run_structure_prediction() {
 
     export ABB3_DEVICE="$device"
     export ABB2_DEVICE="$device"
+    export FLASHABB_DEVICE="$device"
 
-    local batch_size
-    batch_size="$(read_generic_nested_optional structure_prediction batch_size 4)"
+    local batch_size _batch_default
+    # FlashABB handles larger batches efficiently; use 50 as default, 4 for ABB2/ABB3.
+    if [[ "$MODEL" == "flashabb" ]]; then
+        _batch_default=50
+    else
+        _batch_default=4
+    fi
+    batch_size="$(read_generic_nested_optional structure_prediction batch_size "$_batch_default")"
     export ABB3_BATCH_SIZE="$batch_size"
     export ABB2_BATCH_SIZE="$batch_size"
+    export FLASHABB_BATCH_SIZE="$batch_size"
 
     local skip_existing
     skip_existing="$(read_generic_nested_optional structure_prediction skip_existing false)"
@@ -528,6 +570,13 @@ run_structure_prediction() {
 
     local -a csv_paths=()
     mapfile -t csv_paths < <(structure_csvs_from_run_config)
+    # Filter out any empty lines that conda run may have emitted to stdout.
+    local -a _clean_csv_paths=()
+    local _p
+    for _p in "${csv_paths[@]}"; do
+        [[ -n "$_p" ]] && _clean_csv_paths+=("$_p")
+    done
+    csv_paths=("${_clean_csv_paths[@]}")
     if [[ ${#csv_paths[@]} -eq 0 ]]; then
         _die "No CSV datasets in run config for structure prediction: $RUN_CONFIG"
     fi
@@ -542,6 +591,8 @@ run_structure_prediction() {
 
     if [[ "$MODEL" == "abb3" ]]; then
         args=(--abb3 "${args[@]}")
+    elif [[ "$MODEL" == "flashabb" ]]; then
+        args=(--flashabb "${args[@]}")
     else
         args=(--abb2 "${args[@]}")
     fi
@@ -556,15 +607,29 @@ run_structure_prediction() {
 run_descriptor_calculation() {
     local -a structure_dirs=()
     local -a csv_paths=()
-    local struct_dir csv_path
+    local -a _job_lines=()
+    local struct_dir="" csv_path=""
+    local line _jobs_rc=0
 
-    while IFS=$'\t' read -r struct_dir csv_path; do
+    mapfile -t _job_lines < <(descriptor_jobs_from_run_config) || _jobs_rc=$?
+
+    for line in "${_job_lines[@]}"; do
+        [[ -z "$line" ]] && continue
+        if [[ "$line" != *$'\t'* ]]; then
+            _stage "  warning: ignoring non-tab line from descriptor resolver: $line"
+            continue
+        fi
+        struct_dir="${line%%$'\t'*}"
+        csv_path="${line#*$'\t'}"
         [[ -z "$struct_dir" ]] && continue
         structure_dirs+=("$struct_dir")
         csv_paths+=("$csv_path")
-    done < <(descriptor_jobs_from_run_config)
+    done
 
     if [[ ${#structure_dirs[@]} -eq 0 ]]; then
+        if [[ "$_jobs_rc" -ne 0 ]]; then
+            _die "Descriptor job resolution failed (exit $_jobs_rc). See errors above; expected structure folders under $STRUCTURES_ROOT"
+        fi
         _die "No descriptor jobs resolved from run config: $RUN_CONFIG"
     fi
 
@@ -573,20 +638,32 @@ run_descriptor_calculation() {
     fi
 
     local -a desc_extra=()
+    if [[ "$CLEANUP_INTERMEDIATES" == "True" ]]; then
+        desc_extra+=(--remove_helper_outputs)
+        _stage "  cleanup: true — dssp/propka/sasa files removed per structure after successful descriptor write"
+    fi
     if [[ "$CLEAN_EXTERNAL_OUTPUTS" -eq 1 ]]; then
         desc_extra+=(--clean-external-outputs)
         _stage "  Descriptor helper cleanup: dssp/, propka/, sasa/ removed after each dataset"
+    fi
+    if [[ -n "$DESCRIPTOR_BATCH_SIZE" && "$DESCRIPTOR_BATCH_SIZE" -gt 0 ]]; then
+        desc_extra+=(--batch-size "$DESCRIPTOR_BATCH_SIZE")
+        _stage "  descriptor_batch_size: $DESCRIPTOR_BATCH_SIZE — processing in chunks"
+    fi
+    if [[ "$RESUME_MODE" -eq 1 ]]; then
+        desc_extra+=(--skip-existing --skip-failed)
+        _stage "  resume mode — existing descriptor JSON and pipeline.log failures will be skipped"
     fi
 
     local i
     for i in "${!structure_dirs[@]}"; do
         struct_dir="${structure_dirs[$i]}"
-        csv_path="${csv_paths[$i]}"
+        csv_path="${csv_paths[$i]:-}"
         local -a desc_cmd=(
             bash "$DESCRIPTORS_SCRIPT"
             --output-dir "$DESCRIPTORS_ROOT"
         )
-        if [[ -n "$csv_path" ]]; then
+        if [[ -n "${csv_path:-}" ]]; then
             _stage "  [descriptors] $struct_dir  <-  $(basename "$csv_path")"
             desc_cmd+=(--names-from-csv "$csv_path")
         else

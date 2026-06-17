@@ -2,13 +2,9 @@ input_csvs_folder: datasets
 # exclude_datasets: ab21.csv
 split_randomly: ab21.csv,hutchinson2023enhancement_top200tm1_igg.csv,jetha2019homology_RT.csv,pdgf38.csv
 
-result_folder: propermab_abb3
+result_folder: tap
 
 # n_cpu: 4 # number of CPUs to use for descriptors calculation and AutoML, default all available
 
 predefined_descriptors:
-  folder: /storage/antibody_data/PairedStructures/FASTAb/descriptors_propermab_abb3
-  allowed_suffixes:
-    - _abb3_1_propermab
-    - _abb3_2_propermab
-    - _abb3_3_propermab
+  folder: /storage/antibody_data/PairedStructures/FASTAb/descriptors_tap

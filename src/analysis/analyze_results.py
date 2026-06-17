@@ -287,6 +287,7 @@ COL_RESULT_SPEARMAN = "Spearman"
 COL_RESULT_JACCARD_NORM = "Jaccard_norm"
 COL_RESULT_BEST_RUN = "best_Target-Selector-Model"
 COL_RESULT_BEST_FRAC = "best_selector_model_frac"
+COL_RESULT_FEATURE_USAGE = "feature_usage"
 
 _AGGREGATED_FNAME = re.compile(r"^aggregated_(.+)\.csv$", re.IGNORECASE)
 _RANDOM_SEED_SUFFIX = re.compile(r"__rs\d+$")
@@ -364,6 +365,18 @@ def _rows_for_best_pick(
     if not filtered:
         return group_rows, True
     return filtered, False
+
+
+def _n_folds_from_features_cell(features_cell: str) -> int:
+    if not features_cell or not features_cell.strip():
+        return 0
+    try:
+        data = json.loads(features_cell)
+    except json.JSONDecodeError:
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    return sum(1 for v in data.values() if isinstance(v, list))
 
 
 def _feature_fold_counts_json(features_cell: str) -> str:
@@ -594,6 +607,9 @@ def build_summary(
             row["best_spearman_features"] = _feature_fold_counts_json(
                 rs.get(COL_FEATURES, "")
             )
+            row["best_spearman_n_folds"] = _n_folds_from_features_cell(
+                str(rs.get(COL_FEATURES, "") or "")
+            )
             if univ is not None:
                 mj, me, mn = _stability_triple(
                     str(rs.get(COL_FEATURES, "") or ""),
@@ -724,9 +740,57 @@ def _variant_for_summary_row(
     return m.group(1) if m else ""
 
 
+def _split_feature_fold_percentages(
+    counts: dict[str, int],
+    n_folds: int,
+) -> dict[str, float]:
+    if n_folds < 1:
+        return {}
+    return {feat: (count / n_folds) * 100.0 for feat, count in counts.items()}
+
+
+def _aggregate_feature_usage_from_summary_rows(
+    rows: Iterable[dict[str, Any]],
+    *,
+    n_folds_default: int = 4,
+    features_col: str = "best_spearman_features",
+    n_folds_col: str = "best_spearman_n_folds",
+) -> str:
+    """Per CV-split: fold counts -> %; then mean across splits (e.g. random seeds)."""
+    per_split_pcts: list[dict[str, float]] = []
+    for r in rows:
+        counts = _parse_feature_count_dict(str(r.get(features_col, "") or ""))
+        if not counts:
+            continue
+        nf = r.get(n_folds_col)
+        if isinstance(nf, (int, float)) and int(nf) > 0:
+            n_folds = int(nf)
+        elif n_folds_default > 0:
+            n_folds = n_folds_default
+        else:
+            continue
+        per_split_pcts.append(_split_feature_fold_percentages(counts, n_folds))
+
+    if not per_split_pcts:
+        return "{}"
+
+    all_feats = {feat for split in per_split_pcts for feat in split}
+    averaged = {
+        feat: statistics.mean(split.get(feat, 0.0) for split in per_split_pcts)
+        for feat in all_feats
+    }
+    ordered = {
+        k: round(v, 2)
+        for k, v in sorted(averaged.items(), key=lambda item: (-item[1], item[0]))
+    }
+    return json.dumps(ordered, ensure_ascii=False)
+
+
 def build_results_per_target(
     summary: list[dict[str, Any]],
     variant_map: dict[tuple[str, str], str] | None = None,
+    *,
+    n_folds: int = 4,
 ) -> list[dict[str, Any]]:
     """One row per (dataset, variant, target): best model and mean metrics across seeds."""
     variant_map = variant_map or {}
@@ -776,6 +840,10 @@ def build_results_per_target(
                 )
                 if best_row
                 else "",
+                COL_RESULT_FEATURE_USAGE: _aggregate_feature_usage_from_summary_rows(
+                    group,
+                    n_folds_default=n_folds,
+                ),
             }
         )
     return out
@@ -802,6 +870,7 @@ def write_results_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         COL_RESULT_JACCARD_NORM,
         COL_RESULT_BEST_RUN,
         COL_RESULT_BEST_FRAC,
+        COL_RESULT_FEATURE_USAGE,
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -821,6 +890,7 @@ def write_results_csv(path: Path, rows: list[dict[str, Any]]) -> None:
                     ),
                     COL_RESULT_BEST_RUN: r.get(COL_RESULT_BEST_RUN, ""),
                     COL_RESULT_BEST_FRAC: r.get(COL_RESULT_BEST_FRAC, ""),
+                    COL_RESULT_FEATURE_USAGE: r.get(COL_RESULT_FEATURE_USAGE, "{}"),
                 }
             )
 
@@ -839,6 +909,7 @@ def run_best_metrics_from_aggregated(
     eval_model: str | None = None,
     no_gpr: bool = False,
     best_across_tracks: bool = False,
+    n_folds: int = 4,
 ) -> tuple[Path, Path]:
     paths = _expand_paths([str(x) for x in inputs])
     if not paths:
@@ -979,7 +1050,9 @@ def run_best_metrics_from_aggregated(
     if results_out is None:
         results_out = summary_out.parent / "results.csv"
     variant_map = build_aggregated_variant_map(paths, rows)
-    result_rows = build_results_per_target(summary, variant_map=variant_map)
+    result_rows = build_results_per_target(
+        summary, variant_map=variant_map, n_folds=n_folds
+    )
     write_results_csv(results_out, result_rows)
     print(
         f"Wrote {len(result_rows)} per-target result rows to {results_out}",
@@ -1521,6 +1594,7 @@ def main() -> None:
         default="results.csv",
         help=(
             "Per-target best-model table (dataset × variant × target; "
+            "includes feature_usage (%% of folds selected, averaged across random seeds; "
             "default: results.csv)."
         ),
     )
@@ -1716,6 +1790,7 @@ def main() -> None:
         eval_model=args.eval_model,
         no_gpr=bool(args.no_gpr),
         best_across_tracks=bool(args.best_across_tracks),
+        n_folds=args.n_folds,
     )
 
     if not args.skip_feature_usage and not args.aggregate_our_glob:

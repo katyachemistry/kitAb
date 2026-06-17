@@ -165,7 +165,8 @@ def _get(d: dict, *names: str, default=None):
     return default
 
 
-def _phase1_cache_ok(jobs_file: Path) -> bool:
+def _phase1_jobs_valid(jobs_file: Path) -> bool:
+    """Return True if jobs_file exists, is non-empty, and all fold dirs/parquets are present."""
     if not jobs_file.is_file() or jobs_file.stat().st_size == 0:
         return False
     text = jobs_file.read_text()
@@ -190,6 +191,12 @@ def _phase1_cache_ok(jobs_file: Path) -> bool:
         if not (fold_dir / f"fold_{k}_test.parquet").is_file():
             return False
     return True
+
+
+def _phase1_cache_ok(jobs_file: Path) -> bool:
+    # Cache disabled: always re-run phase 1 so descriptor/feature changes are
+    # picked up without manual cache busting.
+    return False
 
 
 def _resolve_path(p: str | Path) -> Path:
@@ -1387,7 +1394,7 @@ def main() -> None:
                     print(f"prepare_run.py failed (see {log_path})", file=sys.stderr)
                     sys.exit(r.returncode)
 
-        if not _phase1_cache_ok(jobs_file):
+        if not _phase1_jobs_valid(jobs_file):
             print(f"Invalid or empty jobs file after phase 1: {jobs_file}", file=sys.stderr)
             sys.exit(1)
         _n_job_lines = sum(

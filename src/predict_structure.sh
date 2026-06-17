@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Predict structures from CSVs (name, heavy, light); output structures/<stem>_abb3_<n> or _abb2_<n>.
-# Usage: predict_structure.sh [--abb3|--abb2] [--data-dir DIR] [--output-root DIR] [--runs N]
+# Predict structures from CSVs (name, heavy, light); output structures/<stem>_abb3_<n>, _abb2_<n>, or _flashabb_<n>.
+# Usage: predict_structure.sh [--abb3|--abb2|--flashabb] [--data-dir DIR] [--output-root DIR] [--runs N]
 #   [--skip-existing] [--no-renumber] [--no-minimize] [--minimize-jobs N]
 #   [--renumber-only|--minimization-only] [--structures-dir DIR] [--allow-partial-domain]
 
@@ -20,26 +20,39 @@ if [[ -f "$REPO_ROOT/fastab.local.env" ]]; then
 fi
 FASTAB_ENV_ABB2="${FASTAB_ENV_ABB2:-fastab-abb2}"
 FASTAB_ENV_ABB3="${FASTAB_ENV_ABB3:-fastab-abb3}"
+FASTAB_ENV_FLASHABB="${FASTAB_ENV_FLASHABB:-fastab-flashabb}"
 ABB3_PYTHON_BIN="$("$CONDA_RUN_BIN" run -n "$FASTAB_ENV_ABB3" python -c 'import sys; print(sys.executable)')"
 ABB2_PYTHON_BIN="$("$CONDA_RUN_BIN" run -n "$FASTAB_ENV_ABB2" python -c 'import sys; print(sys.executable)')"
+# FlashABB env resolution is fault-tolerant: if the env is absent and --flashabb is not
+# passed, the script continues. The binary is checked only when backend=flashabb.
+FLASHABB_PYTHON_BIN="$("$CONDA_RUN_BIN" run -n "$FASTAB_ENV_FLASHABB" python -c 'import sys; print(sys.executable)' 2>/dev/null || echo "")"
 ABB2_ENV_BIN_DIR="$(dirname -- "$ABB2_PYTHON_BIN")"
 export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
 FASTAB_ENV_ABB2="${FASTAB_ENV_ABB2:-fastab-abb2}"
 FASTAB_ENV_ABB3="${FASTAB_ENV_ABB3:-fastab-abb3}"
+FASTAB_ENV_FLASHABB="${FASTAB_ENV_FLASHABB:-fastab-flashabb}"
 ABB3_DIR="${ABB3_DIR:-$REPO_ROOT/vendor/abodybuilder3}"
+FLASHABB_DIR="${FLASHABB_DIR:-$REPO_ROOT/FlashABB}"
 
 ABB3_CHECKPOINT="${ABB3_CHECKPOINT:-$ABB3_DIR/output/plddt-loss/best_second_stage.ckpt}"
 ABB3_DEVICE="${ABB3_DEVICE:-cuda:0}"
 ABB3_BATCH_SIZE="${ABB3_BATCH_SIZE:-4}"
 ABB2_DEVICE="${ABB2_DEVICE:-$ABB3_DEVICE}"
 ABB2_BATCH_SIZE="${ABB2_BATCH_SIZE:-$ABB3_BATCH_SIZE}"
+FLASHABB_DEVICE="${FLASHABB_DEVICE:-$ABB3_DEVICE}"
+FLASHABB_BATCH_SIZE="${FLASHABB_BATCH_SIZE:-50}"
 ABB3_PYTHON_CMD=("$ABB3_PYTHON_BIN")
 ABB2_PYTHON_CMD=("$ABB2_PYTHON_BIN")
+FLASHABB_PYTHON_CMD=("$FLASHABB_PYTHON_BIN")
+# Minimization always uses the Python from the backend's own env (all have openmm).
+# Defaults to ABB3; overridden to FLASHABB_PYTHON_CMD when backend is flashabb.
+MINIMIZE_PYTHON_CMD=("${ABB3_PYTHON_CMD[@]}")
 
 BACKEND=abb3
 HAVE_ABB3=0
 HAVE_ABB2=0
+HAVE_FLASHABB=0
 RUNS=1
 SKIP_EXISTING=0
 DATA_DIR_CLI=""
@@ -64,6 +77,11 @@ while [[ $# -gt 0 ]]; do
         --abb2)
             BACKEND=abb2
             HAVE_ABB2=1
+            shift
+            ;;
+        --flashabb)
+            BACKEND=flashabb
+            HAVE_FLASHABB=1
             shift
             ;;
         --runs)
@@ -153,8 +171,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$HAVE_ABB3" -eq 1 && "$HAVE_ABB2" -eq 1 ]]; then
-    echo "Use only one of --abb3 or --abb2" >&2
+if (( HAVE_ABB3 + HAVE_ABB2 + HAVE_FLASHABB > 1 )); then
+    echo "Use only one of --abb3, --abb2, or --flashabb" >&2
     exit 1
 fi
 
@@ -252,7 +270,7 @@ run_minimization() {
         skip_args=(--skip-existing)
     fi
 
-    "${ABB3_PYTHON_CMD[@]}" "$STRUCTURE_DIR/postprocess_structures.py" minimize \
+    "${MINIMIZE_PYTHON_CMD[@]}" "$STRUCTURE_DIR/postprocess_structures.py" minimize \
         --input-dir  "$input_dir" \
         --output-dir "$output_dir" \
         --jobs       "$MINIMIZE_JOBS" \
@@ -354,7 +372,19 @@ elif [[ ${#CSV_FILES[@]} -eq 0 ]]; then
     echo "No CSV files provided (use --data-dir or one or more --csv paths)" >&2
     exit 1
 else
-    csv_files=("${CSV_FILES[@]}")
+    for _csv_f in "${CSV_FILES[@]}"; do
+        [[ -n "$_csv_f" ]] && csv_files+=("$_csv_f")
+    done
+fi
+
+# When using FlashABB, its own env has OpenMM for minimization.
+if [[ "$BACKEND" == "flashabb" ]]; then
+    if [[ -z "$FLASHABB_PYTHON_BIN" ]]; then
+        echo "FlashABB conda env '$FASTAB_ENV_FLASHABB' not found." >&2
+        echo "Run ./install.sh (or ./install.sh --no-abb2) to create it." >&2
+        exit 1
+    fi
+    MINIMIZE_PYTHON_CMD=("${FLASHABB_PYTHON_CMD[@]}")
 fi
 
 if [[ "$BACKEND" == "abb3" ]]; then
@@ -366,6 +396,7 @@ if [[ "$BACKEND" == "abb3" ]]; then
     batch_csv_args=()
     if [[ ${#CSV_FILES[@]} -gt 0 ]]; then
         for csv_path in "${CSV_FILES[@]}"; do
+            [[ -z "$csv_path" ]] && continue
             batch_csv_args+=(--csv "$csv_path")
         done
     fi
@@ -385,10 +416,35 @@ if [[ "$BACKEND" == "abb3" ]]; then
         run_postprocess_predict_dirs abb3
     fi
 
+elif [[ "$BACKEND" == "flashabb" ]]; then
+    batch_csv_args=()
+    if [[ ${#CSV_FILES[@]} -gt 0 ]]; then
+        for csv_path in "${CSV_FILES[@]}"; do
+            [[ -z "$csv_path" ]] && continue
+            batch_csv_args+=(--csv "$csv_path")
+        done
+    fi
+
+    echo "FlashABB Python: ${FLASHABB_PYTHON_CMD[*]}"
+    FLASHABB_DIR="$FLASHABB_DIR" \
+        "${FLASHABB_PYTHON_CMD[@]}" "$STRUCTURE_DIR/run_abb_batch_from_csv.py" flashabb \
+        ${DATA_DIR:+--data-dir "$DATA_DIR"} \
+        "${batch_csv_args[@]}" \
+        --output-root "$OUT_DIR" \
+        --runs "$RUNS" \
+        --device "$FLASHABB_DEVICE" \
+        --batch-size "$FLASHABB_BATCH_SIZE" \
+        "${SKIP_ARGS[@]}"
+
+    if [[ "$RENUMBER" -eq 1 || "$MINIMIZE" -eq 1 ]]; then
+        run_postprocess_predict_dirs flashabb
+    fi
+
 else
     batch_csv_args=()
     if [[ ${#CSV_FILES[@]} -gt 0 ]]; then
         for csv_path in "${CSV_FILES[@]}"; do
+            [[ -z "$csv_path" ]] && continue
             batch_csv_args+=(--csv "$csv_path")
         done
     fi

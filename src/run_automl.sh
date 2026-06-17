@@ -42,24 +42,9 @@ _csv_to_array() {
 }
 
 _phase1_cache_ok() {
-  local jf="$1"
-  [[ -f "${jf}" ]] || return 1
-  [[ -s "${jf}" ]] || return 1
-  local line fold_dir k _ds _tg
-  while IFS= read -r line || [[ -n "${line}" ]]; do
-    [[ -z "${line}" ]] && continue
-    [[ "${line}" == *$'\t'* ]] || return 1
-    IFS=$'\t' read -r fold_dir k _ds _tg <<< "${line}"
-    [[ -n "${fold_dir:-}" ]] || return 1
-    [[ -n "${k:-}" ]] || return 1
-    [[ -n "${_ds:-}" ]] || return 1
-    [[ -n "${_tg:-}" ]] || return 1
-    [[ -d "${fold_dir}" ]] || return 1
-    [[ -f "${fold_dir}/meta.json" ]] || return 1
-    [[ -f "${fold_dir}/fold_${k}_train.parquet" ]] || return 1
-    [[ -f "${fold_dir}/fold_${k}_test.parquet" ]] || return 1
-  done < "${jf}"
-  return 0
+  # Cache disabled: always re-run phase 1 so descriptor/feature changes are
+  # picked up without manual cache busting.
+  return 1
 }
 
 _py_to_array() {
