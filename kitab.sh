@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# FASTAb pipeline: generic config -> run config -> structures -> descriptors -> AutoML -> analysis.
+# kitAb pipeline: generic config -> run config -> structures -> descriptors -> AutoML -> analysis.
 #
 # Usage:
-#   ./fastab.sh configs/scenario1.yaml
+#   ./kitab.sh configs/scenario1.yaml
 #
 # Step 1: read generic config from configs/, write run-specific config to run_configs/
 #         (one top-level block per dataset; paths under <result_folder>/).
@@ -30,20 +30,20 @@ PREDICT_SCRIPT="$SRC_DIR/predict_structure.sh"
 DESCRIPTORS_SCRIPT="$SRC_DIR/get_descriptors.sh"
 AUTOML_SCRIPT="$SRC_DIR/run_automl.sh"
 
-if [[ -f "$REPO_ROOT/fastab.local.env" ]]; then
+if [[ -f "$REPO_ROOT/kitab.local.env" ]]; then
     # shellcheck disable=SC1091
-    source "$REPO_ROOT/fastab.local.env"
+    source "$REPO_ROOT/kitab.local.env"
 fi
 
-FASTAB_ENV="${FASTAB_ENV:-fastab}"
-PY="${PY:-conda run -n ${FASTAB_ENV} python}"
+KITAB_ENV="${KITAB_ENV:-kitab}"
+PY="${PY:-conda run --no-capture-output -n ${KITAB_ENV} python}"
 
 _stage() {
-    echo "[fastab] $*" >&2
+    echo "[kitab] $*" >&2
 }
 
 _die() {
-    echo "[fastab] ERROR: $*" >&2
+    echo "[kitab] ERROR: $*" >&2
     exit 1
 }
 
@@ -69,7 +69,7 @@ usage() {
     echo "Options:"
     echo "  --no-clean-batch          Keep per-dataset JSON subdirs under <result>/automl after analysis"
     echo "  --clean-external-outputs  After descriptors, remove dssp/, propka/, and sasa/ under each dataset"
-    echo "  --resume                  Continue an interrupted run; skip existing descriptor JSON and prior pipeline.log failures"
+    echo "  --resume                  Continue an interrupted run; skip structures that already have descriptor JSON"
 }
 
 read_generic() {
@@ -243,9 +243,10 @@ for _key, block in run_config.items():
 ' "$REPO_ROOT" "$RUN_CONFIG"
 }
 
-NO_CLEAN_BATCH="${FASTAB_NO_CLEAN_BATCH:-0}"
+NO_CLEAN_BATCH="${KITAB_NO_CLEAN_BATCH:-0}"
 CLEAN_EXTERNAL_OUTPUTS=0
 RESUME_MODE=0
+GENERIC_CONFIG=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no-clean-batch)
@@ -272,17 +273,19 @@ while [[ $# -gt 0 ]]; do
             _die "Unknown option: $1 (see --help)"
             ;;
         *)
-            break
+            if [[ -n "$GENERIC_CONFIG" ]]; then
+                _die "Unexpected argument: $1 (config already set to $GENERIC_CONFIG)"
+            fi
+            GENERIC_CONFIG="$1"
+            shift
             ;;
     esac
 done
 
-if [[ $# -lt 1 ]]; then
+if [[ -z "$GENERIC_CONFIG" ]]; then
     usage >&2
     _die "Missing config YAML path"
 fi
-
-GENERIC_CONFIG="$1"
 if [[ ! -f "$GENERIC_CONFIG" ]]; then
     _die "Config not found: $GENERIC_CONFIG"
 fi
@@ -292,11 +295,16 @@ if [[ -z "$RESULT_FOLDER" ]]; then
     _die "result_folder is required in $GENERIC_CONFIG"
 fi
 RESULT_ROOT="$REPO_ROOT/$RESULT_FOLDER"
+SKIP_EXISTING_RESULTS="$(read_generic_optional skip_existing_results)"
 if [[ -d "$RESULT_ROOT" ]]; then
-    if [[ "$RESUME_MODE" -eq 0 ]]; then
+    if [[ "$RESUME_MODE" -eq 0 && "$SKIP_EXISTING_RESULTS" != "True" ]]; then
         _die "result_folder already exists: $RESULT_ROOT (remove or rename it before re-running, or use --resume to continue)"
     fi
-    _stage "Resuming into existing result_folder: $RESULT_ROOT"
+    if [[ "$SKIP_EXISTING_RESULTS" == "True" ]]; then
+        _stage "skip_existing_results: true - reusing existing result_folder: $RESULT_ROOT"
+    else
+        _stage "Resuming into existing result_folder: $RESULT_ROOT"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -305,7 +313,9 @@ fi
 
 _stage "Preparing run config from $GENERIC_CONFIG"
 _prepare_extra=()
-[[ "$RESUME_MODE" -eq 1 ]] && _prepare_extra+=(--resume)
+if [[ "$RESUME_MODE" -eq 1 || "$SKIP_EXISTING_RESULTS" == "True" ]]; then
+    _prepare_extra+=(--resume)
+fi
 RUN_CONFIG="$(run_py "$PREPARE_SCRIPT" "$GENERIC_CONFIG" --repo-root "$REPO_ROOT" "${_prepare_extra[@]}")"
 _stage "Run config: $RUN_CONFIG"
 
@@ -372,8 +382,8 @@ run_hyperparameter_tuning() {
 # Remove direct children of batch_root that contain fold-result *.json (not batch_manifest.json).
 cleanup_batch_json_subdirs() {
     local batch_root="$1"
-    if [[ "${NO_CLEAN_BATCH:-${FASTAB_NO_CLEAN_BATCH:-0}}" == "1" ]]; then
-        _stage "Skipping AutoML batch JSON subdir cleanup (--no-clean-batch / FASTAB_NO_CLEAN_BATCH=1)"
+    if [[ "${NO_CLEAN_BATCH:-${KITAB_NO_CLEAN_BATCH:-0}}" == "1" ]]; then
+        _stage "Skipping AutoML batch JSON subdir cleanup (--no-clean-batch / KITAB_NO_CLEAN_BATCH=1)"
         return 0
     fi
     if [[ ! -d "$batch_root" ]]; then
@@ -651,8 +661,8 @@ run_descriptor_calculation() {
         _stage "  descriptor_batch_size: $DESCRIPTOR_BATCH_SIZE — processing in chunks"
     fi
     if [[ "$RESUME_MODE" -eq 1 ]]; then
-        desc_extra+=(--skip-existing --skip-failed)
-        _stage "  resume mode — existing descriptor JSON and pipeline.log failures will be skipped"
+        desc_extra+=(--skip-existing)
+        _stage "  resume mode — structures with existing descriptor JSON will be skipped"
     fi
 
     local i

@@ -6,29 +6,29 @@
 
 **kitAb: lightweight molecular descriptors and AutoML integrated framework for rapid antibody developability assessment**
 
-kitAb combines structure-based developability descriptors with automated machine learning for antibody developability prediction. Pipelines are driven by YAML config files; run them with `bash fastab.sh <config>` (entry-point scripts and conda env names still use the legacy `fastab` prefix and will be renamed in a later release).
+kitAb combines structure-based developability descriptors with automated machine learning for antibody developability prediction. Pipelines are driven by YAML config files; run them with `bash kitab.sh <config>` (entry-point scripts and conda env names still use the legacy `kitab` prefix and will be renamed in a later release).
 
 ## Installation
 
 From the repo root (requires **mamba** or **conda**, **git**, **wget** or **curl**):
 
 ```bash
-./install.sh                    # fastab + abb2 + abb3 + flashabb (default)
-./install.sh --fastab-only      # fastab env only (descriptors / AutoML)
-./install.sh --no-abb2          # fastab + abb3 + flashabb (skip abb2 / ImmuneBuilder)
-./install.sh --no-flashabb      # fastab + abb2 + abb3 (skip FlashABB)
-source fastab.local.env
+./install.sh                    # kitab + abb2 + abb3 + flashabb (default)
+./install.sh --kitab-only      # kitab env only (descriptors / AutoML)
+./install.sh --no-abb2          # kitab + abb3 + flashabb (skip abb2 / ImmuneBuilder)
+./install.sh --no-flashabb      # kitab + abb2 + abb3 (skip FlashABB)
+source kitab.local.env
 ```
 
-The `fastab` env includes [MMseqs2](https://github.com/soedinglab/mmseqs2) (`mmseqs` on PATH via the `mmseqs2` bioconda package) for automatic sequence-identity cross-validation splits.
+The `kitab` env includes [MMseqs2](https://github.com/soedinglab/mmseqs2) (`mmseqs` on PATH via the `mmseqs2` bioconda package) for automatic sequence-identity cross-validation splits.
 
 Optional structure backends (installed by default unless skipped):
 
 | Backend | Conda env | Use case |
 |---------|-----------|----------|
-| ABB2 (ImmuneBuilder) | `fastab-abb2` | Structure prediction; IMGT renumbering and minimization |
-| ABB3 | `fastab-abb3` | Structure prediction |
-| FlashABB | `fastab-flashabb` | Fast structure prediction (see `configs/scenario1_flashabb.yaml`) |
+| ABB2 (ImmuneBuilder) | `kitab-abb2` | Structure prediction; IMGT renumbering and minimization |
+| ABB3 | `kitab-abb3` | Structure prediction |
+| FlashABB | `kitab-flashabb` | Fast structure prediction (see `configs/scenario1_flashabb.yaml`) |
 
 ## Scenario 1: Sequences, assay measurements, and optional external features → descriptors and predictions
 
@@ -63,7 +63,7 @@ structure_prediction:
 Try the example:
 
 ```bash
-bash fastab.sh configs/scenario1.yaml
+bash kitab.sh configs/scenario1.yaml
 ```
 
 Default AutoML hyperparameters are used. To customize them, edit **src/automl.yaml** (or set `automl_config:` in your run config).
@@ -122,7 +122,7 @@ kitAb/
 
 Configure parent folder names in the YAML (`input_csvs_folder` and `input_structures_folder`). Subfolder and file names must match dataset stems and antibody `name` values.
 
-Another important block is `structures_processing`. If your structures are not IMGT-numbered, set **`renumber_imgt: true`** (requires the `fastab-abb2` env). To energy-minimize structures, set **`minimize: true`** (also requires `fastab-abb2`):
+Another important block is `structures_processing`. If your structures are not IMGT-numbered, set **`renumber_imgt: true`** (requires the `kitab-abb2` env). To energy-minimize structures, set **`minimize: true`** (also requires `kitab-abb2`):
 
 ```yaml
 structures_processing:
@@ -171,20 +171,27 @@ Optional `structures_processing` (`renumber_imgt` / `minimize`) runs in place be
 For large batches, set `cleanup: true` to delete per-structure intermediate dirs (`dssp/`, `propka/`, `sasa/`) after each JSON is written, and optionally `descriptor_batch_size` (e.g. `10000`) to process structures in chunks and bound peak disk and memory use.
 
 ```bash
-bash fastab.sh configs/scenario2a.yaml
+bash kitab.sh configs/scenario2a.yaml
 ```
 
 ---
 
-## Scenario 3: Descriptors only, no AutoML predictions
+## Scenario 3: Structure prediction + descriptors, no AutoML
 
-Depending on whether you have structures or not, prepare input and configure the relevant fields (see scenarios 1 and 2). Example for the no-structures case: **configs/scenario3.yaml**.
+Use this when you want generated structures and developability descriptors but not modeling. Take **scenario 1** or **scenario 2** as a template and add `automl: false`, or use one of the ready-made configs:
 
-This scenario differs only by disabling AutoML:
+| Config | What it does |
+|--------|----------------|
+| **configs/scenario3.yaml** | Predict structures (ABB3) + descriptors |
+| **configs/scenario1_no_automl.yaml** | Same as scenario 1 (ABB2 example data) + descriptors |
+| **configs/scenario1_flashabb_no_automl.yaml** | FlashABB prediction + descriptors |
+| **configs/scenario2_no_automl.yaml** | Existing structures + descriptors (scenario 2, no prediction) |
 
 ```yaml
 automl: false
 ```
+
+Outputs land under `{result_folder}/structures/` and `{result_folder}/descriptors/`; AutoML and analysis steps are skipped.
 
 ---
 
@@ -210,5 +217,5 @@ predefined_descriptors:
 ```
 
 ```bash
-bash fastab.sh configs/scenario4.yaml
+bash kitab.sh configs/scenario4.yaml
 ```

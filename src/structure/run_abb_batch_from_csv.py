@@ -101,7 +101,7 @@ def _ensure_lightning_pytorch() -> None:
         raise SystemExit(
             "PyTorch Lightning is missing from this env. ABB3 needs the 'lightning' "
             "package, not only 'pytorch-lightning'. Repair with: "
-            "conda run -n fastab-abb3 python -m pip install 'lightning==2.1.2'"
+            "conda run -n kitab-abb3 python -m pip install 'lightning==2.1.2'"
         ) from exc
     import types
 

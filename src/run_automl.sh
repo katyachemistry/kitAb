@@ -63,13 +63,13 @@ for part in shlex.split(sys.argv[1]):
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-if [[ -f "${REPO_ROOT}/fastab.local.env" ]]; then
+if [[ -f "${REPO_ROOT}/kitab.local.env" ]]; then
   # shellcheck disable=SC1091
-  source "${REPO_ROOT}/fastab.local.env"
+  source "${REPO_ROOT}/kitab.local.env"
 fi
 
-FASTAB_ENV="${FASTAB_ENV:-fastab}"
-DEFAULT_PY="conda run -n ${FASTAB_ENV} python"
+KITAB_ENV="${KITAB_ENV:-kitab}"
+DEFAULT_PY="conda run --no-capture-output -n ${KITAB_ENV} python"
 
 if [[ "${1:-}" == "--config" ]]; then
   shift

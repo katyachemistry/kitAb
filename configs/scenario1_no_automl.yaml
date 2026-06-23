@@ -1,0 +1,16 @@
+# Scenario 1 without AutoML: predict structures + calculate descriptors only.
+# Same inputs as scenario1.yaml; set automl: false to skip modeling and analysis.
+input_csvs_folder: data_thera
+
+result_folder: our_thera_abb2
+
+structure_prediction:
+  model: abb2 # abb2 | abb3 | flashabb
+  device: 1 # GPU index (0, 1, …) or cuda:0 / cpu
+  runs: 1 # number of runs for structure prediction, default 1
+  skip_existing: true # skip antibodies whose .pdb already exists (safe for pipeline restarts)
+  # batch_size: 4 # ABB3 mini-batch size (antibodies per forward pass); default 4; ignored by ABB2
+
+automl: false
+
+# n_cpu: 4 # number of CPUs to use for descriptors calculation, default all available

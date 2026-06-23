@@ -1,0 +1,18 @@
+# Scenario 1 (FlashABB) without AutoML: predict structures + calculate descriptors only.
+input_csvs_folder: datasets
+# Use datasets_example for a quick test; switch to datasets for the full run.
+
+split_randomly: ab21.csv,hutchinson2023enhancement_top200tm1_igg.csv,jetha2019homology_RT.csv,pdgf38.csv
+
+result_folder: flashabb_no_automl
+
+structure_prediction:
+  model: flashabb
+  device: 1 # GPU index (0, 1, …) or cuda:0 / cpu
+  runs: 3 # number of runs; FlashABB is stochastic so multiple runs assess reproducibility
+  skip_existing: true # skip antibodies whose .pdb already exists (safe for pipeline restarts)
+  # batch_size: 50 # FlashABB default batch size is 50; increase if VRAM allows
+
+automl: false
+
+# n_cpu: 4 # number of CPUs to use for descriptors calculation, default all available

@@ -1,4 +1,4 @@
-# FASTAb unified descriptor environment
+# kitAb unified descriptor environment
 # --------------------------------------
 # Covers: developability (calculate_descriptors), utils parsers, and automl under src/
 # (excluding structure prediction ABB2/ABB3 and OpenMM minimization — separate envs later).
@@ -12,7 +12,7 @@
 #
 # Create (mamba recommended):
 #   ./install.sh
-#   mamba activate fastab
+#   mamba activate kitab
 #
 # Verify:
 #   python scripts/compare_dssp_binaries.py
@@ -20,7 +20,7 @@
 #
 # Versions pinned from the existing `developability` conda env (2026-05).
 
-name: fastab
+name: kitab
 
 channels:
   - conda-forge

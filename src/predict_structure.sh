@@ -6,7 +6,7 @@
 
 set -euo pipefail
 
-# tmux keeps env vars from when the tmux *server* was first started. Older FASTAb
+# tmux keeps env vars from when the tmux *server* was first started. Older kitAb
 # setups exported PYTHON="conda run python", which breaks conda run even in new sessions.
 unset PYTHON ABB3_PYTHON 2>/dev/null || true
 CONDA_RUN_BIN="${CONDA_EXE:-$(type -P conda || true)}"
@@ -14,24 +14,24 @@ CONDA_RUN_BIN="${CONDA_RUN_BIN:-conda}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-if [[ -f "$REPO_ROOT/fastab.local.env" ]]; then
+if [[ -f "$REPO_ROOT/kitab.local.env" ]]; then
     # shellcheck disable=SC1091
-    source "$REPO_ROOT/fastab.local.env"
+    source "$REPO_ROOT/kitab.local.env"
 fi
-FASTAB_ENV_ABB2="${FASTAB_ENV_ABB2:-fastab-abb2}"
-FASTAB_ENV_ABB3="${FASTAB_ENV_ABB3:-fastab-abb3}"
-FASTAB_ENV_FLASHABB="${FASTAB_ENV_FLASHABB:-fastab-flashabb}"
-ABB3_PYTHON_BIN="$("$CONDA_RUN_BIN" run -n "$FASTAB_ENV_ABB3" python -c 'import sys; print(sys.executable)')"
-ABB2_PYTHON_BIN="$("$CONDA_RUN_BIN" run -n "$FASTAB_ENV_ABB2" python -c 'import sys; print(sys.executable)')"
+KITAB_ENV_ABB2="${KITAB_ENV_ABB2:-kitab-abb2}"
+KITAB_ENV_ABB3="${KITAB_ENV_ABB3:-kitab-abb3}"
+KITAB_ENV_FLASHABB="${KITAB_ENV_FLASHABB:-kitab-flashabb}"
+ABB3_PYTHON_BIN="$("$CONDA_RUN_BIN" run -n "$KITAB_ENV_ABB3" python -c 'import sys; print(sys.executable)')"
+ABB2_PYTHON_BIN="$("$CONDA_RUN_BIN" run -n "$KITAB_ENV_ABB2" python -c 'import sys; print(sys.executable)')"
 # FlashABB env resolution is fault-tolerant: if the env is absent and --flashabb is not
 # passed, the script continues. The binary is checked only when backend=flashabb.
-FLASHABB_PYTHON_BIN="$("$CONDA_RUN_BIN" run -n "$FASTAB_ENV_FLASHABB" python -c 'import sys; print(sys.executable)' 2>/dev/null || echo "")"
+FLASHABB_PYTHON_BIN="$("$CONDA_RUN_BIN" run -n "$KITAB_ENV_FLASHABB" python -c 'import sys; print(sys.executable)' 2>/dev/null || echo "")"
 ABB2_ENV_BIN_DIR="$(dirname -- "$ABB2_PYTHON_BIN")"
 export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
-FASTAB_ENV_ABB2="${FASTAB_ENV_ABB2:-fastab-abb2}"
-FASTAB_ENV_ABB3="${FASTAB_ENV_ABB3:-fastab-abb3}"
-FASTAB_ENV_FLASHABB="${FASTAB_ENV_FLASHABB:-fastab-flashabb}"
+KITAB_ENV_ABB2="${KITAB_ENV_ABB2:-kitab-abb2}"
+KITAB_ENV_ABB3="${KITAB_ENV_ABB3:-kitab-abb3}"
+KITAB_ENV_FLASHABB="${KITAB_ENV_FLASHABB:-kitab-flashabb}"
 ABB3_DIR="${ABB3_DIR:-$REPO_ROOT/vendor/abodybuilder3}"
 FLASHABB_DIR="${FLASHABB_DIR:-$REPO_ROOT/FlashABB}"
 
@@ -380,7 +380,7 @@ fi
 # When using FlashABB, its own env has OpenMM for minimization.
 if [[ "$BACKEND" == "flashabb" ]]; then
     if [[ -z "$FLASHABB_PYTHON_BIN" ]]; then
-        echo "FlashABB conda env '$FASTAB_ENV_FLASHABB' not found." >&2
+        echo "FlashABB conda env '$KITAB_ENV_FLASHABB' not found." >&2
         echo "Run ./install.sh (or ./install.sh --no-abb2) to create it." >&2
         exit 1
     fi
@@ -449,7 +449,8 @@ else
         done
     fi
 
-    "${ABB2_PYTHON_CMD[@]}" "$STRUCTURE_DIR/run_abb_batch_from_csv.py" abb2 \
+    PATH="$ABB2_ENV_BIN_DIR:${PATH}" \
+        "${ABB2_PYTHON_CMD[@]}" "$STRUCTURE_DIR/run_abb_batch_from_csv.py" abb2 \
         ${DATA_DIR:+--data-dir "$DATA_DIR"} \
         "${batch_csv_args[@]}" \
         --output-root "$OUT_DIR" \

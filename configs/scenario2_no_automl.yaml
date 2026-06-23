@@ -1,0 +1,15 @@
+# Scenario 2 without AutoML: use existing structures + calculate descriptors only.
+input_csvs_folder: datasets
+split_randomly: ab21.csv,hutchinson2023enhancement_top200tm1_igg.csv,jetha2019homology_RT.csv,pdgf38.csv
+
+input_structures_folder: structures_flashabb
+
+result_folder: our_flashabb_no_automl
+
+automl: false
+
+# n_cpu: 4 # number of CPUs to use for descriptors calculation, default all available
+
+structures_processing:
+  renumber_imgt: False
+  minimize: False

@@ -7,4 +7,4 @@ result_folder: tap_again
 # n_cpu: 4 # number of CPUs to use for descriptors calculation and AutoML, default all available
 
 predefined_descriptors:
-  folder: /storage/antibody_data/PairedStructures/FASTAb/descriptors_tap
+  folder: /storage/antibody_data/PairedStructures/kitAb/descriptors_tap

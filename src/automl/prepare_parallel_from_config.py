@@ -40,6 +40,7 @@ _ALLOWED_FLOATING_SFS_MODELS = frozenset({"elasticnet", "randomforest", "svm", "
 _PIPELINE_ROOT_KEYS = ("pipeline", "defaults", "shared", "global", "fit_settings")
 _AUTOML_CONFIG_KEYS = ("automl_config", "automl-config", "automl")
 _DEFAULT_AUTOML_CONFIG = _REPO_ROOT / "src" / "automl.yaml"
+_MASTER_OUTPUT_JSON_COL_IDX = 8
 
 _PIPELINE_NON_TRACK_KEYS: frozenset[str] = frozenset({
     "random_state", "random-state", "random_seeds", "random-seeds",
@@ -208,6 +209,51 @@ def _resolve_path(p: str | Path) -> Path:
 
 def _tab_tok(s: str) -> str:
     return str(s).replace("\t", " ").replace("\n", " ").replace("\r", "")
+
+
+def _as_bool(raw: object, *, default: bool = False) -> bool:
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    text = str(raw).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", ""}:
+        return False
+    return default
+
+
+def _result_json_complete(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and bool(payload)
+
+
+def _pending_rows_after_skip_existing(rows: list[str]) -> tuple[list[str], int]:
+    pending: list[str] = []
+    skipped = 0
+    for row in rows:
+        parts = row.split("\t")
+        if len(parts) <= _MASTER_OUTPUT_JSON_COL_IDX:
+            pending.append(row)
+            continue
+        out_json_raw = parts[_MASTER_OUTPUT_JSON_COL_IDX].strip()
+        if not out_json_raw:
+            pending.append(row)
+            continue
+        out_json = Path(out_json_raw)
+        if _result_json_complete(out_json):
+            skipped += 1
+            continue
+        pending.append(row)
+    return pending, skipped
 
 
 def _slug(s: str) -> str:
@@ -796,6 +842,7 @@ def _parse_dataset_records(root: dict, pipeline: dict | None) -> list[dict]:
         dev_feat_groups_by_target = _parse_developability_feature_groups_by_target(
             block, target_cols, yaml_key=yaml_key
         )
+        include_features = _parse_include_features(block)
 
         n_splits = int(_get(block, "n_splits", "n-splits", default=5) or 5)
         if shared is not None:
@@ -882,6 +929,7 @@ def _parse_dataset_records(root: dict, pipeline: dict | None) -> list[dict]:
                     "targets_csv": targets_csv,
                     "features_csv": features_csv,
                     "developability_feature_groups_by_target": dev_feat_groups_by_target,
+                    "include_features": include_features,
                     "run_dir": run_dir_p,
                     "jobs_file": run_dir_p / "parallel_jobs.txt",
                     "n_splits": n_splits,
@@ -944,6 +992,11 @@ def _parse_developability_feature_groups(block: dict) -> list[str]:
         "developability_feature_groups",
         "developability-feature-groups",
     )
+    return _parse_developability_groups_value(raw)
+
+
+def _parse_include_features(block: dict) -> list[str]:
+    raw = _get(block, "include_features", "include-features")
     return _parse_developability_groups_value(raw)
 
 
@@ -1025,6 +1078,7 @@ def _prepare_key(d: dict) -> tuple:
         d["targets_csv"],
         d["features_csv"],
         grp_items,
+        tuple(d.get("include_features") or ()),
         d["run_dir"],
         n_splits_key,
         d["random_state"],
@@ -1229,6 +1283,10 @@ def main() -> None:
         print("YAML root must be a mapping", file=sys.stderr)
         sys.exit(1)
 
+    skip_existing_results = _as_bool(
+        raw.pop("skip_existing_results", raw.pop("skip-existing-results", False))
+    )
+
     yaml_parallel = raw.pop("parallel_jobs", None)
     yaml_parallel = raw.pop("parallel-jobs", yaml_parallel)
     yaml_py = raw.pop("py", None)
@@ -1259,7 +1317,7 @@ def main() -> None:
         except Exception:
             parallel_jobs = "4"
 
-    py_invocation = args.py if args.py is not None else (yaml_py or "conda run -n developability python")
+    py_invocation = args.py if args.py is not None else (yaml_py or "conda run --no-capture-output -n developability python")
     py_parts = shlex.split(py_invocation)
 
     datasets = _parse_dataset_records(raw, pipeline_cfg)
@@ -1290,6 +1348,7 @@ def main() -> None:
             targets_csv,
             features_csv,
             dev_groups_by_target_items,
+            include_features_key,
             run_dir,
             _n_splits_cache_key,
             random_state,
@@ -1303,6 +1362,7 @@ def main() -> None:
         )
         target_cols, feature_cols = _targets_features_as_lists(targets_csv, features_csv)
         dev_groups_by_target = {str(t): list(v) for t, v in dev_groups_by_target_items}
+        include_features = list(include_features_key)
         jobs_file: Path = group[0]["jobs_file"]
         yaml_n_splits = int(group[0]["n_splits"])
 
@@ -1368,6 +1428,8 @@ def main() -> None:
                     prep_cmd.extend(
                         ["--developability-feature-groups", *list(bucket_groups)]
                     )
+                if include_features:
+                    prep_cmd.extend(["--include-features", *include_features])
                 sc = group[0].get("split_col")
                 if sc:
                     prep_cmd.extend(["--split-col", str(sc)])
@@ -1435,6 +1497,7 @@ def main() -> None:
                 "developability_feature_groups_by_target": drec.get(
                     "developability_feature_groups_by_target", {}
                 ),
+                "include_features": list(drec.get("include_features") or []),
                 "split_col": drec.get("split_col"),
             }
         )
@@ -1468,6 +1531,7 @@ def main() -> None:
             "pipeline_track_name",
         ],
         "job_line_count": len(master_rows),
+        "skip_existing_results": skip_existing_results,
         "parallel_jobs": parallel_jobs,
         "py_invocation": py_invocation,
         "datasets": manifest_datasets,
@@ -1531,12 +1595,44 @@ def main() -> None:
                 file=sys.stderr,
             )
             continue
+        chunk_lines_to_run = chunk_lines
+        if skip_existing_results:
+            chunk_lines_to_run, skipped_existing = _pending_rows_after_skip_existing(chunk_lines)
+            print(
+                f"[batch] {drec['yaml_key']}: skip_existing_results=true "
+                f"(existing complete JSONs skipped: {skipped_existing}/{len(chunk_lines)}; "
+                f"pending: {len(chunk_lines_to_run)})",
+                file=sys.stderr,
+                flush=True,
+            )
+            if not chunk_lines_to_run:
+                if not args.no_aggregate:
+                    agg_one = [
+                        *py_parts,
+                        str(_REPO_ROOT / "src/automl/aggregate_batch_results.py"),
+                        "--manifest",
+                        str(manifest_path),
+                        "--only-dataset-yaml-key",
+                        str(drec["yaml_key"]),
+                        "--no-plots",
+                    ]
+                    print(
+                        f"[batch] Aggregating results for {drec['yaml_key']} (no pending jobs) …",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    r_agg = subprocess.run(agg_one, cwd=_REPO_ROOT)
+                    if r_agg.returncode != 0:
+                        sys.exit(r_agg.returncode)
+                continue
         chunk_path = batch_root / f"_parallel_chunk_{idx:04d}_{_slug(drec['yaml_key'])}.tsv"
-        chunk_path.write_text("\n".join(chunk_lines) + ("\n" if chunk_lines else ""))
+        chunk_path.write_text(
+            "\n".join(chunk_lines_to_run) + ("\n" if chunk_lines_to_run else "")
+        )
         chunk_paths.append(chunk_path)
         par_run = [*par_cmd_base, str(chunk_path)]
         print(
-            f"[batch] Parallel {len(chunk_lines)} job(s): {drec['yaml_key']} …",
+            f"[batch] Parallel {len(chunk_lines_to_run)} job(s): {drec['yaml_key']} …",
             file=sys.stderr,
             flush=True,
         )

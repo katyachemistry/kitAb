@@ -7,7 +7,7 @@ result_folder: propermab_flashabb_NO_PATCH_FEATURES
 # n_cpu: 4 # number of CPUs to use for descriptors calculation and AutoML, default all available
 
 predefined_descriptors:
-  folder: /storage/antibody_data/PairedStructures/FASTAb/descriptors_propermab_flashabb_NO_PATCH_FEATURES
+  folder: /storage/antibody_data/PairedStructures/kitAb/descriptors_propermab_flashabb_NO_PATCH_FEATURES
   allowed_suffixes:
     - _flashabb_1_propermab
     - _flashabb_2_propermab

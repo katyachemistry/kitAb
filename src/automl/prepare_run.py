@@ -423,6 +423,64 @@ def _filter_developability_columns_by_groups(
     return out
 
 
+def _filter_developability_columns_by_include_features(
+    columns: list[str],
+    include_features: list[str],
+    *,
+    developability_is_json_dir: bool,
+    context: str,
+) -> list[str]:
+    requested = [str(f).strip() for f in include_features if str(f).strip()]
+    if not requested:
+        return list(columns)
+    if not developability_is_json_dir:
+        warnings.warn(
+            f"{context}: include_features is ignored for features.csv developability sources "
+            "(the filter only applies to calculated descriptor JSON columns).",
+            UserWarning,
+            stacklevel=2,
+        )
+        return list(columns)
+
+    available = list(columns)
+    available_set = set(available)
+
+    def _leaf_name(col: str) -> str:
+        for group in _KNOWN_DEVELOPABILITY_JSON_GROUPS:
+            prefix = f"{group}_"
+            if col.startswith(prefix):
+                return col[len(prefix):]
+        return col
+
+    selected: list[str] = []
+    missing: list[str] = []
+    ambiguous: dict[str, list[str]] = {}
+    for raw in requested:
+        if raw in available_set:
+            selected.append(raw)
+            continue
+        matches = [col for col in available if _leaf_name(col) == raw]
+        if len(matches) == 1:
+            selected.append(matches[0])
+        elif len(matches) > 1:
+            ambiguous[raw] = matches
+        else:
+            missing.append(raw)
+
+    if missing or ambiguous:
+        details: list[str] = []
+        if missing:
+            details.append(f"missing={missing!r}")
+        if ambiguous:
+            details.append(f"ambiguous={ambiguous!r}")
+        raise ValueError(
+            f"{context}: include_features did not resolve cleanly against calculated "
+            f"descriptor columns ({'; '.join(details)}). Use exact flattened column names "
+            "such as 'surface_pos_patch' when a leaf name is ambiguous."
+        )
+    return list(dict.fromkeys(selected))
+
+
 def load_merge_and_expand(
     dataset_path: Path,
     *,
@@ -431,6 +489,7 @@ def load_merge_and_expand(
     target_cols: list[str],
     developability_sources: list[Path],
     developability_feature_groups: list[str] | None = None,
+    include_features: list[str] | None = None,
     split_col: str | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     path = Path(dataset_path)
@@ -457,6 +516,7 @@ def load_merge_and_expand(
         if developability_feature_groups is not None
         else []
     )
+    include_dev_features = list(include_features) if include_features is not None else []
     dev_sources = [Path(p) for p in developability_sources]
     if not dev_sources:
         raise ValueError("At least one developability source path is required.")
@@ -517,6 +577,12 @@ def load_merge_and_expand(
         dev_cols_one = _filter_developability_columns_by_groups(
             dev_candidates,
             dev_groups,
+            developability_is_json_dir=(src_kind == "json"),
+            context=f"load_merge_and_expand ({src})",
+        )
+        dev_cols_one = _filter_developability_columns_by_include_features(
+            dev_cols_one,
+            include_dev_features,
             developability_is_json_dir=(src_kind == "json"),
             context=f"load_merge_and_expand ({src})",
         )
@@ -836,6 +902,18 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--include-features",
+        nargs="*",
+        default=None,
+        metavar="COL",
+        help=(
+            "Optional calculated descriptor columns to include from JSON developability "
+            "sources. Experimental CSV feature columns from --feature-cols are still kept. "
+            "Use flattened names such as surface_pos_patch; unqualified leaf names are "
+            "accepted only when they match one descriptor column."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         required=True,
@@ -933,6 +1011,7 @@ def main() -> None:
         if args.developability_feature_groups is None
         else list(args.developability_feature_groups)
     )
+    inc = None if args.include_features is None else list(args.include_features)
     try:
         merged, expanded_feature_cols = load_merge_and_expand(
             args.dataset_path,
@@ -941,6 +1020,7 @@ def main() -> None:
             target_cols=args.target_cols,
             developability_sources=dev_sources,
             developability_feature_groups=dfg,
+            include_features=inc,
             split_col=split_col,
         )
     except (FileNotFoundError, ValueError) as e:

@@ -1,4 +1,4 @@
-# FASTAb ABodyBuilder2 + post-processing (ImmuneBuilder, ANARCI, OpenMM).
+# kitAb ABodyBuilder2 + post-processing (ImmuneBuilder, ANARCI, OpenMM).
 # PyTorch + ImmuneBuilder are installed by install.sh (CUDA wheel index is machine-specific).
 #
 #   mamba env create -f environment-abb2.yml

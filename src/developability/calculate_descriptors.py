@@ -36,10 +36,6 @@ from developability.descriptors import (
     compute_inter_chain_buried_sasa,
     asymmetry_score_from_pka,
 )
-from developability.descriptors import (
-    count_motif_overlapping,
-    get_full_sequence_with_index_map_from_pdb,
-)
 from utils.chemistry import (
     AROMATIC_RESIDUES,
     EXPOSURE_REL_ASA_THRESHOLD,
@@ -61,6 +57,8 @@ from developability.descriptor_utils import (
 from developability.descriptors import (
     sum_residue_mean_local_planarity,
     mean_residue_planarity_over_residues,
+    get_full_sequence_with_index_map_from_pdb,
+    count_motif_overlapping,
 )
 from utils.parsers import residue_key_from_atom
 
@@ -267,6 +265,7 @@ def main():
             n_positive_cdr = sum(1 for k in cdr_keys if k in positive_charged_keys)
             n_negative_cdr = sum(1 for k in cdr_keys if k in negative_charged_keys)
             n_gln_asn_cdr = sum(1 for k in cdr_keys if k[0] in GLN_ASN_RESIDUES)
+            n_tyr_cdr = sum(1 for k in cdr_keys if k[0] == "TYR")
             inv_cdr = 1.0 / float(n_cdr)
             fraction_gly_in_cdr = n_gly_cdr * inv_cdr
             fraction_pro_in_cdr = n_pro_cdr * inv_cdr
@@ -274,6 +273,7 @@ def main():
             fraction_positive_in_cdr = n_positive_cdr * inv_cdr
             fraction_negative_in_cdr = n_negative_cdr * inv_cdr
             fraction_gln_asn_in_cdr = n_gln_asn_cdr * inv_cdr
+            fraction_tyr_in_cdr = n_tyr_cdr * inv_cdr
         else:
             (
                 fraction_gly_in_cdr,
@@ -281,8 +281,9 @@ def main():
                 fraction_aromatic_in_cdr,
                 fraction_positive_in_cdr,
                 fraction_negative_in_cdr,
-            fraction_gln_asn_in_cdr,
-        ) = (0.0,) * 6
+                fraction_gln_asn_in_cdr,
+                fraction_tyr_in_cdr,
+            ) = (0.0,) * 7
 
         def _total_side_rel_weight(k: Tuple[str, int, str, str]) -> float:
             """Relative side-chain SASA fraction [0, 1] from parse_sasa."""
@@ -666,6 +667,7 @@ def main():
                     "fraction_pos_in_cdr": fraction_positive_in_cdr,
                     "fraction_neg_in_cdr": fraction_negative_in_cdr,
                     "fraction_gln_asn_in_cdr": fraction_gln_asn_in_cdr,
+                    # "fraction_tyr_in_cdr": fraction_tyr_in_cdr,
                 },
             }
         )
@@ -682,100 +684,100 @@ def main():
                 chain_seqs_and_maps.append((ch, seq_ch, map_ch))
 
         if chain_seqs_and_maps:
-                sequence_motives = aggregated.setdefault("sequence_motives", {})
+            sequence_motives = aggregated.setdefault("sequence_motives", {})
 
-                def _contiguous_fragments_for_keyset_per_chain(
-                    key_set,
-                ) -> Dict[str, List[str]]:
-                    """Per-chain 1-letter fragments for key_set; split on index gaps."""
-                    if not key_set:
-                        return {}
-                    out: Dict[str, List[str]] = {}
-                    for ch, seq_ch, map_ch in chain_seqs_and_maps:
-                        if not seq_ch:
+            def _contiguous_fragments_for_keyset_per_chain(
+                key_set,
+            ) -> Dict[str, List[str]]:
+                """Per-chain 1-letter fragments for key_set; split on index gaps."""
+                if not key_set:
+                    return {}
+                out: Dict[str, List[str]] = {}
+                for ch, seq_ch, map_ch in chain_seqs_and_maps:
+                    if not seq_ch:
+                        continue
+                    present = [False] * len(seq_ch)
+                    any_present = False
+                    for k in key_set:
+                        idx = map_ch.get(k)
+                        if idx is not None and 0 <= idx < len(seq_ch):
+                            present[idx] = True
+                            any_present = True
+                    if not any_present:
+                        continue
+                    frags: List[str] = []
+                    i = 0
+                    n = len(seq_ch)
+                    while i < n:
+                        if not present[i]:
+                            i += 1
                             continue
-                        present = [False] * len(seq_ch)
-                        any_present = False
-                        for k in key_set:
-                            idx = map_ch.get(k)
-                            if idx is not None and 0 <= idx < len(seq_ch):
-                                present[idx] = True
-                                any_present = True
-                        if not any_present:
-                            continue
-                        frags: List[str] = []
-                        i = 0
-                        n = len(seq_ch)
-                        while i < n:
-                            if not present[i]:
-                                i += 1
-                                continue
-                            j = i
-                            while j < n and present[j]:
-                                j += 1
-                            frags.append(seq_ch[i:j])
-                            i = j
-                        if frags:
-                            out[ch] = frags
-                    return out
+                        j = i
+                        while j < n and present[j]:
+                            j += 1
+                        frags.append(seq_ch[i:j])
+                        i = j
+                    if frags:
+                        out[ch] = frags
+                return out
 
-                def _flatten_fragments(frags_by_chain: Dict[str, List[str]]) -> List[str]:
-                    if not frags_by_chain:
-                        return []
-                    flat: List[str] = []
-                    for ch in chain_order:
-                        xs = frags_by_chain.get(ch)
-                        if xs:
-                            flat.extend(xs)
-                    return flat
+            def _flatten_fragments(frags_by_chain: Dict[str, List[str]]) -> List[str]:
+                if not frags_by_chain:
+                    return []
+                flat: List[str] = []
+                for ch in chain_order:
+                    xs = frags_by_chain.get(ch)
+                    if xs:
+                        flat.extend(xs)
+                return flat
 
-                fragments_cdr_vicinity = _contiguous_fragments_for_keyset_per_chain(
-                    cdr_vicinity_keys
-                )
-                cdr_vicinity_frags_flat = _flatten_fragments(fragments_cdr_vicinity)
+            fragments_cdr_vicinity = _contiguous_fragments_for_keyset_per_chain(
+                cdr_vicinity_keys
+            )
+            cdr_vicinity_frags_flat = _flatten_fragments(fragments_cdr_vicinity)
 
-                sequence_motives["count_AspAsp_cdr"] = count_motif_overlapping(
-                    cdr_vicinity_frags_flat, "DD"
-                )
-                
-                sequence_motives["count_AspGlu_cdr"] = count_motif_overlapping(
-                    cdr_vicinity_frags_flat, "DE"
-                )
-                
-                sequence_motives["count_TyrTyr_cdr"] = count_motif_overlapping(
-                    cdr_vicinity_frags_flat, "YY"
-                )
+            sequence_motives["count_AspAsp_cdr"] = count_motif_overlapping(
+                cdr_vicinity_frags_flat, "DD"
+            )
 
-                sasa_residue = ctx.sasa_residue
-                if sasa_residue:
-                    chain_side_sasa: Dict[str, List[float]] = {}
-                    for ch, seq_ch, map_ch in chain_seqs_and_maps:
-                        inv_map = {idx: k for k, idx in map_ch.items()}
-                        arr = [0.0] * len(seq_ch)
-                        for i in range(len(seq_ch)):
-                            key4 = inv_map.get(i)
-                            if key4 is not None:
-                                arr[i] = float(residue_side_sasa(key4, sasa_residue))
-                        chain_side_sasa[ch] = arr
+            sequence_motives["count_AspGlu_cdr"] = count_motif_overlapping(
+                cdr_vicinity_frags_flat, "DE"
+            )
 
-                    def _motif_side_asa_sum(motif: str) -> float:
-                        if not motif or len(motif) != 2:
-                            return 0.0
-                        a, b = motif[0], motif[1]
-                        total = 0.0
-                        for ch, seq_ch, _map_ch in chain_seqs_and_maps:
-                            if len(seq_ch) < 2:
-                                continue
-                            asa = chain_side_sasa.get(ch)
-                            if asa is None or len(asa) != len(seq_ch):
-                                continue
-                            for i in range(len(seq_ch) - 1):
-                                if seq_ch[i] == a and seq_ch[i + 1] == b:
-                                    total += float(asa[i] + asa[i + 1])
-                        return float(total)
+            sequence_motives["count_TyrTyr_cdr"] = count_motif_overlapping(
+                cdr_vicinity_frags_flat, "YY"
+            )
 
-                    for motif, key in [("DD", "AspAsp"), ("DE", "AspGlu")]:
-                        sequence_motives[f"{key}_all_sasa"] = _motif_side_asa_sum(motif)
+        #         sasa_residue = ctx.sasa_residue
+        #         if sasa_residue:
+        #             chain_side_sasa: Dict[str, List[float]] = {}
+        #             for ch, seq_ch, map_ch in chain_seqs_and_maps:
+        #                 inv_map = {idx: k for k, idx in map_ch.items()}
+        #                 arr = [0.0] * len(seq_ch)
+        #                 for i in range(len(seq_ch)):
+        #                     key4 = inv_map.get(i)
+        #                     if key4 is not None:
+        #                         arr[i] = float(residue_side_sasa(key4, sasa_residue))
+        #                 chain_side_sasa[ch] = arr
+        #
+        #             def _motif_side_asa_sum(motif: str) -> float:
+        #                 if not motif or len(motif) != 2:
+        #                     return 0.0
+        #                 a, b = motif[0], motif[1]
+        #                 total = 0.0
+        #                 for ch, seq_ch, _map_ch in chain_seqs_and_maps:
+        #                     if len(seq_ch) < 2:
+        #                         continue
+        #                     asa = chain_side_sasa.get(ch)
+        #                     if asa is None or len(asa) != len(seq_ch):
+        #                         continue
+        #                     for i in range(len(seq_ch) - 1):
+        #                         if seq_ch[i] == a and seq_ch[i + 1] == b:
+        #                             total += float(asa[i] + asa[i + 1])
+        #                 return float(total)
+        #
+        #             for motif, key in [("DD", "AspAsp"), ("DE", "AspGlu")]:
+        #                 sequence_motives[f"{key}_all_sasa"] = _motif_side_asa_sum(motif)
 
         def _sanitize_for_json(obj: Any) -> Any:
             if isinstance(obj, dict):

@@ -7,13 +7,13 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
-if [[ -f "$PROJECT_ROOT/fastab.local.env" ]]; then
+if [[ -f "$PROJECT_ROOT/kitab.local.env" ]]; then
     # shellcheck disable=SC1091
-    source "$PROJECT_ROOT/fastab.local.env"
+    source "$PROJECT_ROOT/kitab.local.env"
 fi
 
-FASTAB_ENV="${FASTAB_ENV:-fastab}"
-PY="${PY:-conda run -n ${FASTAB_ENV} python}"
+KITAB_ENV="${KITAB_ENV:-kitab}"
+PY="${PY:-conda run -n ${KITAB_ENV} python}"
 DSSP_BIN="${DSSP_BIN:-mkdssp}"
 
 _py_to_array() {
@@ -30,11 +30,11 @@ for part in shlex.split(sys.argv[1]):
 }
 _py_to_array "$PY" PY_ARR
 
-_fastab_run() {
+_kitab_run() {
     if command -v mamba &>/dev/null; then
-        mamba run -n "$FASTAB_ENV" "$@"
+        mamba run -n "$KITAB_ENV" "$@"
     elif command -v conda &>/dev/null; then
-        conda run -n "$FASTAB_ENV" "$@"
+        conda run -n "$KITAB_ENV" "$@"
     else
         "$@"
     fi
@@ -199,7 +199,7 @@ if [[ ${#STRUCTURES_DIRS[@]} -eq 0 ]]; then
   echo "  --remove_helper_outputs: delete dssp/propka/freesasa files after a structure's descriptor JSON is written." >&2
   echo "  --clean-external-outputs: after all descriptors for a dataset, remove dssp/, propka/, and sasa/ subdirs." >&2
   echo "  --skip-existing: skip any PDB whose descriptor JSON already exists (non-empty) in the results/ dir." >&2
-  echo "  --skip-failed: skip structures logged as failed in pipeline.log (DSSP/SASA/PROPKA/DESCRIPTORS)." >&2
+  echo "  --skip-failed: skip structures that failed in the current pipeline.log session and still lack JSON." >&2
   exit 1
 fi
 
@@ -238,6 +238,10 @@ if [[ -n "$USER_OUTPUT_DESCRIPTOR_ROOT" ]]; then
 else
     DESCRIPTOR_ROOT="${RUN_INVOCATION_DIR}/developability_descriptors"
 fi
+RUN_FAILED_TSV="${DESCRIPTOR_ROOT%/*}/failed_structures.tsv"
+RUN_TOTAL_FAILURES=0
+mkdir -p "$(dirname "$RUN_FAILED_TSV")"
+printf 'dataset\tstructure\treason\n' > "$RUN_FAILED_TSV"
 cd "$PROJECT_ROOT"
 export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export NUM_JOBS SCRIPT_DIR
@@ -279,6 +283,122 @@ _finalize_propka_pka() {
         mv "$generated" "$target"
     fi
     return 0
+}
+
+_truncate_for_terminal() {
+    local text="${1//$'\n'/ }"
+    text="${text//  / }"
+    local max="${2:-120}"
+    if ((${#text} > max)); then
+        printf '%s...' "${text:0:max}"
+    else
+        printf '%s' "$text"
+    fi
+}
+
+_extract_failure_reason() {
+    local raw="$1"
+    local reason=""
+    reason=$(printf '%s\n' "$raw" | grep -m1 -E 'PropKa coverage incomplete|pKa data is empty|SASA file not found|empty output|did not produce|No such file|Error calculating' || true)
+    if [[ -z "$reason" ]]; then
+        reason=$(printf '%s\n' "$raw" | grep -m1 -E 'ERROR|Error |RuntimeError|Traceback|failed' | sed -E 's/^ERROR:[^:]+://; s/^[[:space:]]+//' || true)
+    fi
+    if [[ -z "$reason" ]]; then
+        reason=$(printf '%s\n' "$raw" | tr '\n' ' ' | sed 's/  */ /g')
+    fi
+    reason=$(printf '%s' "$reason" | sed -E 's|Error calculating developability descriptors for [^:]+: ||')
+    reason=$(printf '%s' "$reason" | sed -E 's/^ERROR:[^:]+://')
+    _truncate_for_terminal "$reason" 500
+}
+
+_emit_failure() {
+    local stage="$1" stem="$2" reason="$3"
+    local short
+    short=$(_truncate_for_terminal "$reason" 120)
+    echo "✗ ${stem} (${stage}: ${short})"
+    echo "[$(date -Iseconds)] ${stage} ✗ ${stem}: ${reason}" >> "$PIPELINE_LOG"
+}
+
+# Parse pipeline.log failures. Modes: stems (one stem per line) or records (stem<TAB>stage<TAB>reason).
+_pipeline_failure_records() {
+    local log_file="$1"
+    local json_dir="${2:-}"
+    local since_session="${3:-since_session}"
+    local mode="${4:-records}"
+    "${PY_ARR[@]}" - "$log_file" "$json_dir" "$since_session" "$mode" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+log_path = Path(sys.argv[1])
+json_dir = Path(sys.argv[2]) if sys.argv[2] else None
+since_session = sys.argv[3] == "since_session"
+mode = sys.argv[4]
+
+lines = log_path.read_text(errors="replace").splitlines() if log_path.is_file() else []
+
+start_idx = 0
+for i, line in enumerate(lines):
+    if "=== Pipeline session START" in line or "] Pipeline started for" in line:
+        start_idx = i
+
+scan = lines[start_idx:] if since_session else lines
+
+fail_pat = re.compile(r"\] (DSSP|SASA|PROPKA|DESCRIPTORS) ✗ ([^:]+):?\s*(.*)$")
+failures = {}
+for line in scan:
+    m = fail_pat.search(line)
+    if m:
+        stage, stem, reason = m.group(1), m.group(2).strip(), (m.group(3) or "").strip()
+        failures[stem] = (stage, reason)
+
+err_pat = re.compile(
+    r"Error calculating developability descriptors for .+/([^/]+)\.pdb: (.+)$"
+)
+for line in scan:
+    m = err_pat.search(line)
+    if m:
+        stem, reason = m.group(1), m.group(2).strip()
+        failures.setdefault(stem, ("DESCRIPTORS", reason))
+
+if json_dir and json_dir.is_dir():
+    for stem in list(failures):
+        jp = json_dir / f"{stem}.json"
+        if jp.is_file() and jp.stat().st_size > 0:
+            del failures[stem]
+
+for stem in sorted(failures):
+    stage, reason = failures[stem]
+    if mode == "stems":
+        print(stem)
+    else:
+        print(f"{stem}\t{stage}\t{reason.replace(chr(9), ' ')}")
+PY
+}
+
+_pipeline_session_end_report() {
+    local base_name="$1"
+    local log_file="$2"
+    local json_dir="$3"
+    local -a fail_lines=()
+    mapfile -t fail_lines < <(_pipeline_failure_records "$log_file" "$json_dir" since_session records)
+    local n=${#fail_lines[@]}
+    echo "[$(date -Iseconds)] === Pipeline session END (${n} unresolved failure(s)) ===" >> "$log_file"
+    if [[ $n -eq 0 ]]; then
+        echo "  ${base_name}: all structures OK this session"
+        return 0
+    fi
+    RUN_TOTAL_FAILURES=$((RUN_TOTAL_FAILURES + n))
+    echo ""
+    echo "  Failures in ${base_name} (${n}):"
+    local line stem stage reason short
+    for line in "${fail_lines[@]}"; do
+        IFS=$'\t' read -r stem stage reason <<< "$line"
+        short=$(_truncate_for_terminal "$reason" 100)
+        echo "    ✗ ${stem} (${stage}: ${short})"
+        printf '%s\t%s\t%s\n' "$base_name" "$stem" "$reason" >> "$RUN_FAILED_TSV"
+    done
+    echo "  Log: ${log_file}"
 }
 
 _abb2_bfactor_all_zero() {
@@ -384,9 +504,11 @@ for name in expected:
 if missing:
     preview = ", ".join(missing[:10])
     extra = f" (+{len(missing) - 10} more)" if len(missing) > 10 else ""
+    log_hint = results_dir.parent / "pipeline.log"
     raise SystemExit(
         f"Missing descriptor JSON for {len(missing)} CSV name(s) in {results_dir}: "
-        f"{preview}{extra}"
+        f"{preview}{extra}\n"
+        f"See {log_hint} for per-structure failure reasons."
     )
 PY
     then
@@ -437,6 +559,21 @@ _is_pipeline_pdb_stem() {
     return 0
 }
 
+_is_valid_descriptor_pdb() {
+    local pdb="$1"
+    local stem="$2"
+    [[ -f "$pdb" ]] || return 0
+    if [[ ! -s "$pdb" ]]; then
+        _emit_failure "INPUT" "$stem" "empty PDB file"
+        return 1
+    fi
+    if ! grep -qE '^(ATOM  |HETATM)' "$pdb"; then
+        _emit_failure "INPUT" "$stem" "PDB file has no ATOM/HETATM records"
+        return 1
+    fi
+    return 0
+}
+
 pipeline_pdb_paths() {
     local dir="$1"
     if [[ ${#ALLOWED_NAMES[@]} -gt 0 ]]; then
@@ -477,32 +614,20 @@ declare -A PIPELINE_FAILED_STEMS=()
 
 _load_pipeline_failed_stems() {
     local log_file="$1"
-    PIPELINE_FAILED_STEMS=()
+    local json_dir="${2:-}"
+    unset PIPELINE_FAILED_STEMS
+    declare -gA PIPELINE_FAILED_STEMS
     [[ -f "$log_file" ]] || return 0
     while IFS= read -r stem; do
-        [[ -n "$stem" ]] && PIPELINE_FAILED_STEMS["$stem"]=1
-    done < <("${PY_ARR[@]}" -c '
-import re
-import sys
-from pathlib import Path
-
-p = Path(sys.argv[1])
-if not p.is_file():
-    raise SystemExit(0)
-pat = re.compile(r"\] (?:DSSP|SASA|PROPKA|DESCRIPTORS) ✗ ([^: ]+)")
-seen = set()
-with p.open(errors="replace") as handle:
-    for line in handle:
-        m = pat.search(line)
-        if m:
-            seen.add(m.group(1))
-for s in sorted(seen):
-    print(s)
-' "$log_file")
+        [[ -z "$stem" ]] && continue
+        PIPELINE_FAILED_STEMS["$stem"]=1
+    done < <(_pipeline_failure_records "$log_file" "$json_dir" since_session stems)
+    return 0
 }
 
 _is_pipeline_failed_stem() {
-    [[ -n "${PIPELINE_FAILED_STEMS[$1]:-}" ]]
+    local stem="$1"
+    [[ -n "$stem" && -n "${PIPELINE_FAILED_STEMS[$stem]+x}" ]]
 }
 
 USE_GNU_PARALLEL=false
@@ -526,10 +651,10 @@ for STRUCTURES_DIR in "${STRUCTURES_DIRS[@]}"; do
 
     PIPELINE_LOG="${DATASET_DESCRIPTOR_DIR}/pipeline.log"
     export PIPELINE_LOG
-    echo "[$(date -Iseconds)] Pipeline started for ${BASE_NAME}" >> "$PIPELINE_LOG"
+    echo "[$(date -Iseconds)] === Pipeline session START (${BASE_NAME}) ===" >> "$PIPELINE_LOG"
 
     if [[ "$SKIP_FAILED" == true ]]; then
-        _load_pipeline_failed_stems "$PIPELINE_LOG"
+        _load_pipeline_failed_stems "$PIPELINE_LOG" "$DEV_JSON_OUTPUT_DIR"
     fi
 
     if [[ "$SANITY_CHECK_ABB2" == true ]]; then
@@ -560,6 +685,16 @@ for STRUCTURES_DIR in "${STRUCTURES_DIRS[@]}"; do
                     local basename=$(basename "$pdb_file" .pdb)
                     local filename=$(basename "$pdb_file")
                     local output_file="${OUTPUT_DIR}/${basename}.dssp"
+                    if [[ ! -s "$pdb_file" ]]; then
+                        _emit_failure "DSSP" "$basename" "empty PDB file"
+                        rm -f "$output_file"
+                        return 0
+                    fi
+                    if ! grep -qE '^(ATOM  |HETATM)' "$pdb_file"; then
+                        _emit_failure "DSSP" "$basename" "PDB file has no ATOM/HETATM records"
+                        rm -f "$output_file"
+                        return 0
+                    fi
                     local temp_pdb=$(mktemp)
                     {
                         printf "REMARK    @%s (1-2)\n" "$filename"
@@ -567,22 +702,20 @@ for STRUCTURES_DIR in "${STRUCTURES_DIRS[@]}"; do
                         awk '!/^REMARK/ && !/^CRYST1/' "$pdb_file"
                     } > "$temp_pdb"
                     local dssp_err
-                    if ! dssp_err=$(_fastab_run "$DSSP_BIN" "$temp_pdb" "$output_file" 2>&1 >/dev/null); then
-                        echo "✗ $basename (failed)"
-                        echo "[$(date -Iseconds)] DSSP ✗ ${basename}: ${dssp_err}" >> "$PIPELINE_LOG"
+                    if ! dssp_err=$(_kitab_run "$DSSP_BIN" "$temp_pdb" "$output_file" 2>&1 >/dev/null); then
+                        _emit_failure "DSSP" "$basename" "$dssp_err"
                         rm -f "$output_file"
                     elif [[ ! -s "$output_file" ]]; then
-                        echo "✗ $basename (no DSSP output)"
-                        echo "[$(date -Iseconds)] DSSP ✗ ${basename}: empty output" >> "$PIPELINE_LOG"
+                        _emit_failure "DSSP" "$basename" "empty output"
                         rm -f "$output_file"
                     fi
                     rm -f "$temp_pdb"
                 }
-                export -f process_file _fastab_run
-                export DSSP_BIN FASTAB_ENV PIPELINE_LOG
-                pipeline_pdb_paths "$STRUCTURES_DIR" | parallel -0 -j "$NUM_JOBS" process_file {}
+                export -f process_file _kitab_run _emit_failure _truncate_for_terminal
+                export DSSP_BIN KITAB_ENV PIPELINE_LOG
+                pipeline_pdb_paths "$STRUCTURES_DIR" | parallel --will-cite -0 -j "$NUM_JOBS" process_file {}
             else
-                export STRUCTURES_DIR DSSP_BIN FASTAB_ENV
+                export STRUCTURES_DIR DSSP_BIN KITAB_ENV
                 "${PY_ARR[@]}" << 'DSSP_PY'
 import os
 import shutil
@@ -595,14 +728,14 @@ STRUCTURES_DIR = os.environ.get("STRUCTURES_DIR", ".")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
 SCRIPT_DIR = os.environ.get("SCRIPT_DIR", ".")
 DSSP_BIN = os.environ.get("DSSP_BIN", "mkdssp")
-FASTAB_ENV = os.environ.get("FASTAB_ENV", "fastab")
+KITAB_ENV = os.environ.get("KITAB_ENV", "kitab")
 PIPELINE_LOG = os.environ.get("PIPELINE_LOG", "")
 num_jobs = int(os.environ.get("NUM_JOBS", str(cpu_count())))
 
-def run_in_fastab(args, **kwargs):
+def run_in_kitab(args, **kwargs):
     for conda in ("mamba", "conda"):
         if shutil.which(conda):
-            return subprocess.run([conda, "run", "-n", FASTAB_ENV, *args], **kwargs)
+            return subprocess.run([conda, "run", "-n", KITAB_ENV, *args], **kwargs)
     return subprocess.run(args, **kwargs)
 
 def _log(msg):
@@ -617,6 +750,16 @@ def process_file(pdb_path):
     filename = pdb_file.name
     output_file = Path(OUTPUT_DIR) / f"{basename}.dssp"
     try:
+        if not pdb_file.stat().st_size:
+            output_file.unlink(missing_ok=True)
+            _log(f"DSSP ✗ {basename}: empty PDB file")
+            return f"✗ {basename} (empty PDB file)"
+        with open(pdb_file) as f:
+            has_atoms = any(line.startswith(("ATOM  ", "HETATM")) for line in f)
+        if not has_atoms:
+            output_file.unlink(missing_ok=True)
+            _log(f"DSSP ✗ {basename}: PDB file has no ATOM/HETATM records")
+            return f"✗ {basename} (no ATOM/HETATM records)"
         with tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False) as tf:
             tf.write(f"REMARK    @{filename} (1-2)\n")
             tf.write("CRYST1    1.000    1.000    1.000  90.00  90.00  90.00 P 1           1          \n")
@@ -625,7 +768,7 @@ def process_file(pdb_path):
                     if not line.startswith('REMARK') and not line.startswith('CRYST1'):
                         tf.write(line)
             path = tf.name
-        r = run_in_fastab([DSSP_BIN, path, str(output_file)], capture_output=True, text=True, cwd=SCRIPT_DIR)
+        r = run_in_kitab([DSSP_BIN, path, str(output_file)], capture_output=True, text=True, cwd=SCRIPT_DIR)
         Path(path).unlink(missing_ok=True)
         if r.returncode != 0:
             output_file.unlink(missing_ok=True)
@@ -707,35 +850,32 @@ DSSP_PY
                     }' "$pdbfile"
 
                     local sasa_err
-                    if ! sasa_err=$(_fastab_run freesasa --shrake-rupley --format=rsa --depth=residue "$pdbfile" > "$sasa_full" 2>&1); then
-                        echo "✗ $filename (full failed)"
-                        echo "[$(date -Iseconds)] SASA ✗ ${filename}: ${sasa_err}" >> "$PIPELINE_LOG"
+                    if ! sasa_err=$(_kitab_run freesasa --shrake-rupley --format=rsa --depth=residue "$pdbfile" > "$sasa_full" 2>&1); then
+                        _emit_failure "SASA" "$filename" "$sasa_err"
                         rm -f "$sasa_full"
                     fi
 
                     if grep -q "^ATOM" "$tmp_H"; then
-                        if ! sasa_err=$(_fastab_run freesasa --shrake-rupley --format=rsa --depth=residue "$tmp_H" > "$sasa_H" 2>&1); then
-                            echo "✗ $filename (H-only failed)"
-                            echo "[$(date -Iseconds)] SASA ✗ ${filename} H-chain: ${sasa_err}" >> "$PIPELINE_LOG"
+                        if ! sasa_err=$(_kitab_run freesasa --shrake-rupley --format=rsa --depth=residue "$tmp_H" > "$sasa_H" 2>&1); then
+                            _emit_failure "SASA" "$filename" "H-chain: ${sasa_err}"
                             rm -f "$sasa_H"
                         fi
                     fi
 
                     if grep -q "^ATOM" "$tmp_L"; then
-                        if ! sasa_err=$(_fastab_run freesasa --shrake-rupley --format=rsa --depth=residue "$tmp_L" > "$sasa_L" 2>&1); then
-                            echo "✗ $filename (L-only failed)"
-                            echo "[$(date -Iseconds)] SASA ✗ ${filename} L-chain: ${sasa_err}" >> "$PIPELINE_LOG"
+                        if ! sasa_err=$(_kitab_run freesasa --shrake-rupley --format=rsa --depth=residue "$tmp_L" > "$sasa_L" 2>&1); then
+                            _emit_failure "SASA" "$filename" "L-chain: ${sasa_err}"
                             rm -f "$sasa_L"
                         fi
                     fi
 
                     rm -f "$tmp_H" "$tmp_L"
                 }
-                export -f process_file _fastab_run
-                export SASA_DIR FASTAB_ENV PIPELINE_LOG
-                pipeline_pdb_paths "$STRUCTURES_DIR" | parallel -0 -j "$NUM_JOBS" process_file {}
+                export -f process_file _kitab_run _emit_failure _truncate_for_terminal
+                export SASA_DIR KITAB_ENV PIPELINE_LOG
+                pipeline_pdb_paths "$STRUCTURES_DIR" | parallel --will-cite -0 -j "$NUM_JOBS" process_file {}
             else
-                export STRUCTURES_DIR SASA_DIR FASTAB_ENV PIPELINE_LOG
+                export STRUCTURES_DIR SASA_DIR KITAB_ENV PIPELINE_LOG
                 "${PY_ARR[@]}" << 'FREESASA_PY'
 import os
 import shutil
@@ -746,14 +886,14 @@ import subprocess
 import tempfile
 STRUCTURES_DIR = os.environ.get("STRUCTURES_DIR", ".")
 SASA_DIR = os.environ.get("SASA_DIR", ".")
-FASTAB_ENV = os.environ.get("FASTAB_ENV", "fastab")
+KITAB_ENV = os.environ.get("KITAB_ENV", "kitab")
 PIPELINE_LOG = os.environ.get("PIPELINE_LOG", "")
 num_jobs = int(os.environ.get("NUM_JOBS", str(cpu_count())))
 
-def run_in_fastab(args, **kwargs):
+def run_in_kitab(args, **kwargs):
     for conda in ("mamba", "conda"):
         if shutil.which(conda):
-            return subprocess.run([conda, "run", "-n", FASTAB_ENV, *args], **kwargs)
+            return subprocess.run([conda, "run", "-n", KITAB_ENV, *args], **kwargs)
     return subprocess.run(args, **kwargs)
 
 def _log(msg):
@@ -787,7 +927,7 @@ def process_file(pdb_path):
 
     errors = []
 
-    r = run_in_fastab(
+    r = run_in_kitab(
         ["freesasa", "--shrake-rupley", "--format=rsa", "--depth=residue", str(pdb_file)],
         capture_output=True, text=True
     )
@@ -804,7 +944,7 @@ def process_file(pdb_path):
 
     has_H_atoms = any(l.startswith("ATOM") for l in tmp_H_path.read_text().splitlines())
     if has_H_atoms:
-        r = run_in_fastab(
+        r = run_in_kitab(
             ["freesasa", "--shrake-rupley", "--format=rsa", "--depth=residue", str(tmp_H_path)],
             capture_output=True, text=True
         )
@@ -816,7 +956,7 @@ def process_file(pdb_path):
 
     has_L_atoms = any(l.startswith("ATOM") for l in tmp_L_path.read_text().splitlines())
     if has_L_atoms:
-        r = run_in_fastab(
+        r = run_in_kitab(
             ["freesasa", "--shrake-rupley", "--format=rsa", "--depth=residue", str(tmp_L_path)],
             capture_output=True, text=True
         )
@@ -893,17 +1033,23 @@ FREESASA_PY
                     mkdir -p "$tmp_structures"
                     cd "$output_dir"
                     local propka_input propka_stem
-                    propka_input=$(cd "$SCRIPT_DIR" && _fastab_run python utils/prepare_propka_input.py "$pdb_file" \
+                    propka_input=$(cd "$SCRIPT_DIR" && _kitab_run python utils/prepare_propka_input.py "$pdb_file" \
                         --tmp-dir "$tmp_structures" --stem "${basename}_full" 2>/dev/null | head -1)
                     propka_stem=$(basename "$propka_input" .pdb)
-                    _fastab_run propka3 "$propka_input" > "${basename}_full.log" 2>&1
-                    if ! _finalize_propka_pka "${propka_stem}.pka" "${basename}_full.pka"; then echo "✗ $basename (full - failed)"; fi
+                    _kitab_run propka3 "$propka_input" > "${basename}_full.log" 2>&1
+                    if ! _finalize_propka_pka "${propka_stem}.pka" "${basename}_full.pka"; then
+                        local propka_reason="PropKa did not produce .pka output"
+                        if [[ -s "${basename}_full.log" ]]; then
+                            propka_reason=$(grep -m1 -E 'failed protonation|Missing atoms|Error|WARNING' "${basename}_full.log" || echo "$propka_reason")
+                        fi
+                        _emit_failure "PROPKA" "$basename" "$propka_reason"
+                    fi
                 }
-                export -f process_file _fastab_run _finalize_propka_pka
-                export FASTAB_ENV SCRIPT_DIR
-                pipeline_pdb_paths "$STRUCTURES_DIR" | parallel -0 -j "$NUM_JOBS" process_file {} "$OUTPUT_DIR"
+                export -f process_file _kitab_run _finalize_propka_pka _emit_failure _truncate_for_terminal
+                export KITAB_ENV SCRIPT_DIR
+                pipeline_pdb_paths "$STRUCTURES_DIR" | parallel --will-cite -0 -j "$NUM_JOBS" process_file {} "$OUTPUT_DIR"
             else
-                export STRUCTURES_DIR FASTAB_ENV PY SCRIPT_DIR
+                export STRUCTURES_DIR KITAB_ENV PY SCRIPT_DIR
                 "${PY_ARR[@]}" << 'PROPKA_PY'
 import os
 import shutil
@@ -913,16 +1059,16 @@ from multiprocessing import Pool, cpu_count
 import subprocess
 STRUCTURES_DIR = os.environ.get("STRUCTURES_DIR", ".")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
-FASTAB_ENV = os.environ.get("FASTAB_ENV", "fastab")
+KITAB_ENV = os.environ.get("KITAB_ENV", "kitab")
 SCRIPT_DIR = Path(os.environ.get("SCRIPT_DIR", "."))
 TMP_STRUCTURES = Path(OUTPUT_DIR) / "tmp_structures"
 TMP_STRUCTURES.mkdir(parents=True, exist_ok=True)
 num_jobs = int(os.environ.get("NUM_JOBS", str(cpu_count())))
 
-def run_in_fastab(args, **kwargs):
+def run_in_kitab(args, **kwargs):
     for conda in ("mamba", "conda"):
         if shutil.which(conda):
-            return subprocess.run([conda, "run", "-n", FASTAB_ENV, *args], **kwargs)
+            return subprocess.run([conda, "run", "-n", KITAB_ENV, *args], **kwargs)
     return subprocess.run(args, **kwargs)
 
 def prepare_propka_input(source_pdb, stem):
@@ -950,7 +1096,7 @@ def run_propka_variant(pdb_file, basename, label, stem):
     propka_stem = propka_input.stem
     log_out = output_dir / f"{basename}_{label}.log"
     pka_out = output_dir / f"{basename}_{label}.pka"
-    r = run_in_fastab(["propka3", str(propka_input)], capture_output=True, text=True, cwd=output_dir)
+    r = run_in_kitab(["propka3", str(propka_input)], capture_output=True, text=True, cwd=output_dir)
     with open(log_out, "w") as f:
         f.write(r.stdout)
         f.write(r.stderr)
@@ -1031,8 +1177,7 @@ PROPKA_PY
                     local output_file="${OUTPUT_DIR}/${basename}.json"
                     local -a cmd=(python developability/calculate_descriptors.py "$pdb_file" "$sasa_file")
                     if [ ! -f "$sasa_file" ]; then
-                        echo "✗ $basename (SASA file not found)"
-                        echo "[$(date -Iseconds)] DESCRIPTORS ✗ ${basename}: SASA file not found: ${sasa_file}" >> "$PIPELINE_LOG"
+                        _emit_failure "DESCRIPTORS" "$basename" "SASA file not found: ${sasa_file}"
                         return
                     fi
                     [ -f "$dssp_file" ] && cmd+=("--dssp-file" "$dssp_file")
@@ -1040,16 +1185,17 @@ PROPKA_PY
                     cmd+=("--pH" "$PH_VALUE")
                     cmd+=("--output" "$output_file")
                     cmd+=("--log-file" "$PIPELINE_LOG")
-                    if ! output=$(cd "$SCRIPT_DIR" && _fastab_run "${cmd[@]}" 2>&1); then
-                        echo "✗ $basename (failed)"
-                        echo "[$(date -Iseconds)] DESCRIPTORS ✗ ${basename}: ${output}" >> "$PIPELINE_LOG"
+                    local output reason
+                    if ! output=$(cd "$SCRIPT_DIR" && _kitab_run "${cmd[@]}" 2>&1); then
+                        reason=$(_extract_failure_reason "$output")
+                        _emit_failure "DESCRIPTORS" "$basename" "$reason"
                     elif [[ -s "$output_file" ]]; then
                         _remove_helper_outputs_for_stem "$basename"
                     fi
                 }
-                export -f process_file _fastab_run _remove_helper_outputs_for_stem
-                export SASA_DIR DSSP_DIR PKA_DIR OUTPUT_DIR PH_VALUE SCRIPT_DIR FASTAB_ENV REMOVE_HELPER_OUTPUTS PIPELINE_LOG
-                pipeline_pdb_paths "$STRUCTURES_DIR" | parallel -0 -j "$NUM_JOBS" process_file {}
+                export -f process_file _kitab_run _remove_helper_outputs_for_stem _emit_failure _extract_failure_reason _truncate_for_terminal
+                export SASA_DIR DSSP_DIR PKA_DIR OUTPUT_DIR PH_VALUE SCRIPT_DIR KITAB_ENV REMOVE_HELPER_OUTPUTS PIPELINE_LOG
+                pipeline_pdb_paths "$STRUCTURES_DIR" | parallel --will-cite -0 -j "$NUM_JOBS" process_file {}
             else
                 export PY REMOVE_HELPER_OUTPUTS PIPELINE_LOG
                 "${PY_ARR[@]}" << 'DEV_PY'
@@ -1170,12 +1316,17 @@ DEV_PY
         _batch_total=0
         _sp_skipped_done=0
         _sp_skipped_failed=0
+        _sp_skipped_invalid=0
         while IFS= read -r -d '' _pdb; do
             _stem="${_pdb##*/}"
             _stem="${_stem%.pdb}"
             # Inline filter matching _is_pipeline_pdb_stem (no ALLOWED_NAMES yet).
             case "$_stem" in *_full_atom_sasa|*_H_chain|*_L_chain|*_H|*_L) continue ;; esac
             if [[ "$SANITY_CHECK_ABB2" == true ]] && _is_abb2_sanity_skipped_stem "$_stem"; then
+                continue
+            fi
+            if ! _is_valid_descriptor_pdb "$_pdb" "$_stem"; then
+                _sp_skipped_invalid=$((_sp_skipped_invalid + 1))
                 continue
             fi
             if [[ "$SKIP_EXISTING" == true ]] && [[ -s "$DEV_JSON_OUTPUT_DIR/${_stem}.json" ]]; then
@@ -1225,7 +1376,10 @@ DEV_PY
             echo "  skip-existing: $_sp_skipped_done already-done structure(s) skipped"
         fi
         if [[ "$SKIP_FAILED" == true && $_sp_skipped_failed -gt 0 ]]; then
-            echo "  skip-failed: $_sp_skipped_failed previously-failed structure(s) skipped (pipeline.log)"
+            echo "  skip-failed: $_sp_skipped_failed structure(s) skipped (failed this session, no JSON yet; see ${PIPELINE_LOG})"
+        fi
+        if [[ "$_sp_skipped_invalid" -gt 0 ]]; then
+            echo "  invalid-input: $_sp_skipped_invalid invalid PDB file(s) skipped (see ${PIPELINE_LOG})"
         fi
         echo "  Batch mode done: $_batch_total structure(s) in $_BATCH_NUM batch(es)"
         ALLOWED_NAMES=()
@@ -1234,14 +1388,19 @@ DEV_PY
     else
         # Single-pass: BATCH_SIZE=0, or names already set from --names-from-csv.
 
-        # --skip-existing / --skip-failed: remove finished or failed stems from the work list.
-        if [[ "$SKIP_EXISTING" == true || "$SKIP_FAILED" == true ]]; then
+        # Remove invalid inputs, and optionally remove finished or previously failed stems.
+        if true; then
             _sp_filtered=()
             _sp_skipped_done=0
             _sp_skipped_failed=0
+            _sp_skipped_invalid=0
             if [[ ${#ALLOWED_NAMES[@]} -gt 0 ]]; then
                 # Pre-set name list (e.g. from --names-from-csv): filter in-memory.
                 for _sp_name in "${ALLOWED_NAMES[@]}"; do
+                    if ! _is_valid_descriptor_pdb "$STRUCTURES_DIR/${_sp_name}.pdb" "$_sp_name"; then
+                        _sp_skipped_invalid=$((_sp_skipped_invalid + 1))
+                        continue
+                    fi
                     if [[ "$SKIP_EXISTING" == true ]] && [[ -s "$DEV_JSON_OUTPUT_DIR/${_sp_name}.json" ]]; then
                         _sp_skipped_done=$((_sp_skipped_done + 1))
                         continue
@@ -1253,7 +1412,8 @@ DEV_PY
                     _sp_filtered+=("$_sp_name")
                 done
                 [[ "$SKIP_EXISTING" == true && $_sp_skipped_done -gt 0 ]] && echo "  skip-existing: $_sp_skipped_done already-done structure(s) skipped"
-                [[ "$SKIP_FAILED" == true && $_sp_skipped_failed -gt 0 ]] && echo "  skip-failed: $_sp_skipped_failed previously-failed structure(s) skipped (pipeline.log)"
+                [[ "$SKIP_FAILED" == true && $_sp_skipped_failed -gt 0 ]] && echo "  skip-failed: $_sp_skipped_failed structure(s) skipped (failed this session, no JSON yet; see ${PIPELINE_LOG})"
+                [[ "$_sp_skipped_invalid" -gt 0 ]] && echo "  invalid-input: $_sp_skipped_invalid invalid PDB file(s) skipped (see ${PIPELINE_LOG})"
                 ALLOWED_NAMES=("${_sp_filtered[@]}")
                 ALLOWED_NAMES_CSV="$(printf '%s,' "${ALLOWED_NAMES[@]}")"
                 export ALLOWED_NAMES_CSV
@@ -1264,6 +1424,10 @@ DEV_PY
                     _sp_stem="${_sp_pdb##*/}"; _sp_stem="${_sp_stem%.pdb}"
                     case "$_sp_stem" in *_full_atom_sasa|*_H_chain|*_L_chain|*_H|*_L) continue ;; esac
                     if [[ "$SANITY_CHECK_ABB2" == true ]] && _is_abb2_sanity_skipped_stem "$_sp_stem"; then continue; fi
+                    if ! _is_valid_descriptor_pdb "$_sp_pdb" "$_sp_stem"; then
+                        _sp_skipped_invalid=$((_sp_skipped_invalid + 1))
+                        continue
+                    fi
                     if [[ "$SKIP_EXISTING" == true ]] && [[ -s "$DEV_JSON_OUTPUT_DIR/${_sp_stem}.json" ]]; then
                         _sp_skipped_done=$((_sp_skipped_done + 1))
                         continue
@@ -1277,7 +1441,8 @@ DEV_PY
                 done < <(find "$STRUCTURES_DIR" -maxdepth 1 -name "*.pdb" -type f \
                               ! -path '*/.*/*' ! -name "*_H.pdb" ! -name "*_L.pdb" -print0)
                 [[ "$SKIP_EXISTING" == true && $_sp_skipped_done -gt 0 ]] && echo "  skip-existing: $_sp_skipped_done already-done structure(s) skipped"
-                [[ "$SKIP_FAILED" == true && $_sp_skipped_failed -gt 0 ]] && echo "  skip-failed: $_sp_skipped_failed previously-failed structure(s) skipped (pipeline.log)"
+                [[ "$SKIP_FAILED" == true && $_sp_skipped_failed -gt 0 ]] && echo "  skip-failed: $_sp_skipped_failed structure(s) skipped (failed this session, no JSON yet; see ${PIPELINE_LOG})"
+                [[ "$_sp_skipped_invalid" -gt 0 ]] && echo "  invalid-input: $_sp_skipped_invalid invalid PDB file(s) skipped (see ${PIPELINE_LOG})"
                 if [[ ${#_sp_filtered[@]} -gt 0 ]]; then
                     ALLOWED_NAMES=("${_sp_filtered[@]}")
                     ALLOWED_NAMES_CSV=""
@@ -1307,6 +1472,8 @@ DEV_PY
         _validate_descriptor_outputs_for_csv "$NAMES_FROM_CSV" "$DEV_JSON_OUTPUT_DIR"
     fi
 
+    _pipeline_session_end_report "$BASE_NAME" "$PIPELINE_LOG" "$DEV_JSON_OUTPUT_DIR"
+
     _clean_external_output_dirs
 done
 
@@ -1315,3 +1482,8 @@ echo ""
 echo "--- Summary ---"
 echo "Structures processed: $TOTAL_STRUCTURES"
 printf "Total time: %02d:%02d:%02d\n" $((ELAPSED/3600)) $(((ELAPSED%3600)/60)) $((ELAPSED%60))
+if [[ "$RUN_TOTAL_FAILURES" -gt 0 ]]; then
+    echo "Failures this run: $RUN_TOTAL_FAILURES (details: $RUN_FAILED_TSV)"
+else
+    echo "All descriptor runs succeeded this session."
+fi

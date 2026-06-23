@@ -30,7 +30,7 @@
 **/.venv/
 **/venv/
 
-!fastab.sh
+!kitab.sh
 !install.sh
 !environment.yml
 !environment-abb2.yml
