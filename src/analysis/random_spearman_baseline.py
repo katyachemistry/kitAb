@@ -212,7 +212,7 @@ def _reconstructed_fold_targets(
         developability_feature_groups=dev_groups,
         split_col=str(split_col) if split_col else None,
     )
-    merged = drop_invalid_target_rows(merged, target_col)
+    merged = drop_invalid_target_rows(merged, target_col, max_nan_frac=0.7)
     merged = merged.reset_index(drop=True)
     if split_col:
         _segment_sizes, fold_ilocs = cv_split_col_ilocs(merged[str(split_col)])
