@@ -458,11 +458,11 @@ def compute_sap_shell_synergy_scores(
     """SAP-style surface metrics: aromatic/histidine exposure and charge–aromatic synergy.
 
     Per residue i, sum SASA-weighted neighbor env (pos, neg, aro, his), then
-    sap_aro_score, sap_his_score, sap_pos_aro_synergy, sap_aro_neg_contrast.
+    sap_aro_score, sap_pos_aro_synergy, sap_aro_neg_synergy.
     """
     out: Dict[str, float] = {
         "sap_pos_aro_synergy": 0.0,
-        "sap_aro_neg_contrast": 0.0,
+        "sap_aro_neg_synergy": 0.0,
     }
     if not pdb_atoms or not sasa_data:
         return out
@@ -520,9 +520,8 @@ def compute_sap_shell_synergy_scores(
 
     w = sasa_arr
     out["sap_aro_score"] = float(np.sum(w * aro_env))
-    out["sap_his_score"] = float(np.sum(w * his_env))
     out["sap_pos_aro_synergy"] = float(np.sum(w * pos_env * aro_env))
-    out["sap_aro_neg_contrast"] = float(np.sum(w * aro_env * neg_env))
+    out["sap_aro_neg_synergy"] = float(np.sum(w * aro_env * neg_env))
     return out
 
 

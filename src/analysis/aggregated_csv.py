@@ -11,6 +11,7 @@ COL_DATASET = "Dataset_stem"
 COL_SOURCE = "Developability_source"
 COL_SPEAR = "Spearman"
 COL_PEAR = "Pearson"
+COL_R2 = "R2"
 COL_FEATURES = "selected_features_by_fold"
 
 ANALYSIS_RESULTS_DIRNAME = "analysis_results"

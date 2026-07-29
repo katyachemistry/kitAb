@@ -23,6 +23,7 @@ from analysis.aggregated_csv import (
     COL_DATASET,
     COL_FEATURES,
     COL_PEAR as AGG_COL_PEAR,
+    COL_R2 as AGG_COL_R2,
     COL_RUN_ID,
     COL_SOURCE,
     COL_SPEAR as AGG_COL_SPEAR,
@@ -284,6 +285,8 @@ GROUP_KEYS = (COL_DATASET, COL_SOURCE, COL_TARGET, COL_TRACK)
 
 COL_VARIANT = "Variant"
 COL_RESULT_SPEARMAN = "Spearman"
+COL_RESULT_PEARSON = "Pearson"
+COL_RESULT_R2 = "R2"
 COL_RESULT_JACCARD_NORM = "Jaccard_norm"
 COL_RESULT_BEST_RUN = "best_Target-Selector-Model"
 COL_RESULT_BEST_FRAC = "best_selector_model_frac"
@@ -356,12 +359,20 @@ def _universe_for_source(
     return None
 
 
+def _row_is_final_floating_sfs(row: dict[str, Any]) -> bool:
+    return "final_floating_sfs" in str(row.get(COL_RUN_ID, ""))
+
+
 def _rows_for_best_pick(
-    group_rows: list[dict[str, Any]], *, no_gpr: bool
+    group_rows: list[dict[str, Any]], *, no_gpr: bool, no_final_sfs: bool = False
 ) -> tuple[list[dict[str, Any]], bool]:
-    if not no_gpr:
+    if not no_gpr and not no_final_sfs:
         return group_rows, False
-    filtered = [r for r in group_rows if not _row_is_gpr_eval(r)]
+    filtered = group_rows
+    if no_gpr:
+        filtered = [r for r in filtered if not _row_is_gpr_eval(r)]
+    if no_final_sfs:
+        filtered = [r for r in filtered if not _row_is_final_floating_sfs(r)]
     if not filtered:
         return group_rows, True
     return filtered, False
@@ -543,7 +554,8 @@ def build_summary(
     stability_random_seed: int = 42,
     stability_weight: float = 0.1,
     eval_model: str | None = None,
-    no_gpr: bool = False,
+    no_gpr: bool = True,
+    no_final_sfs: bool = False,
     best_across_tracks: bool = False,
 ) -> tuple[list[dict[str, Any]], int]:
     cache: dict[tuple[str, int, int, tuple[str, ...]], dict[str, Any] | None] = {}
@@ -560,7 +572,7 @@ def build_summary(
         by_g[gkey(r)].append(r)
 
     out: list[dict[str, Any]] = []
-    no_gpr_fallback_groups = 0
+    filter_fallback_groups = 0
     for key in sorted(by_g.keys()):
         g = by_g[key]
         if not g:
@@ -570,10 +582,14 @@ def build_summary(
             trk_out: str = ""
         else:
             trk_out = str(key[3])
-        g_spear, fb_s = _rows_for_best_pick(g, no_gpr=no_gpr)
-        g_pear, fb_p = _rows_for_best_pick(g, no_gpr=no_gpr)
+        g_spear, fb_s = _rows_for_best_pick(
+            g, no_gpr=no_gpr, no_final_sfs=no_final_sfs
+        )
+        g_pear, fb_p = _rows_for_best_pick(
+            g, no_gpr=no_gpr, no_final_sfs=no_final_sfs
+        )
         if fb_s or fb_p:
-            no_gpr_fallback_groups += 1
+            filter_fallback_groups += 1
         univ = _universe_for_source(
             src,
             universe_single=universe_single,
@@ -622,6 +638,8 @@ def build_summary(
                 row[COL_STAB_EXPECTED] = me
                 row[COL_STAB_NORM] = mn
             row["Pipeline_time_sum_s"] = _pipeline_time_s_from_aggregate_row(rs)
+            row["spearman_winner_pearson"] = _parse_float(rs.get(AGG_COL_PEAR, ""))
+            row["spearman_winner_r2"] = _parse_float(rs.get(AGG_COL_R2, ""))
         if rp:
             pea = _parse_float(rp[AGG_COL_PEAR])
             row["best_pearson"] = pea
@@ -633,7 +651,7 @@ def build_summary(
                 rp.get(COL_FEATURES, "")
             )
         out.append(row)
-    return out, no_gpr_fallback_groups
+    return out, filter_fallback_groups
 
 
 def _collapse_summary_best_track_per_source(
@@ -809,6 +827,8 @@ def build_results_per_target(
         ds, variant, tgt = key
         group = by_key[key]
         spears: list[float] = []
+        pears: list[float] = []
+        r2s: list[float] = []
         jaccs: list[float] = []
         best_row: dict[str, Any] | None = None
         best_spear: float | None = None
@@ -820,6 +840,12 @@ def build_results_per_target(
                 if best_spear is None or v > best_spear:
                     best_spear = v
                     best_row = r
+            pea = r.get("spearman_winner_pearson")
+            if isinstance(pea, (int, float)):
+                pears.append(float(pea))
+            r2 = r.get("spearman_winner_r2")
+            if isinstance(r2, (int, float)):
+                r2s.append(float(r2))
             jac = _stab_normalized_from_summary_row(r)
             if jac is not None:
                 jaccs.append(jac)
@@ -831,6 +857,8 @@ def build_results_per_target(
                 COL_VARIANT: variant,
                 COL_TARGET: tgt,
                 COL_RESULT_SPEARMAN: statistics.mean(spears) if spears else None,
+                COL_RESULT_PEARSON: statistics.mean(pears) if pears else None,
+                COL_RESULT_R2: statistics.mean(r2s) if r2s else None,
                 COL_RESULT_JACCARD_NORM: statistics.mean(jaccs) if jaccs else None,
                 COL_RESULT_BEST_RUN: str(best_row.get("best_spearman_Target-Selector-Model", ""))
                 if best_row
@@ -867,6 +895,8 @@ def write_results_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         COL_VARIANT,
         COL_TARGET,
         COL_RESULT_SPEARMAN,
+        COL_RESULT_PEARSON,
+        COL_RESULT_R2,
         COL_RESULT_JACCARD_NORM,
         COL_RESULT_BEST_RUN,
         COL_RESULT_BEST_FRAC,
@@ -884,6 +914,12 @@ def write_results_csv(path: Path, rows: list[dict[str, Any]]) -> None:
                     COL_TARGET: r[COL_TARGET],
                     COL_RESULT_SPEARMAN: _fmt_spearman_cell(
                         r.get(COL_RESULT_SPEARMAN)  # type: ignore[arg-type]
+                    ),
+                    COL_RESULT_PEARSON: _fmt_spearman_cell(
+                        r.get(COL_RESULT_PEARSON)  # type: ignore[arg-type]
+                    ),
+                    COL_RESULT_R2: _fmt_spearman_cell(
+                        r.get(COL_RESULT_R2)  # type: ignore[arg-type]
                     ),
                     COL_RESULT_JACCARD_NORM: _fmt_float_cell(
                         r.get(COL_RESULT_JACCARD_NORM)  # type: ignore[arg-type]
@@ -907,7 +943,8 @@ def run_best_metrics_from_aggregated(
     stability_seed: int = 42,
     stability_weight: float = 0.1,
     eval_model: str | None = None,
-    no_gpr: bool = False,
+    no_gpr: bool = True,
+    no_final_sfs: bool = False,
     best_across_tracks: bool = False,
     n_folds: int = 4,
 ) -> tuple[Path, Path]:
@@ -916,7 +953,7 @@ def run_best_metrics_from_aggregated(
         raise SystemExit("No input files found.")
     rows = _read_rows(paths)
     rows = [r for r in rows if _is_our_source(str(r.get(COL_SOURCE, "")))]
-    required = {COL_RUN_ID, COL_TARGET, AGG_COL_SPEAR, AGG_COL_PEAR, COL_FEATURES}
+    required = {COL_RUN_ID, COL_TARGET, AGG_COL_SPEAR, AGG_COL_PEAR, AGG_COL_R2, COL_FEATURES}
     if rows:
         missing = required - set(rows[0].keys())
         if missing:
@@ -952,7 +989,7 @@ def run_best_metrics_from_aggregated(
             file=sys.stderr,
         )
 
-    summary, no_gpr_fallback_groups = build_summary(
+    summary, filter_fallback_groups = build_summary(
         rows,
         universe_single=universe_single,
         universe_our=universe_our,
@@ -962,12 +999,18 @@ def run_best_metrics_from_aggregated(
         stability_weight=stability_weight,
         eval_model=eval_model,
         no_gpr=no_gpr,
+        no_final_sfs=no_final_sfs,
         best_across_tracks=best_across_tracks,
     )
-    if no_gpr and no_gpr_fallback_groups:
+    if filter_fallback_groups and (no_gpr or no_final_sfs):
+        excluded: list[str] = []
+        if no_gpr:
+            excluded.append("GPR")
+        if no_final_sfs:
+            excluded.append("final_floating_sfs")
         print(
-            f"Warning: --no-gpr had {no_gpr_fallback_groups} group(s) where every candidate row "
-            "was GPR (or only GPR used the new run-id shape); those groups used the full row set.",
+            f"Warning: {filter_fallback_groups} group(s) had no rows left after excluding "
+            f"{' and '.join(excluded)}; those groups used the full row set.",
             file=sys.stderr,
         )
     if not summary and rows and eval_model and str(eval_model).strip():
@@ -992,6 +1035,8 @@ def run_best_metrics_from_aggregated(
         "best_pearson_Target-Selector-Model",
         "best_pearson_selector_model_frac",
         "best_pearson_features",
+        "spearman_winner_pearson",
+        "spearman_winner_r2",
         "Pipeline_time_sum_s",
         "Pipeline_time_std_s",
     ]
@@ -1645,10 +1690,30 @@ def main() -> None:
         type=str,
         default=None,
     )
-    parser.add_argument(
+    gpr_group = parser.add_mutually_exclusive_group()
+    gpr_group.add_argument(
         "--no-gpr",
         "--no_gpr",
+        dest="no_gpr",
         action="store_true",
+        help="Exclude GPR eval rows when picking best row (default).",
+    )
+    gpr_group.add_argument(
+        "--with-gpr",
+        "--with_gpr",
+        dest="no_gpr",
+        action="store_false",
+        help="Include GPR eval rows when picking best row.",
+    )
+    parser.set_defaults(no_gpr=True)
+    parser.add_argument(
+        "--no-final-sfs",
+        "--no_final_sfs",
+        action="store_true",
+        help=(
+            "Exclude final_floating_sfs rows when picking best Spearman/Pearson "
+            "(use the next-best non-FFS model if FFS would win)."
+        ),
     )
     parser.add_argument(
         "--best-across-tracks",
@@ -1789,6 +1854,7 @@ def main() -> None:
         stability_weight=args.stability_weight,
         eval_model=args.eval_model,
         no_gpr=bool(args.no_gpr),
+        no_final_sfs=bool(args.no_final_sfs),
         best_across_tracks=bool(args.best_across_tracks),
         n_folds=args.n_folds,
     )

@@ -728,6 +728,7 @@ def load_generic_config(config_path: Path, repo_root: Path, *, resume: bool = Fa
             "is_scenario3": is_scenario3,
             "split_randomly": split_randomly,
             "exclude_stems": exclude_stems,
+            "include_features": include_features,
         }
 
     if calc_desc:

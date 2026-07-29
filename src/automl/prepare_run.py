@@ -433,19 +433,13 @@ def _filter_developability_columns_by_include_features(
     requested = [str(f).strip() for f in include_features if str(f).strip()]
     if not requested:
         return list(columns)
-    if not developability_is_json_dir:
-        warnings.warn(
-            f"{context}: include_features is ignored for features.csv developability sources "
-            "(the filter only applies to calculated descriptor JSON columns).",
-            UserWarning,
-            stacklevel=2,
-        )
-        return list(columns)
 
     available = list(columns)
     available_set = set(available)
 
     def _leaf_name(col: str) -> str:
+        if not developability_is_json_dir:
+            return col
         for group in _KNOWN_DEVELOPABILITY_JSON_GROUPS:
             prefix = f"{group}_"
             if col.startswith(prefix):

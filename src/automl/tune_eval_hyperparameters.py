@@ -556,7 +556,7 @@ def run_tuning(
     manifest_path: Path,
     margin: float = 0.1,
     max_rank: int = 3,
-    no_gpr: bool = False,
+    no_gpr: bool = True,
     models_root: Path | None = None,
     metrics_name: str = "tuned_eval_hyperparameters_metrics.csv",
     limit: int | None = None,
@@ -822,7 +822,22 @@ def main() -> None:
     )
     p.add_argument("--margin", type=float, default=0.1)
     p.add_argument("--max-rank", type=int, default=3)
-    p.add_argument("--no-gpr", action="store_true")
+    gpr_group = p.add_mutually_exclusive_group()
+    gpr_group.add_argument(
+        "--no-gpr",
+        "--no_gpr",
+        dest="no_gpr",
+        action="store_true",
+        help="Exclude GPR eval rows when shortlisting (default).",
+    )
+    gpr_group.add_argument(
+        "--with-gpr",
+        "--with_gpr",
+        dest="no_gpr",
+        action="store_false",
+        help="Include GPR eval rows when shortlisting.",
+    )
+    p.set_defaults(no_gpr=True)
     p.add_argument(
         "--models-root",
         type=Path,

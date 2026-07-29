@@ -1,0 +1,73 @@
+input_csvs_folder: datasets
+split_randomly: ab21.csv,hutchinson2023enhancement_top200tm1_igg.csv,jetha2019homology_RT.csv,pdgf38.csv
+
+input_structures_folder: structures_flashabb
+
+result_folder: our_flashabb_final_set_of_features
+
+# n_cpu: 4 # number of CPUs to use for descriptors calculation and AutoML, default all available
+
+structures_processing:
+  renumber_imgt: False
+  minimize: False
+
+include_features:
+  - pcf_neg_4w3A
+  - pcf_neg_7w3A
+  - pcf_pos_4w3A
+  - pcf_pos_7w3A
+  - pcf_hyd_4w3A
+  - pcf_hyd_7w3A
+  - neg_cluster_entropy
+  - pos_cluster_entropy
+  - neg_planarity_cdr
+  - pos_planarity_cdr
+  - aro_planarity_cdr
+  - nonpolar_planarity_cdr
+  - pos_patch
+  - neg_patch
+  - nonpolar_patch
+  - pos_patch_cdr
+  - neg_patch_cdr
+  - nonpolar_patch_cdr
+  - aro_exposed_sasa
+  - aro_all_sasa
+  - neg_exposed_sasa
+  - neg_all_sasa
+  - pos_exposed_sasa
+  - pos_all_sasa
+  - hyd_exposed_sasa
+  - hyd_all_sasa
+  - aro_sasa_cdr
+  - neg_sasa_cdr
+  - pos_sasa_cdr
+  - aro_exposure_cdr
+  - nonpolar_exposure_cdr
+  - neg_exposure_cdr
+  - pos_exposure_cdr
+  - exposure_weighted_hyd_score_cdr
+  - hbond_density_cdr
+  - scm_neg_ff19sb
+  - scm_pos_ff19sb
+  - sap_pos_aro_synergy
+  - sap_aro_neg_synergy
+  - sap_aro_score
+  - hbond_energy_density
+  - inter_chain_buried_sasa
+  - dipole_moment_ff19sb
+  - net_charge_by_pH_3
+  - net_charge_by_pH_7.5
+  - protein_pi
+  - cdr3_length
+  - charge_symmetry
+  - hyd_score
+  - number_of_salt_bridges
+  - fraction_gly_in_cdr
+  - fraction_pro_in_cdr
+  - fraction_aro_in_cdr
+  - fraction_pos_in_cdr
+  - fraction_neg_in_cdr
+  - fraction_gln_asn_in_cdr
+  - count_AspAsp_cdr
+  - count_AspGlu_cdr
+  - count_TyrTyr_cdr

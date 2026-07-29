@@ -45,9 +45,9 @@ pipeline:
       model: svm,elasticnet
       hyperparameters:
         sfs_min_improvement: 0.02
-    final_floating_sfs:
-      max_feature_fraction: 0.15
-      model: elasticnet,svm
+    # final_floating_sfs:
+    #   max_feature_fraction: 0.15
+    #   model: elasticnet,svm
   track_nonlinear:
     stability_reduction:
       model: randomforest
@@ -72,6 +72,6 @@ pipeline:
       model: randomforest,knn
       hyperparameters:
         sfs_min_improvement: 0.02
-    final_floating_sfs:
-      max_feature_fraction: 0.15
-      model: randomforest,knn
+    # final_floating_sfs:
+    #   max_feature_fraction: 0.15
+    #   model: randomforest,knn

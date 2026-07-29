@@ -1,6 +1,6 @@
 #!/bin/bash
 # mkdssp, propka, freesasa -> developability (parallel over PDB folders).
-# Usage: get_descriptors.sh [--output-dir DIR] [--parent-dir DIR ...] STRUCTURES_DIR ... [num_jobs] [--pH VALUE] [--sanity_check_abb2] [--remove_helper_outputs] [--clean-external-outputs]
+# Usage: get_descriptors.sh [--output-dir DIR] [--parent-dir DIR ...] STRUCTURES_DIR ... [num_jobs] [--pH VALUE] [--sanity_check_abb2] [--remove_helper_outputs] [--clean-external-outputs] [--append-failures]
 
 set -e
 
@@ -52,6 +52,7 @@ CLEAN_EXTERNAL_OUTPUTS=false
 SKIP_EXISTING=false
 SKIP_FAILED=false
 BATCH_SIZE=0
+APPEND_FAILURES=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -118,6 +119,10 @@ while [[ $# -gt 0 ]]; do
             fi
             BATCH_SIZE="$2"
             shift 2
+            ;;
+        --append-failures)
+            APPEND_FAILURES=true
+            shift
             ;;
         [0-9]*)
             NUM_JOBS="$1"
@@ -199,7 +204,7 @@ if [[ ${#STRUCTURES_DIRS[@]} -eq 0 ]]; then
   echo "  --remove_helper_outputs: delete dssp/propka/freesasa files after a structure's descriptor JSON is written." >&2
   echo "  --clean-external-outputs: after all descriptors for a dataset, remove dssp/, propka/, and sasa/ subdirs." >&2
   echo "  --skip-existing: skip any PDB whose descriptor JSON already exists (non-empty) in the results/ dir." >&2
-  echo "  --skip-failed: skip structures that failed in the current pipeline.log session and still lack JSON." >&2
+  echo "  --skip-failed: skip structures with unresolved failures in pipeline.log and still lack JSON." >&2
   exit 1
 fi
 
@@ -241,7 +246,13 @@ fi
 RUN_FAILED_TSV="${DESCRIPTOR_ROOT%/*}/failed_structures.tsv"
 RUN_TOTAL_FAILURES=0
 mkdir -p "$(dirname "$RUN_FAILED_TSV")"
-printf 'dataset\tstructure\treason\n' > "$RUN_FAILED_TSV"
+if [[ "$APPEND_FAILURES" == true ]]; then
+    if [[ ! -f "$RUN_FAILED_TSV" ]]; then
+        printf 'dataset\tstructure\treason\n' > "$RUN_FAILED_TSV"
+    fi
+else
+    printf 'dataset\tstructure\treason\n' > "$RUN_FAILED_TSV"
+fi
 cd "$PROJECT_ROOT"
 export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export NUM_JOBS SCRIPT_DIR
@@ -325,7 +336,9 @@ _pipeline_failure_records() {
     local json_dir="${2:-}"
     local since_session="${3:-since_session}"
     local mode="${4:-records}"
-    "${PY_ARR[@]}" - "$log_file" "$json_dir" "$since_session" "$mode" <<'PY'
+    local parser_script parser_rc
+    parser_script="$(mktemp)"
+    cat > "$parser_script" <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -344,7 +357,7 @@ for i, line in enumerate(lines):
 
 scan = lines[start_idx:] if since_session else lines
 
-fail_pat = re.compile(r"\] (DSSP|SASA|PROPKA|DESCRIPTORS) ✗ ([^:]+):?\s*(.*)$")
+fail_pat = re.compile(r"\] (INPUT|DSSP|SASA|PROPKA|DESCRIPTORS) ✗ ([^:]+):?\s*(.*)$")
 failures = {}
 for line in scan:
     m = fail_pat.search(line)
@@ -353,12 +366,12 @@ for line in scan:
         failures[stem] = (stage, reason)
 
 err_pat = re.compile(
-    r"Error calculating developability descriptors for .+/([^/]+)\.pdb: (.+)$"
+    r"Error calculating developability descriptors for (.+?\.pdb): (.+)$"
 )
 for line in scan:
     m = err_pat.search(line)
     if m:
-        stem, reason = m.group(1), m.group(2).strip()
+        stem, reason = Path(m.group(1)).stem, m.group(2).strip()
         failures.setdefault(stem, ("DESCRIPTORS", reason))
 
 if json_dir and json_dir.is_dir():
@@ -374,6 +387,13 @@ for stem in sorted(failures):
     else:
         print(f"{stem}\t{stage}\t{reason.replace(chr(9), ' ')}")
 PY
+    if "${PY_ARR[@]}" "$parser_script" "$log_file" "$json_dir" "$since_session" "$mode"; then
+        parser_rc=0
+    else
+        parser_rc=$?
+    fi
+    rm -f "$parser_script"
+    return "$parser_rc"
 }
 
 _pipeline_session_end_report() {
@@ -382,6 +402,13 @@ _pipeline_session_end_report() {
     local json_dir="$3"
     local -a fail_lines=()
     mapfile -t fail_lines < <(_pipeline_failure_records "$log_file" "$json_dir" since_session records)
+    local -a _nonempty_fail_lines=()
+    local _fail_line
+    for _fail_line in "${fail_lines[@]}"; do
+        [[ -z "$_fail_line" ]] && continue
+        _nonempty_fail_lines+=("$_fail_line")
+    done
+    fail_lines=("${_nonempty_fail_lines[@]}")
     local n=${#fail_lines[@]}
     echo "[$(date -Iseconds)] === Pipeline session END (${n} unresolved failure(s)) ===" >> "$log_file"
     if [[ $n -eq 0 ]]; then
@@ -621,7 +648,7 @@ _load_pipeline_failed_stems() {
     while IFS= read -r stem; do
         [[ -z "$stem" ]] && continue
         PIPELINE_FAILED_STEMS["$stem"]=1
-    done < <(_pipeline_failure_records "$log_file" "$json_dir" since_session stems)
+    done < <(_pipeline_failure_records "$log_file" "$json_dir" all_sessions stems)
     return 0
 }
 
@@ -1325,16 +1352,16 @@ DEV_PY
             if [[ "$SANITY_CHECK_ABB2" == true ]] && _is_abb2_sanity_skipped_stem "$_stem"; then
                 continue
             fi
-            if ! _is_valid_descriptor_pdb "$_pdb" "$_stem"; then
-                _sp_skipped_invalid=$((_sp_skipped_invalid + 1))
-                continue
-            fi
             if [[ "$SKIP_EXISTING" == true ]] && [[ -s "$DEV_JSON_OUTPUT_DIR/${_stem}.json" ]]; then
                 _sp_skipped_done=$((_sp_skipped_done + 1))
                 continue
             fi
             if [[ "$SKIP_FAILED" == true ]] && _is_pipeline_failed_stem "$_stem"; then
                 _sp_skipped_failed=$((_sp_skipped_failed + 1))
+                continue
+            fi
+            if ! _is_valid_descriptor_pdb "$_pdb" "$_stem"; then
+                _sp_skipped_invalid=$((_sp_skipped_invalid + 1))
                 continue
             fi
             _batch_stems+=("$_stem")
@@ -1376,7 +1403,7 @@ DEV_PY
             echo "  skip-existing: $_sp_skipped_done already-done structure(s) skipped"
         fi
         if [[ "$SKIP_FAILED" == true && $_sp_skipped_failed -gt 0 ]]; then
-            echo "  skip-failed: $_sp_skipped_failed structure(s) skipped (failed this session, no JSON yet; see ${PIPELINE_LOG})"
+            echo "  skip-failed: $_sp_skipped_failed structure(s) skipped (unresolved failure in pipeline.log, no JSON yet; see ${PIPELINE_LOG})"
         fi
         if [[ "$_sp_skipped_invalid" -gt 0 ]]; then
             echo "  invalid-input: $_sp_skipped_invalid invalid PDB file(s) skipped (see ${PIPELINE_LOG})"
@@ -1397,10 +1424,6 @@ DEV_PY
             if [[ ${#ALLOWED_NAMES[@]} -gt 0 ]]; then
                 # Pre-set name list (e.g. from --names-from-csv): filter in-memory.
                 for _sp_name in "${ALLOWED_NAMES[@]}"; do
-                    if ! _is_valid_descriptor_pdb "$STRUCTURES_DIR/${_sp_name}.pdb" "$_sp_name"; then
-                        _sp_skipped_invalid=$((_sp_skipped_invalid + 1))
-                        continue
-                    fi
                     if [[ "$SKIP_EXISTING" == true ]] && [[ -s "$DEV_JSON_OUTPUT_DIR/${_sp_name}.json" ]]; then
                         _sp_skipped_done=$((_sp_skipped_done + 1))
                         continue
@@ -1409,10 +1432,14 @@ DEV_PY
                         _sp_skipped_failed=$((_sp_skipped_failed + 1))
                         continue
                     fi
+                    if ! _is_valid_descriptor_pdb "$STRUCTURES_DIR/${_sp_name}.pdb" "$_sp_name"; then
+                        _sp_skipped_invalid=$((_sp_skipped_invalid + 1))
+                        continue
+                    fi
                     _sp_filtered+=("$_sp_name")
                 done
                 [[ "$SKIP_EXISTING" == true && $_sp_skipped_done -gt 0 ]] && echo "  skip-existing: $_sp_skipped_done already-done structure(s) skipped"
-                [[ "$SKIP_FAILED" == true && $_sp_skipped_failed -gt 0 ]] && echo "  skip-failed: $_sp_skipped_failed structure(s) skipped (failed this session, no JSON yet; see ${PIPELINE_LOG})"
+                [[ "$SKIP_FAILED" == true && $_sp_skipped_failed -gt 0 ]] && echo "  skip-failed: $_sp_skipped_failed structure(s) skipped (unresolved failure in pipeline.log, no JSON yet; see ${PIPELINE_LOG})"
                 [[ "$_sp_skipped_invalid" -gt 0 ]] && echo "  invalid-input: $_sp_skipped_invalid invalid PDB file(s) skipped (see ${PIPELINE_LOG})"
                 ALLOWED_NAMES=("${_sp_filtered[@]}")
                 ALLOWED_NAMES_CSV="$(printf '%s,' "${ALLOWED_NAMES[@]}")"
@@ -1424,10 +1451,6 @@ DEV_PY
                     _sp_stem="${_sp_pdb##*/}"; _sp_stem="${_sp_stem%.pdb}"
                     case "$_sp_stem" in *_full_atom_sasa|*_H_chain|*_L_chain|*_H|*_L) continue ;; esac
                     if [[ "$SANITY_CHECK_ABB2" == true ]] && _is_abb2_sanity_skipped_stem "$_sp_stem"; then continue; fi
-                    if ! _is_valid_descriptor_pdb "$_sp_pdb" "$_sp_stem"; then
-                        _sp_skipped_invalid=$((_sp_skipped_invalid + 1))
-                        continue
-                    fi
                     if [[ "$SKIP_EXISTING" == true ]] && [[ -s "$DEV_JSON_OUTPUT_DIR/${_sp_stem}.json" ]]; then
                         _sp_skipped_done=$((_sp_skipped_done + 1))
                         continue
@@ -1436,12 +1459,16 @@ DEV_PY
                         _sp_skipped_failed=$((_sp_skipped_failed + 1))
                         continue
                     fi
+                    if ! _is_valid_descriptor_pdb "$_sp_pdb" "$_sp_stem"; then
+                        _sp_skipped_invalid=$((_sp_skipped_invalid + 1))
+                        continue
+                    fi
                     _sp_filtered+=("$_sp_stem")
                     echo "$_sp_stem" >> "$_SP_NAMES_FILE"
                 done < <(find "$STRUCTURES_DIR" -maxdepth 1 -name "*.pdb" -type f \
                               ! -path '*/.*/*' ! -name "*_H.pdb" ! -name "*_L.pdb" -print0)
                 [[ "$SKIP_EXISTING" == true && $_sp_skipped_done -gt 0 ]] && echo "  skip-existing: $_sp_skipped_done already-done structure(s) skipped"
-                [[ "$SKIP_FAILED" == true && $_sp_skipped_failed -gt 0 ]] && echo "  skip-failed: $_sp_skipped_failed structure(s) skipped (failed this session, no JSON yet; see ${PIPELINE_LOG})"
+                [[ "$SKIP_FAILED" == true && $_sp_skipped_failed -gt 0 ]] && echo "  skip-failed: $_sp_skipped_failed structure(s) skipped (unresolved failure in pipeline.log, no JSON yet; see ${PIPELINE_LOG})"
                 [[ "$_sp_skipped_invalid" -gt 0 ]] && echo "  invalid-input: $_sp_skipped_invalid invalid PDB file(s) skipped (see ${PIPELINE_LOG})"
                 if [[ ${#_sp_filtered[@]} -gt 0 ]]; then
                     ALLOWED_NAMES=("${_sp_filtered[@]}")

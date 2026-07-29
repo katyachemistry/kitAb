@@ -661,9 +661,14 @@ run_descriptor_calculation() {
         _stage "  descriptor_batch_size: $DESCRIPTOR_BATCH_SIZE — processing in chunks"
     fi
     if [[ "$RESUME_MODE" -eq 1 ]]; then
-        desc_extra+=(--skip-existing)
-        _stage "  resume mode — structures with existing descriptor JSON will be skipped"
+        desc_extra+=(--skip-existing --skip-failed)
+        _stage "  resume mode — structures with existing descriptor JSON or unresolved prior failures will be skipped"
     fi
+
+    local failed_tsv="$REPO_ROOT/$RESULT_FOLDER/failed_structures.tsv"
+    mkdir -p "$(dirname "$failed_tsv")"
+    printf 'dataset\tstructure\treason\n' > "$failed_tsv"
+    desc_extra+=(--append-failures)
 
     local i
     for i in "${!structure_dirs[@]}"; do

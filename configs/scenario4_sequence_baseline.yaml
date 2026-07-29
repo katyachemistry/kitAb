@@ -1,0 +1,21 @@
+input_csvs_folder: datasets_ginkgo_no_hc_lc
+# exclude_datasets: ab21.csv
+
+result_folder: propermab_sequence_baseline_ginkgo_no_hc_lc
+
+# n_cpu: 4 # number of CPUs to use for descriptors calculation and AutoML, default all available
+
+predefined_descriptors:
+  folder: /storage/antibody_data/PairedStructures/kitAb/descriptors_propermab_abb2
+  allowed_suffixes:
+    - _abb2_1_propermab
+    - _abb2_2_propermab
+    - _abb2_3_propermab
+
+include_features:
+  - cdr_h3_length
+  - aromatic_cdr
+  - theoretical_pi
+  - n_charged_res_fv
+  - fv_charge
+  - fv_csp

@@ -198,7 +198,7 @@ def run_plot_fold_spearmans(
     inputs: list[str],
     out_dir: Path | None,
     *,
-    no_gpr: bool = False,
+    no_gpr: bool = True,
     dpi: int = 150,
     width_per_target: float = 2.2,
     height: float = 4.2,
@@ -265,12 +265,22 @@ def main() -> None:
         default=None,
         help="Output directory (default: ./analysis_results in cwd).",
     )
-    p.add_argument(
+    gpr_group = p.add_mutually_exclusive_group()
+    gpr_group.add_argument(
         "--no-gpr",
         "--no_gpr",
+        dest="no_gpr",
         action="store_true",
-        help="Exclude GPR rows when picking best Spearman row.",
+        help="Exclude GPR rows when picking best Spearman row (default).",
     )
+    gpr_group.add_argument(
+        "--with-gpr",
+        "--with_gpr",
+        dest="no_gpr",
+        action="store_false",
+        help="Include GPR rows when picking best Spearman row.",
+    )
+    p.set_defaults(no_gpr=True)
     p.add_argument("--dpi", type=int, default=150)
     p.add_argument("--width-per-target", type=float, default=2.2)
     p.add_argument("--height", type=float, default=4.2)

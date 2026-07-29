@@ -3,7 +3,7 @@ split_randomly: ab21.csv,hutchinson2023enhancement_top200tm1_igg.csv,jetha2019ho
 
 input_structures_folder: structures_abb2
 
-result_folder: our_abb2_minimal_features_baseline_2
+result_folder: our_abb2_sequence_only_baseline
 
 # n_cpu: 4 # number of CPUs to use for descriptors calculation and AutoML, default all available
 
@@ -12,15 +12,18 @@ structures_processing:
   minimize: False
 
 include_features:
-  - protein_pi
-  - cdr3_length
-  - hyd_score
-  - charge_symmetry
   - net_charge_by_pH_3
   - net_charge_by_pH_7.5
+  - protein_pi
+  - cdr3_length
+  - charge_symmetry
+  - hyd_score
   - fraction_gly_in_cdr
   - fraction_pro_in_cdr
   - fraction_aro_in_cdr
   - fraction_pos_in_cdr
   - fraction_neg_in_cdr
   - fraction_gln_asn_in_cdr
+  - count_AspAsp_cdr
+  - count_AspGlu_cdr
+  - count_TyrTyr_cdr
