@@ -1,0 +1,33 @@
+# Reproduce paper results from existing FlashABB structures (descriptors → AutoML).
+# Requires datasets/ and structures_flashabb/ under the repo root.
+inputs:
+  datasets_dir: datasets
+  structures_dir: structures_flashabb
+  split_randomly:
+    - ab21
+    - hutchinson2023enhancement_top200tm1_igg
+    - jetha2019homology_RT
+    - pdgf38
+
+run:
+  output_dir: runs/reproduce_paper_flashabb
+  resume: false
+
+structure_prediction:
+  enabled: false
+
+structure_processing:
+  enabled: false
+  renumber_imgt: false
+  minimize: false
+
+descriptors:
+  enabled: true
+  cleanup: false
+
+automl:
+  enabled: true
+  eval_models: all
+
+tuning:
+  enabled: false

@@ -149,6 +149,27 @@ yhat = predict_with_tuned_model("runs/.../models/...", feature_dataframe)
 
 Eval models are `linear`, `elasticnet`, `randomforest`, `svm`, and `knn`.
 
+## Reproduce paper results
+
+Reuse the paper structures (no structure prediction). Descriptors use the default final set (59 features), then AutoML.
+
+| Config | Structures |
+|--------|------------|
+| `examples/configs/reproduce-paper-abb2.yaml` | `structures_abb2` |
+| `examples/configs/reproduce-paper-abb3.yaml` | `structures_abb3_minimized` |
+| `examples/configs/reproduce-paper-flashabb.yaml` | `structures_flashabb` |
+
+Needs `datasets/` plus the matching `structures_*` tree under the repo root. Outputs go under `runs/reproduce_paper_<backend>/`.
+
+```bash
+source kitab.local.env
+./kitab.sh validate examples/configs/reproduce-paper-abb2.yaml
+./kitab.sh examples/configs/reproduce-paper-abb2.yaml
+# abb3 / flashabb:
+# ./kitab.sh examples/configs/reproduce-paper-abb3.yaml
+# ./kitab.sh examples/configs/reproduce-paper-flashabb.yaml
+```
+
 ## Tests
 
 ```bash

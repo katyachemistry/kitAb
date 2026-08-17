@@ -218,6 +218,9 @@ def test_example_manifests_validate(repo_root: Path):
         "descriptors-only.yaml",
         "automl-only.yaml",
         "full-with-tuning.yaml",
+        "reproduce-paper-abb2.yaml",
+        "reproduce-paper-abb3.yaml",
+        "reproduce-paper-flashabb.yaml",
     ):
         path = repo_root / "examples" / "configs" / name
         from kitab.config import load_yaml, is_legacy_config, parse_manifest_dict
