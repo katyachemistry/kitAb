@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Grid-search eval-regressor hyperparameters for analysis-shortlisted models."""
+"""Export analysis-shortlisted eval models; optionally grid-search hyperparameters."""
 
 from __future__ import annotations
 
@@ -32,11 +32,11 @@ from analysis.aggregated_csv import (
     eval_model_slug,
     expand_glob_pattern,
     is_our_source,
-    row_is_gpr_eval,
 )
 from analysis.features import (
     collapse_best_track_per_group,
     parse_features_frac_from_run_id,
+    parse_metric_cell,
     pick_preferred_row,
     select_close_top_models,
 )
@@ -51,6 +51,7 @@ from automl.utils import (
     _coerce_eval_hp_value,
     fit_regressor,
     make_regressor,
+    parse_eval_hyperparameters_mapping,
 )
 
 _NAME_COL = "name"
@@ -93,12 +94,6 @@ _EVAL_HP_GRIDS: dict[str, list[dict]] = {
         {"n_neighbors": 10, "weights": "distance"},
         {"n_neighbors": 15, "weights": "distance"},
     ],
-    "gpr": [
-        {"alpha": 1e-10},
-        {"alpha": 0.01},
-        {"alpha": 0.1},
-        {"alpha": 1.0},
-    ],
 }
 
 
@@ -119,6 +114,43 @@ def _eval_hp_grid_to_make_regressor_kwargs(model: str, hp_point: dict) -> dict:
         mr = _canonical_eval_hp_param(m, str(pk))
         out[mr] = _coerce_eval_hp_value(mr, pv)
     return out
+
+
+def _hp_from_manifest_block(block: dict, eval_model: str) -> tuple[dict, dict]:
+    """AutoML eval hyperparameters for ``eval_model`` (no HPO).
+
+    Returns ``(hp_raw_for_meta, hp_kwargs_for_make_regressor)``.
+    """
+    raw = block.get("eval_hyperparameters")
+    try:
+        parsed = parse_eval_hyperparameters_mapping(raw if raw else None)
+    except (ValueError, TypeError):
+        parsed = parse_eval_hyperparameters_mapping(None)
+    hp_kwargs = dict(parsed.get(str(eval_model).strip().lower()) or {})
+    return dict(hp_kwargs), hp_kwargs
+
+
+def _candidate_eval_setup(
+    cand: dict[str, str],
+    *,
+    tgt: str,
+    fold_dir: Path,
+) -> tuple[str, str, dict[str, list[str]], float | None] | None:
+    run_id = str(cand.get(COL_RUN_ID, ""))
+    em = eval_model_slug(run_id, tgt)
+    if em is None:
+        return None
+    feats_by_fold = _parse_features_by_fold(str(cand.get(COL_FEATURES, "")))
+    if not feats_by_fold:
+        return None
+    if not _fold_parquets_ready(fold_dir, _fold_keys_sorted(feats_by_fold)):
+        print(
+            f"Warning: fold parquets missing under {fold_dir} "
+            f"(re-run AutoML to regenerate fold parquets); skip {run_id!r}.",
+            file=sys.stderr,
+        )
+        return None
+    return run_id, em, feats_by_fold, _features_frac_for_run(run_id, tgt, fold_dir)
 
 
 _FOLD_KEY_RE = re.compile(r"^fold_(\d+)$")
@@ -222,7 +254,6 @@ def _filter_aggregated_for_summary(
     agg_rows: list[dict[str, str]],
     summary_row: dict[str, str],
     *,
-    no_gpr: bool,
     ignore_track: bool = False,
 ) -> list[dict[str, str]]:
     ds = str(summary_row.get(COL_DATASET, ""))
@@ -238,8 +269,6 @@ def _filter_aggregated_for_summary(
         if str(r.get(COL_TARGET, "")) != tgt:
             continue
         if not ignore_track and trk and str(r.get(COL_TRACK, "")).strip() != trk:
-            continue
-        if no_gpr and row_is_gpr_eval(r):
             continue
         out.append(r)
     return out
@@ -368,10 +397,7 @@ def _mean_cv_metrics(
         try:
             model = make_regressor(eval_model, **mkw)
             fit_regressor(model, X_tr, y_tr)
-            if eval_model == "gpr":
-                y_pred, _ = model.predict(X_te, return_std=True)
-            else:
-                y_pred = model.predict(X_te)
+            y_pred = model.predict(X_te)
         except Exception:
             continue
         sp, _ = _spearman_stat_p(y_te, y_pred)
@@ -444,13 +470,13 @@ def _fit_final_model(
     hp_kwargs: dict,
     random_state: int,
     features_frac: float | None,
-) -> tuple[Any | None, list[str]]:
+) -> tuple[Any | None, list[str], int]:
     train_df = _concat_deduped_train(fold_dir)
     if train_df is None:
-        return None, []
+        return None, [], 0
     cols = [c for c in feature_cols if c in train_df.columns]
     if not cols:
-        return None, []
+        return None, [], 0
     y = train_df[target_col].to_numpy(dtype=np.float64, copy=True)
     X = train_df.loc[:, cols].to_numpy(dtype=np.float64, copy=True)
     n_train = int(len(y))
@@ -475,7 +501,7 @@ def _fit_final_model(
     }
     model = make_regressor(eval_model, **mkw)
     fit_regressor(model, X, y)
-    return model, used_cols
+    return model, used_cols, n_train
 
 
 def load_tuned_model(model_dir: Path) -> tuple[Any, dict[str, Any]]:
@@ -504,11 +530,41 @@ def save_tuned_model(
     estimator: Any,
     meta: dict[str, Any],
 ) -> Path:
+    """Persist estimator + metadata atomically (compress=3 is storage-only)."""
+    import os
+    import tempfile
+
     model_dir = Path(model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
-    joblib.dump(estimator, model_dir / "estimator.joblib", compress=3)
-    with open(model_dir / "meta.json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2, ensure_ascii=False)
+    payload = dict(meta)
+    payload.setdefault("schema_version", 1)
+    payload.setdefault("scaling", "none")
+    # Write to temp files then rename for atomic publish.
+    fd, tmp_est = tempfile.mkstemp(prefix=".estimator_", suffix=".joblib", dir=model_dir)
+    os.close(fd)
+    try:
+        joblib.dump(estimator, tmp_est, compress=3)
+        est_path = model_dir / "estimator.joblib"
+        os.replace(tmp_est, est_path)
+    finally:
+        if os.path.exists(tmp_est):
+            try:
+                os.unlink(tmp_est)
+            except OSError:
+                pass
+    fd, tmp_meta = tempfile.mkstemp(prefix=".meta_", suffix=".json", dir=model_dir)
+    os.close(fd)
+    try:
+        with open(tmp_meta, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp_meta, model_dir / "meta.json")
+    finally:
+        if os.path.exists(tmp_meta):
+            try:
+                os.unlink(tmp_meta)
+            except OSError:
+                pass
     return model_dir
 
 
@@ -556,10 +612,10 @@ def run_tuning(
     manifest_path: Path,
     margin: float = 0.1,
     max_rank: int = 3,
-    no_gpr: bool = True,
     models_root: Path | None = None,
     metrics_name: str = "tuned_eval_hyperparameters_metrics.csv",
     limit: int | None = None,
+    grid_search: bool = True,
 ) -> TuningResult:
     manifest = _load_manifest(manifest_path)
     manifest_by_src = _manifest_by_developability_source(manifest)
@@ -588,6 +644,7 @@ def run_tuning(
         "cv_pearson_mean",
         "best_hyperparameters_json",
         "model_path",
+        "tuned",
     ]
     result_rows: list[dict[str, Any]] = []
     tuned_run_dirs: list[Path] = []
@@ -606,7 +663,6 @@ def run_tuning(
         pool = _filter_aggregated_for_summary(
             agg_rows,
             summary_row,
-            no_gpr=no_gpr,
             ignore_track=True,
         )
         if not pool:
@@ -640,40 +696,37 @@ def run_tuning(
         best_pear: float | None = None
 
         for cand in shortlisted:
-            run_id = str(cand.get(COL_RUN_ID, ""))
-            em = eval_model_slug(run_id, tgt)
-            if em is None:
+            setup = _candidate_eval_setup(cand, tgt=tgt, fold_dir=fold_dir)
+            if setup is None:
                 continue
-            feats_by_fold = _parse_features_by_fold(str(cand.get(COL_FEATURES, "")))
-            if not feats_by_fold:
-                continue
-            if not _fold_parquets_ready(fold_dir, _fold_keys_sorted(feats_by_fold)):
-                print(
-                    f"Warning: fold parquets missing under {fold_dir} "
-                    f"(re-run AutoML to regenerate fold parquets); skip {run_id!r}.",
-                    file=sys.stderr,
+            _run_id, em, feats_by_fold, feats_frac = setup
+            if grid_search:
+                hp_raw, sp, pe = _grid_search_candidate(
+                    fold_dir=fold_dir,
+                    target_col=tgt,
+                    features_by_fold=feats_by_fold,
+                    eval_model=em,
+                    random_state=random_state,
+                    features_frac=feats_frac,
                 )
-                continue
-            feats_frac = _features_frac_for_run(run_id, tgt, fold_dir)
-            hp_raw, sp, pe = _grid_search_candidate(
-                fold_dir=fold_dir,
-                target_col=tgt,
-                features_by_fold=feats_by_fold,
-                eval_model=em,
-                random_state=random_state,
-                features_frac=feats_frac,
-            )
-            if sp is None:
-                continue
+                if sp is None:
+                    continue
+                try:
+                    hp_kwargs = _eval_hp_grid_to_make_regressor_kwargs(em, hp_raw)
+                except (ValueError, TypeError):
+                    hp_kwargs = {}
+            else:
+                sp = parse_metric_cell(cand.get(COL_SPEAR, ""))
+                pe = parse_metric_cell(cand.get(COL_PEAR, ""))
+                if sp is None:
+                    continue
+                hp_raw, hp_kwargs = _hp_from_manifest_block(block, em)
             if best_run is None:
                 best_spear = sp
                 best_pear = pe
                 best_run = cand
                 best_hp_raw = hp_raw
-                try:
-                    best_hp_kwargs = _eval_hp_grid_to_make_regressor_kwargs(em, hp_raw)
-                except (ValueError, TypeError):
-                    best_hp_kwargs = {}
+                best_hp_kwargs = hp_kwargs
             else:
                 cand_pick = pick_preferred_row(
                     best_run,
@@ -687,14 +740,12 @@ def run_tuning(
                     best_pear = pe
                     best_run = cand
                     best_hp_raw = hp_raw
-                    try:
-                        best_hp_kwargs = _eval_hp_grid_to_make_regressor_kwargs(em, hp_raw)
-                    except (ValueError, TypeError):
-                        best_hp_kwargs = {}
+                    best_hp_kwargs = hp_kwargs
 
         if best_run is None or best_spear is None:
+            kind = "grid search" if grid_search else "shortlist"
             print(
-                f"Warning: grid search found no valid model for "
+                f"Warning: {kind} found no valid model for "
                 f"{summary_row.get(COL_DATASET)!r} {src!r} {tgt!r}.",
                 file=sys.stderr,
             )
@@ -705,7 +756,7 @@ def run_tuning(
         feats_by_fold = _parse_features_by_fold(str(best_run.get(COL_FEATURES, "")))
         feature_cols = _union_features(feats_by_fold)
         win_frac = _features_frac_for_run(run_id, tgt, fold_dir)
-        model, used_cols = _fit_final_model(
+        model, used_cols, n_train = _fit_final_model(
             fold_dir=fold_dir,
             target_col=tgt,
             feature_cols=feature_cols,
@@ -732,10 +783,14 @@ def run_tuning(
             "developability_source": src,
             "cv_spearman_mean": _json_float(best_spear),
             "cv_pearson_mean": _json_float(best_pear),
+            "training_row_count": int(n_train),
+            "n_features": len(used_cols),
+            "tuned": bool(grid_search),
             "scaling": "none",
             "inference_note": (
                 "Predict on raw (unscaled) descriptor values in feature_cols order. "
-                "Load with automl.tune_eval_hyperparameters.load_tuned_model(model_dir)."
+                "Load with automl.tune_eval_hyperparameters.load_tuned_model(model_dir) "
+                "or kitab.models.predict_with_tuned_model(model_dir, features)."
             ),
         }
         save_tuned_model(model_dir, estimator=model, meta=meta)
@@ -759,6 +814,7 @@ def run_tuning(
             "cv_pearson_mean": best_pear if best_pear is not None else "",
             "best_hyperparameters_json": json.dumps(best_hp_raw, ensure_ascii=False),
             "model_path": str(model_dir),
+            "tuned": bool(grid_search),
         })
     with open(metrics_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -766,8 +822,9 @@ def run_tuning(
         for r in result_rows:
             w.writerow(r)
 
+    kind = "tuned" if grid_search else "untuned"
     print(
-        f"Wrote {len(result_rows)} tuned model(s) under {models_root} "
+        f"Wrote {len(result_rows)} {kind} model(s) under {models_root} "
         f"and metrics to {metrics_path}",
         file=sys.stderr,
     )
@@ -822,22 +879,6 @@ def main() -> None:
     )
     p.add_argument("--margin", type=float, default=0.1)
     p.add_argument("--max-rank", type=int, default=3)
-    gpr_group = p.add_mutually_exclusive_group()
-    gpr_group.add_argument(
-        "--no-gpr",
-        "--no_gpr",
-        dest="no_gpr",
-        action="store_true",
-        help="Exclude GPR eval rows when shortlisting (default).",
-    )
-    gpr_group.add_argument(
-        "--with-gpr",
-        "--with_gpr",
-        dest="no_gpr",
-        action="store_false",
-        help="Include GPR eval rows when shortlisting.",
-    )
-    p.set_defaults(no_gpr=True)
     p.add_argument(
         "--models-root",
         type=Path,
@@ -848,6 +889,14 @@ def main() -> None:
         ),
     )
     p.add_argument("--limit", type=int, default=None)
+    p.add_argument(
+        "--skip-grid-search",
+        action="store_true",
+        help=(
+            "Refit and save shortlisted models with AutoML eval hyperparameters "
+            "(no hyperparameter search)."
+        ),
+    )
     p.add_argument(
         "--clean-folds",
         action="store_true",
@@ -888,15 +937,16 @@ def main() -> None:
         manifest_path=manifest_path,
         margin=float(args.margin),
         max_rank=int(args.max_rank),
-        no_gpr=bool(args.no_gpr),
         models_root=models_root,
         limit=args.limit,
+        grid_search=not args.skip_grid_search,
     )
 
     if result.expected_jobs > 0 and result.tuned_jobs < result.expected_jobs:
         raise SystemExit(
-            f"Tuning incomplete: {result.tuned_jobs}/{result.expected_jobs} model(s) "
-            f"written to {result.metrics_path}. Fold parquets and other artifacts were kept."
+            f"Model export incomplete: {result.tuned_jobs}/{result.expected_jobs} "
+            f"model(s) written to {result.metrics_path}. Fold parquets and other "
+            "artifacts were kept."
         )
 
     if args.clean_folds:

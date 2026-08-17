@@ -8,7 +8,6 @@ result_folder: flashabb
 structure_prediction:
   model: flashabb
   device: 1 # GPU index (0, 1, …) or cuda:0 / cpu
-  runs: 3 # number of runs; FlashABB is stochastic so multiple runs assess reproducibility
   skip_existing: true # skip antibodies whose .pdb already exists (safe for pipeline restarts)
   # batch_size: 50 # FlashABB default batch size is 50; increase if VRAM allows
 

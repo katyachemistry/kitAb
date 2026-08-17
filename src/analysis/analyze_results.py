@@ -34,7 +34,6 @@ from analysis.aggregated_csv import (
     expand_paths as _expand_paths,
     is_our_source as _is_our_source,
     resolve_output_dir,
-    row_is_gpr_eval as _row_is_gpr_eval,
     row_matches_eval_model_filter as _row_matches_eval_model_filter,
     run_suffix_after_target as _run_suffix_after_target,
     selector_model_frac as _selector_model_frac,
@@ -364,15 +363,11 @@ def _row_is_final_floating_sfs(row: dict[str, Any]) -> bool:
 
 
 def _rows_for_best_pick(
-    group_rows: list[dict[str, Any]], *, no_gpr: bool, no_final_sfs: bool = False
+    group_rows: list[dict[str, Any]], *, no_final_sfs: bool = False
 ) -> tuple[list[dict[str, Any]], bool]:
-    if not no_gpr and not no_final_sfs:
+    if not no_final_sfs:
         return group_rows, False
-    filtered = group_rows
-    if no_gpr:
-        filtered = [r for r in filtered if not _row_is_gpr_eval(r)]
-    if no_final_sfs:
-        filtered = [r for r in filtered if not _row_is_final_floating_sfs(r)]
+    filtered = [r for r in group_rows if not _row_is_final_floating_sfs(r)]
     if not filtered:
         return group_rows, True
     return filtered, False
@@ -554,7 +549,6 @@ def build_summary(
     stability_random_seed: int = 42,
     stability_weight: float = 0.1,
     eval_model: str | None = None,
-    no_gpr: bool = True,
     no_final_sfs: bool = False,
     best_across_tracks: bool = False,
 ) -> tuple[list[dict[str, Any]], int]:
@@ -583,10 +577,10 @@ def build_summary(
         else:
             trk_out = str(key[3])
         g_spear, fb_s = _rows_for_best_pick(
-            g, no_gpr=no_gpr, no_final_sfs=no_final_sfs
+            g, no_final_sfs=no_final_sfs
         )
         g_pear, fb_p = _rows_for_best_pick(
-            g, no_gpr=no_gpr, no_final_sfs=no_final_sfs
+            g, no_final_sfs=no_final_sfs
         )
         if fb_s or fb_p:
             filter_fallback_groups += 1
@@ -943,7 +937,6 @@ def run_best_metrics_from_aggregated(
     stability_seed: int = 42,
     stability_weight: float = 0.1,
     eval_model: str | None = None,
-    no_gpr: bool = True,
     no_final_sfs: bool = False,
     best_across_tracks: bool = False,
     n_folds: int = 4,
@@ -998,19 +991,13 @@ def run_best_metrics_from_aggregated(
         stability_random_seed=stability_seed,
         stability_weight=stability_weight,
         eval_model=eval_model,
-        no_gpr=no_gpr,
         no_final_sfs=no_final_sfs,
         best_across_tracks=best_across_tracks,
     )
-    if filter_fallback_groups and (no_gpr or no_final_sfs):
-        excluded: list[str] = []
-        if no_gpr:
-            excluded.append("GPR")
-        if no_final_sfs:
-            excluded.append("final_floating_sfs")
+    if filter_fallback_groups and no_final_sfs:
         print(
             f"Warning: {filter_fallback_groups} group(s) had no rows left after excluding "
-            f"{' and '.join(excluded)}; those groups used the full row set.",
+            f"final_floating_sfs; those groups used the full row set.",
             file=sys.stderr,
         )
     if not summary and rows and eval_model and str(eval_model).strip():
@@ -1690,22 +1677,6 @@ def main() -> None:
         type=str,
         default=None,
     )
-    gpr_group = parser.add_mutually_exclusive_group()
-    gpr_group.add_argument(
-        "--no-gpr",
-        "--no_gpr",
-        dest="no_gpr",
-        action="store_true",
-        help="Exclude GPR eval rows when picking best row (default).",
-    )
-    gpr_group.add_argument(
-        "--with-gpr",
-        "--with_gpr",
-        dest="no_gpr",
-        action="store_false",
-        help="Include GPR eval rows when picking best row.",
-    )
-    parser.set_defaults(no_gpr=True)
     parser.add_argument(
         "--no-final-sfs",
         "--no_final_sfs",
@@ -1853,7 +1824,6 @@ def main() -> None:
         stability_seed=args.stability_seed,
         stability_weight=args.stability_weight,
         eval_model=args.eval_model,
-        no_gpr=bool(args.no_gpr),
         no_final_sfs=bool(args.no_final_sfs),
         best_across_tracks=bool(args.best_across_tracks),
         n_folds=args.n_folds,
@@ -1893,7 +1863,6 @@ def main() -> None:
         rc = run_plot_fold_spearmans(
             args.inputs,
             plot_dir,
-            no_gpr=bool(args.no_gpr),
         )
         if rc != 0:
             raise SystemExit(rc)

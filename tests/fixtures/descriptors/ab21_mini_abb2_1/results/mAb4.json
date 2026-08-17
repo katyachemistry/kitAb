@@ -1,0 +1,14 @@
+{
+  "name": "mAb4",
+  "surface": {
+    "protein_pi": 6.8,
+    "hyd_score": 0.1
+  },
+  "core": {},
+  "general": {
+    "cdr3_length": 13
+  },
+  "sequence_motives": {
+    "fraction_gly_in_cdr": 0.1
+  }
+}

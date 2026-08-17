@@ -20,7 +20,6 @@ from analysis.aggregated_csv import (
     COL_TARGET,
     expand_paths,
     fold_spearman_columns,
-    is_gpr_run,
     is_our_source,
     resolve_output_dir,
 )
@@ -31,17 +30,9 @@ ALPHA_BOX = 0.55
 DOT_SIZE = 28
 
 
-def _best_row(sub: pd.DataFrame, *, no_gpr: bool) -> pd.Series | None:
+def _best_row(sub: pd.DataFrame) -> pd.Series | None:
     if sub is None or len(sub) == 0:
         return None
-    if no_gpr:
-        filt = sub[
-            ~sub.apply(
-                lambda r: is_gpr_run(str(r[COL_RUN_ID]), str(r[COL_TARGET])), axis=1
-            )
-        ]
-        if len(filt):
-            sub = filt
     s = pd.to_numeric(sub[COL_SPEAR], errors="coerce")
     return sub.loc[s.idxmax()] if s.notna().any() else None
 
@@ -63,7 +54,6 @@ def plot_dataset(
     dataset_stem: str,
     out_png: Path,
     *,
-    no_gpr: bool,
     dpi: int,
     width_per_target: float,
     height: float,
@@ -109,7 +99,7 @@ def plot_dataset(
         mean_spearmans: list[float] = []
         for src in sources:
             src_rows = rows[rows[COL_SOURCE] == src]
-            best = _best_row(src_rows, no_gpr=no_gpr)
+            best = _best_row(src_rows)
             if best is None:
                 continue
             ys = _fold_ys(best, fc)
@@ -180,9 +170,8 @@ def plot_dataset(
     ax.set_ylabel("Spearman ρ (per fold)", fontsize=9)
     ax.tick_params(axis="both", labelsize=8)
 
-    no_gpr_note = "  |  GPR excluded" if no_gpr else ""
     fig.suptitle(
-        f"{dataset_stem}{no_gpr_note}",
+        f"{dataset_stem}",
         fontsize=10,
         fontweight="medium",
         y=1.02,
@@ -198,7 +187,6 @@ def run_plot_fold_spearmans(
     inputs: list[str],
     out_dir: Path | None,
     *,
-    no_gpr: bool = True,
     dpi: int = 150,
     width_per_target: float = 2.2,
     height: float = 4.2,
@@ -240,7 +228,6 @@ def run_plot_fold_spearmans(
             df,
             ds,
             out_png,
-            no_gpr=no_gpr,
             dpi=dpi,
             width_per_target=width_per_target,
             height=height,
@@ -265,22 +252,6 @@ def main() -> None:
         default=None,
         help="Output directory (default: ./analysis_results in cwd).",
     )
-    gpr_group = p.add_mutually_exclusive_group()
-    gpr_group.add_argument(
-        "--no-gpr",
-        "--no_gpr",
-        dest="no_gpr",
-        action="store_true",
-        help="Exclude GPR rows when picking best Spearman row (default).",
-    )
-    gpr_group.add_argument(
-        "--with-gpr",
-        "--with_gpr",
-        dest="no_gpr",
-        action="store_false",
-        help="Include GPR rows when picking best Spearman row.",
-    )
-    p.set_defaults(no_gpr=True)
     p.add_argument("--dpi", type=int, default=150)
     p.add_argument("--width-per-target", type=float, default=2.2)
     p.add_argument("--height", type=float, default=4.2)
@@ -293,7 +264,6 @@ def main() -> None:
         run_plot_fold_spearmans(
             args.inputs,
             args.out_dir,
-            no_gpr=bool(args.no_gpr),
             dpi=args.dpi,
             width_per_target=args.width_per_target,
             height=args.height,

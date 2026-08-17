@@ -161,7 +161,6 @@ def process_one_dataset_abb2(
     out_root: Path,
     runs: int,
     skip_existing: bool,
-    n_threads_save: int,
 ) -> None:
     import time
 
@@ -197,7 +196,7 @@ def process_one_dataset_abb2(
                     print(f"  [{idx}/{n_total}] {name} skip (exists)", flush=True)
                 continue
 
-            print(f"  [{idx}/{n_total}] {name} predict+refine ...", flush=True)
+            print(f"  [{idx}/{n_total}] {name} predict ...", flush=True)
             t0 = time.monotonic()
             sequences = {"H": heavy, "L": light}
             try:
@@ -213,11 +212,8 @@ def process_one_dataset_abb2(
                 continue
 
             try:
-                antibody.save(
-                    str(pdb_path),
-                    check_for_strained_bonds=True,
-                    n_threads=n_threads_save,
-                )
+                rank0 = antibody.ranking[0] if getattr(antibody, "ranking", None) else 0
+                antibody.save_single_unrefined(str(pdb_path), index=rank0)
                 n_ok += 1
                 print(
                     f"  [{idx}/{n_total}] {name} ok ({time.monotonic() - t0:.1f}s)",
@@ -264,10 +260,6 @@ def main_abb2(args: argparse.Namespace) -> None:
     for csv_path, stem in jobs:
         print(f"  - {stem!r} <- {csv_path}", flush=True)
 
-    n_threads_save = args.refine_threads
-    if n_threads_save == 0:
-        n_threads_save = -1
-
     for csv_path, dataset in jobs:
         process_one_dataset_abb2(
             csv_path,
@@ -276,7 +268,6 @@ def main_abb2(args: argparse.Namespace) -> None:
             out_root,
             args.runs,
             args.skip_existing,
-            n_threads_save,
         )
 
     print(f"\nDone. Outputs under {out_root}", flush=True)
@@ -736,7 +727,7 @@ def main(argv: list[str] | None = None) -> None:
         "--refine-threads",
         type=int,
         default=1,
-        help="n_threads passed to OpenMM refinement in antibody.save (default: 1).",
+        help="Ignored: kitAb writes unrefined ABB2 PDBs; OpenMM refinement uses the kitab env.",
     )
 
     abb3_p = sub.add_parser(

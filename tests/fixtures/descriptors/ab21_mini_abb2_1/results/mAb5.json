@@ -1,0 +1,14 @@
+{
+  "name": "mAb5",
+  "surface": {
+    "protein_pi": 6.9,
+    "hyd_score": 0.1
+  },
+  "core": {},
+  "general": {
+    "cdr3_length": 14
+  },
+  "sequence_motives": {
+    "fraction_gly_in_cdr": 0.1
+  }
+}

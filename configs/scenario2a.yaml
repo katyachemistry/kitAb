@@ -2,12 +2,6 @@
 # input_structures_folder: /storage/antibody_data/PairedStructures/structures
 input_structures_folder: /storage/antibody_data/PairedStructures/structures
 
-# How to discover jobs inside input_structures_folder:
-#   auto    – (default) one job per subdirectory if any contain PDB/mmCIF files,
-#             otherwise the root folder itself is treated as a single job.
-#   flat    – root folder is one job; no directory scan (use for millions of PDB files).
-#   subdirs – one job per subdirectory; error if none found.
-structures_layout: flat
 result_folder: abngs_paired
 
 n_cpu: 56

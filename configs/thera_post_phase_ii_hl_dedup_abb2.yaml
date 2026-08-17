@@ -1,0 +1,36 @@
+# ABB2 structures + developability descriptors for HL-deduped post–Phase II therapeutics.
+# No AutoML.
+#
+# Input CSV must use kitAb columns: name, heavy, light, target_*
+# (prepared from thersabdab_21_june_post_phase_ii_hl_dedup.csv).
+
+inputs:
+  datasets_dir: data_thera/kitab_post_phase_ii_hl_dedup  # CSVs with name, heavy, light, target_*
+
+run:
+  output_dir: thera_post_phase_ii_hl_dedup_abb2  # all generated files go here
+  resume: false                                  # false aborts if output_dir has files; true continues it and skips finished descriptor JSONs
+  n_cpu: 56                                      # CPU workers
+
+structure_prediction:
+  enabled: true                          # predict structures from sequences
+  model: abb2                            # one or more of abb2, abb3, flashabb — e.g. [abb2, abb3]
+  device: cuda:0
+  skip_existing: true                    # skip PDBs already in this run (output_dir/structures/{dataset}_{model}_1/{name}.pdb); does not use structures_dir
+
+structure_processing:
+  enabled: false                         # IMGT renumber / OpenMM minimize
+  renumber_imgt: false
+  minimize: false
+  minimize_attempts: 5                   # retries per structure if minimize is on
+
+descriptors:
+  enabled: true                          # compute developability descriptors
+  cleanup: true                          # after each JSON, delete .dssp, _full.pka/.log, _full/_H_full/_L_full.sasa
+  # batch_size: 0                        # process all in one pass (~700 structures)
+
+automl:
+  enabled: false                         # no models
+
+tuning:
+  enabled: false                         # unused without AutoML

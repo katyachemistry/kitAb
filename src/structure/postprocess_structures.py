@@ -195,9 +195,8 @@ def run_anarci_imgt(name: str, sequence: str, allow_partial: bool = False) -> Nu
     except ImportError as exc:
         raise SystemExit(
             "ERROR: Could not import ANARCI.\n"
-            "Install it first, for example in a conda environment where ANARCI works:\n"
-            "  pip install anarci\n"
-            "or follow the ANARCI repository installation instructions.\n"
+            "IMGT numbering uses the core kitab env (installed by ./install.sh).\n"
+            "  source kitab.local.env && conda activate kitab\n"
         ) from exc
 
     numbering, alignment_details, _hit_tables = anarci(

@@ -1,0 +1,23 @@
+# AutoML on precomputed descriptors
+inputs:
+  datasets_dir: datasets                 # CSVs with name, heavy, light, target_*
+  predefined_descriptors_dir: descriptors_reproducibility_finalization  # existing descriptor runs ({dataset} or {dataset}_...)
+  split_randomly: [ab21]                 # random 5-fold CV for these stems (skip MMseqs2)
+
+run:
+  output_dir: runs/example_automl_only   # all generated files go here
+  skip_existing_results: false           # true = reuse existing AutoML outputs
+
+structure_prediction:
+  enabled: false                         # no structure prediction
+
+descriptors:
+  enabled: false                         # descriptors already computed
+
+automl:
+  enabled: true                          # train/eval models on precomputed descriptors
+  eval_models: all                       # final scoring regressors only (not selectors): all, or linear,elasticnet,randomforest,svm,knn
+  # config_path: src/automl.yaml         # optional: custom AutoML YAML (selectors, features_frac); default is src/automl.yaml
+
+tuning:
+  enabled: false                         # opt-in hyperparameter search (top models are always saved after AutoML)

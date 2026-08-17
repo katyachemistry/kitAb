@@ -1,7 +1,8 @@
-# kitAb unified descriptor environment
+# kitAb unified descriptor + post-processing environment
 # --------------------------------------
-# Covers: developability (calculate_descriptors), utils parsers, and automl under src/
-# (excluding structure prediction ABB2/ABB3 and OpenMM minimization — separate envs later).
+# Covers: developability (calculate_descriptors), IMGT renumbering (ANARCI),
+# OpenMM/PDBFixer minimization, utils parsers, and automl under src/.
+# Structure *prediction* (ABB2/ABB3/FlashABB) stays in separate backend envs.
 #
 # CLI tools on PATH after activate:
 #   mkdssp   (conda package `dssp`, modern DSSP)
@@ -9,6 +10,7 @@
 #   propka3  (conda package `propka`)
 #   mmseqs   (conda package `mmseqs2` from bioconda — sequence clustering for CV folds)
 #   parallel (GNU parallel — get_descriptors.sh / run_automl.sh)
+#   hmmscan  (HMMER, pulled in with anarci)
 #
 # Create (mamba recommended):
 #   ./install.sh
@@ -36,6 +38,11 @@ dependencies:
   - propka=3.5.1        # provides `propka3` (install.sh patches for Python 3.14)
   - mmseqs2             # provides `mmseqs` (sequence-identity clustering for AutoML CV folds)
   - parallel            # GNU parallel (get_descriptors.sh / run_automl.sh)
+
+  # --- Shared structure post-processing (independent of prediction backends) ---
+  - openmm=8.4.0
+  - pdbfixer=1.12
+  - anarci=2024.05.21   # IMGT numbering + HMMER/hmmscan
 
   # --- Core scientific Python (developability + automl) ---
   - numpy=2.4.2

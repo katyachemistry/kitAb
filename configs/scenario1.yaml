@@ -7,7 +7,6 @@ result_folder: scenario1_abb2
 structure_prediction:
   model: abb2 # abb2
   device: 1 # GPU index (0, 1, …) or cuda:0 / cpu
-  runs: 2 # number of runs for structure prediction, default 1. Use multiple runs to check reproducibility
   skip_existing: true # skip antibodies whose .pdb already exists (safe for pipeline restarts)
   # batch_size: 4 # ABB3 mini-batch size (antibodies per forward pass); default 4; ignored by ABB2
 

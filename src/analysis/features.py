@@ -48,7 +48,6 @@ EVAL_MODEL_PREFERENCE: tuple[str, ...] = (
     "svm",
     "knn",
     "randomforest",
-    "gpr",
 )
 _EVAL_MODEL_RANK: dict[str, int] = {
     name: i for i, name in enumerate(EVAL_MODEL_PREFERENCE)

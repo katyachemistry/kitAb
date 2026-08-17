@@ -14,10 +14,18 @@ DEFAULT_FEATURES_FRAC_CSV: str = ",".join(str(x) for x in DEFAULT_FEATURES_FRACS
 
 DEFAULT_EVAL_MODELS: str = "all"
 
+# Models included when eval_models is "all" (Gaussian Process Regression removed).
+DEFAULT_EVAL_MODEL_ORDER: tuple[str, ...] = (
+    "linear",
+    "elasticnet",
+    "randomforest",
+    "svm",
+    "knn",
+)
+
 DEFAULT_EVAL_HYPERPARAMETERS_RAW: dict[str, dict] = {
     "elasticnet": {"alpha": 0.01},
     "knn": {"weights": "distance"},
-    "gpr": {"alpha": 0.1},
 }
 
 DEFAULT_LOW_VARIANCE_RELATIVE_STD_THRESHOLD: float = 0.01

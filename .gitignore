@@ -34,4 +34,12 @@
 !install.sh
 !environment.yml
 !environment-abb2.yml
+!environment-flashabb.yml
 !README.md
+!pytest.ini
+
+!examples/
+!examples/**
+
+!tests/
+!tests/**

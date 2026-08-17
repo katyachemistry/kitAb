@@ -53,16 +53,6 @@ def row_matches_eval_model_filter(
     return slug is not None and slug == eval_model_lc
 
 
-def row_is_gpr_eval(row: dict[str, Any]) -> bool:
-    return eval_model_slug(str(row.get(COL_RUN_ID, "")), str(row.get(COL_TARGET, ""))) == "gpr"
-
-
-def is_gpr_run(run_id: str, target_col: str) -> bool:
-    return eval_model_slug(run_id, target_col) == "gpr" or bool(
-        re.search(r"(^|-)gpr(-|$)", str(run_id).lower()) and "frac" in str(run_id).lower()
-    )
-
-
 def run_suffix_after_target(run_id: str, target_col: str) -> str:
     prefix = target_col + "-"
     if run_id.startswith(prefix):

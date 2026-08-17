@@ -1,0 +1,30 @@
+# Existing structures + assay CSVs -> descriptors -> AutoML
+inputs:
+  datasets_dir: datasets                 # CSVs with name, heavy, light, target_*
+  structures_dir: structures_abb2        # existing PDB/mmCIF folders
+  split_randomly: [ab21]                 # random 5-fold CV for these stems (skip MMseqs2)
+
+run:
+  output_dir: runs/example_existing_structures  # all generated files go here
+  resume: false                                 # false aborts if output_dir has files; true continues it and skips finished descriptor JSONs
+
+structure_prediction:
+  enabled: false                         # sequences already have structures
+
+structure_processing:
+  enabled: false                         # IMGT renumber / OpenMM minimize
+  renumber_imgt: false
+  minimize: false
+  minimize_attempts: 5                   # retries per structure if minimize is on
+
+descriptors:
+  enabled: true                          # compute developability descriptors
+  cleanup: false                         # after each JSON, delete .dssp, _full.pka/.log, _full/_H_full/_L_full.sasa
+
+automl:
+  enabled: true                          # train/eval models on descriptors
+  eval_models: all                       # final scoring regressors only (not selectors): all, or linear,elasticnet,randomforest,svm,knn
+  # config_path: src/automl.yaml         # optional: custom AutoML YAML (selectors, features_frac); default is src/automl.yaml
+
+tuning:
+  enabled: false                         # opt-in hyperparameter search (top models are always saved after AutoML)

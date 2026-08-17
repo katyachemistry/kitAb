@@ -7,7 +7,6 @@ result_folder: scenario3
 structure_prediction:
   model: abb3 # abb2 | abb3 | flashabb
   device: 0 # GPU index (0, 1, …) or cuda:0 / cpu
-  runs: 1
   skip_existing: true
   # batch_size: 4 # default 4 for abb2/abb3; default 50 for flashabb
 

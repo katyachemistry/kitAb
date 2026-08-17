@@ -9,7 +9,3 @@ skip_existing_results: true
 
 predefined_descriptors:
   folder: /storage/antibody_data/PairedStructures/kitAb/descriptors_our_abb2_minimal_features_baseline
-  allowed_suffixes:
-    - _abb2_1
-    - _abb2_2
-    - _abb2_3

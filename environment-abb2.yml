@@ -1,4 +1,6 @@
-# kitAb ABodyBuilder2 + post-processing (ImmuneBuilder, ANARCI, OpenMM).
+# kitAb ABodyBuilder2 prediction (ImmuneBuilder).
+# OpenMM / PDBFixer / ANARCI remain because ImmuneBuilder imports them; kitAb
+# pipeline refinement and IMGT numbering use the core `kitab` env instead.
 # PyTorch + ImmuneBuilder are installed by install.sh (CUDA wheel index is machine-specific).
 #
 #   mamba env create -f environment-abb2.yml

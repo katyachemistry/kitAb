@@ -3,6 +3,9 @@
 # Usage: predict_structure.sh [--abb3|--abb2|--flashabb] [--data-dir DIR] [--output-root DIR] [--runs N]
 #   [--skip-existing] [--no-renumber] [--no-minimize] [--minimize-jobs N]
 #   [--renumber-only|--minimization-only] [--structures-dir DIR] [--allow-partial-domain]
+#
+# Prediction uses only the selected backend conda env. IMGT numbering and OpenMM
+# minimization always use the core kitab env (openmm 8.4 / pdbfixer 1.12 / anarci).
 
 set -euo pipefail
 
@@ -18,17 +21,8 @@ if [[ -f "$REPO_ROOT/kitab.local.env" ]]; then
     # shellcheck disable=SC1091
     source "$REPO_ROOT/kitab.local.env"
 fi
-KITAB_ENV_ABB2="${KITAB_ENV_ABB2:-kitab-abb2}"
-KITAB_ENV_ABB3="${KITAB_ENV_ABB3:-kitab-abb3}"
-KITAB_ENV_FLASHABB="${KITAB_ENV_FLASHABB:-kitab-flashabb}"
-ABB3_PYTHON_BIN="$("$CONDA_RUN_BIN" run -n "$KITAB_ENV_ABB3" python -c 'import sys; print(sys.executable)')"
-ABB2_PYTHON_BIN="$("$CONDA_RUN_BIN" run -n "$KITAB_ENV_ABB2" python -c 'import sys; print(sys.executable)')"
-# FlashABB env resolution is fault-tolerant: if the env is absent and --flashabb is not
-# passed, the script continues. The binary is checked only when backend=flashabb.
-FLASHABB_PYTHON_BIN="$("$CONDA_RUN_BIN" run -n "$KITAB_ENV_FLASHABB" python -c 'import sys; print(sys.executable)' 2>/dev/null || echo "")"
-ABB2_ENV_BIN_DIR="$(dirname -- "$ABB2_PYTHON_BIN")"
-export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
+KITAB_ENV="${KITAB_ENV:-kitab}"
 KITAB_ENV_ABB2="${KITAB_ENV_ABB2:-kitab-abb2}"
 KITAB_ENV_ABB3="${KITAB_ENV_ABB3:-kitab-abb3}"
 KITAB_ENV_FLASHABB="${KITAB_ENV_FLASHABB:-kitab-flashabb}"
@@ -42,12 +36,8 @@ ABB2_DEVICE="${ABB2_DEVICE:-$ABB3_DEVICE}"
 ABB2_BATCH_SIZE="${ABB2_BATCH_SIZE:-$ABB3_BATCH_SIZE}"
 FLASHABB_DEVICE="${FLASHABB_DEVICE:-$ABB3_DEVICE}"
 FLASHABB_BATCH_SIZE="${FLASHABB_BATCH_SIZE:-50}"
-ABB3_PYTHON_CMD=("$ABB3_PYTHON_BIN")
-ABB2_PYTHON_CMD=("$ABB2_PYTHON_BIN")
-FLASHABB_PYTHON_CMD=("$FLASHABB_PYTHON_BIN")
-# Minimization always uses the Python from the backend's own env (all have openmm).
-# Defaults to ABB3; overridden to FLASHABB_PYTHON_CMD when backend is flashabb.
-MINIMIZE_PYTHON_CMD=("${ABB3_PYTHON_CMD[@]}")
+
+export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
 BACKEND=abb3
 HAVE_ABB3=0
@@ -201,6 +191,62 @@ if [[ "$RENUMBER_ONLY" -eq 1 && ${#STRUCTURES_DIRS[@]} -eq 0 ]]; then
     exit 1
 fi
 
+conda_python_bin() {
+    local env_name="$1"
+    "$CONDA_RUN_BIN" run -n "$env_name" python -c 'import sys; print(sys.executable)' 2>/dev/null || true
+}
+
+require_conda_python() {
+    local env_name="$1"
+    local role="$2"
+    local bin
+    bin="$(conda_python_bin "$env_name")"
+    if [[ -z "$bin" || ! -x "$bin" ]]; then
+        echo "Conda env '$env_name' not found ($role)." >&2
+        echo "Run ./install.sh (use --skip to omit unused predictors)." >&2
+        exit 1
+    fi
+    printf '%s\n' "$bin"
+}
+
+prepend_python_lib() {
+    local py_bin="$1"
+    local lib_dir
+    lib_dir="$(cd -- "$(dirname -- "$py_bin")/../lib" && pwd)"
+    export LD_LIBRARY_PATH="${lib_dir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+}
+
+KITAB_PYTHON_BIN="$(require_conda_python "$KITAB_ENV" "core kitab env: ANARCI / OpenMM / descriptors")"
+KITAB_PYTHON_CMD=("$KITAB_PYTHON_BIN")
+KITAB_ENV_BIN_DIR="$(dirname -- "$KITAB_PYTHON_BIN")"
+POSTPROCESS_PYTHON_CMD=("${KITAB_PYTHON_CMD[@]}")
+
+ABB2_PYTHON_BIN=""
+ABB3_PYTHON_BIN=""
+FLASHABB_PYTHON_BIN=""
+ABB2_PYTHON_CMD=()
+ABB3_PYTHON_CMD=()
+FLASHABB_PYTHON_CMD=()
+ABB2_ENV_BIN_DIR=""
+
+if [[ "$RENUMBER_ONLY" -eq 0 && "$MINIMIZATION_ONLY" -eq 0 ]]; then
+    case "$BACKEND" in
+        abb2)
+            ABB2_PYTHON_BIN="$(require_conda_python "$KITAB_ENV_ABB2" "ABB2 prediction")"
+            ABB2_PYTHON_CMD=("$ABB2_PYTHON_BIN")
+            ABB2_ENV_BIN_DIR="$(dirname -- "$ABB2_PYTHON_BIN")"
+            ;;
+        abb3)
+            ABB3_PYTHON_BIN="$(require_conda_python "$KITAB_ENV_ABB3" "ABB3 prediction")"
+            ABB3_PYTHON_CMD=("$ABB3_PYTHON_BIN")
+            ;;
+        flashabb)
+            FLASHABB_PYTHON_BIN="$(require_conda_python "$KITAB_ENV_FLASHABB" "FlashABB prediction")"
+            FLASHABB_PYTHON_CMD=("$FLASHABB_PYTHON_BIN")
+            ;;
+    esac
+fi
+
 STRUCTURE_DIR="$SCRIPT_DIR/structure"
 
 run_renumber() {
@@ -232,8 +278,9 @@ run_renumber() {
         extra+=(--allow-partial-domain)
     fi
 
-    PATH="$ABB2_ENV_BIN_DIR:${PATH}" \
-        "${ABB2_PYTHON_CMD[@]}" "$STRUCTURE_DIR/postprocess_structures.py" renumber "$input_dir" "${extra[@]}"
+    prepend_python_lib "$KITAB_PYTHON_BIN"
+    PATH="$KITAB_ENV_BIN_DIR:${PATH}" \
+        "${POSTPROCESS_PYTHON_CMD[@]}" "$STRUCTURE_DIR/postprocess_structures.py" renumber "$input_dir" "${extra[@]}"
 }
 
 run_minimization() {
@@ -270,7 +317,8 @@ run_minimization() {
         skip_args=(--skip-existing)
     fi
 
-    "${MINIMIZE_PYTHON_CMD[@]}" "$STRUCTURE_DIR/postprocess_structures.py" minimize \
+    prepend_python_lib "$KITAB_PYTHON_BIN"
+    "${POSTPROCESS_PYTHON_CMD[@]}" "$STRUCTURE_DIR/postprocess_structures.py" minimize \
         --input-dir  "$input_dir" \
         --output-dir "$output_dir" \
         --jobs       "$MINIMIZE_JOBS" \
@@ -292,8 +340,6 @@ run_postprocess_predict_dirs() {
             fi
 
             if [[ "$MINIMIZE" -eq 1 ]]; then
-                # ABB3 raw outputs can contain locally strained peptide bonds that
-                # OpenMM fixes cleanly before IMGT insertion-code renumbering.
                 run_minimization "$predict_dir" "" 1
             fi
 
@@ -377,14 +423,12 @@ else
     done
 fi
 
-# When using FlashABB, its own env has OpenMM for minimization.
-if [[ "$BACKEND" == "flashabb" ]]; then
-    if [[ -z "$FLASHABB_PYTHON_BIN" ]]; then
-        echo "FlashABB conda env '$KITAB_ENV_FLASHABB' not found." >&2
-        echo "Run ./install.sh (or ./install.sh --no-abb2) to create it." >&2
-        exit 1
-    fi
-    MINIMIZE_PYTHON_CMD=("${FLASHABB_PYTHON_CMD[@]}")
+batch_csv_args=()
+if [[ ${#CSV_FILES[@]} -gt 0 ]]; then
+    for csv_path in "${CSV_FILES[@]}"; do
+        [[ -z "$csv_path" ]] && continue
+        batch_csv_args+=(--csv "$csv_path")
+    done
 fi
 
 if [[ "$BACKEND" == "abb3" ]]; then
@@ -393,15 +437,8 @@ if [[ "$BACKEND" == "abb3" ]]; then
         exit 1
     fi
 
-    batch_csv_args=()
-    if [[ ${#CSV_FILES[@]} -gt 0 ]]; then
-        for csv_path in "${CSV_FILES[@]}"; do
-            [[ -z "$csv_path" ]] && continue
-            batch_csv_args+=(--csv "$csv_path")
-        done
-    fi
-
     echo "ABB3 Python: ${ABB3_PYTHON_CMD[*]}"
+    prepend_python_lib "$ABB3_PYTHON_BIN"
     "${ABB3_PYTHON_CMD[@]}" "$STRUCTURE_DIR/run_abb_batch_from_csv.py" abb3 \
         ${DATA_DIR:+--data-dir "$DATA_DIR"} \
         "${batch_csv_args[@]}" \
@@ -417,15 +454,8 @@ if [[ "$BACKEND" == "abb3" ]]; then
     fi
 
 elif [[ "$BACKEND" == "flashabb" ]]; then
-    batch_csv_args=()
-    if [[ ${#CSV_FILES[@]} -gt 0 ]]; then
-        for csv_path in "${CSV_FILES[@]}"; do
-            [[ -z "$csv_path" ]] && continue
-            batch_csv_args+=(--csv "$csv_path")
-        done
-    fi
-
     echo "FlashABB Python: ${FLASHABB_PYTHON_CMD[*]}"
+    prepend_python_lib "$FLASHABB_PYTHON_BIN"
     FLASHABB_DIR="$FLASHABB_DIR" \
         "${FLASHABB_PYTHON_CMD[@]}" "$STRUCTURE_DIR/run_abb_batch_from_csv.py" flashabb \
         ${DATA_DIR:+--data-dir "$DATA_DIR"} \
@@ -441,14 +471,8 @@ elif [[ "$BACKEND" == "flashabb" ]]; then
     fi
 
 else
-    batch_csv_args=()
-    if [[ ${#CSV_FILES[@]} -gt 0 ]]; then
-        for csv_path in "${CSV_FILES[@]}"; do
-            [[ -z "$csv_path" ]] && continue
-            batch_csv_args+=(--csv "$csv_path")
-        done
-    fi
-
+    echo "ABB2 Python: ${ABB2_PYTHON_CMD[*]}"
+    prepend_python_lib "$ABB2_PYTHON_BIN"
     PATH="$ABB2_ENV_BIN_DIR:${PATH}" \
         "${ABB2_PYTHON_CMD[@]}" "$STRUCTURE_DIR/run_abb_batch_from_csv.py" abb2 \
         ${DATA_DIR:+--data-dir "$DATA_DIR"} \
@@ -458,6 +482,10 @@ else
         --device "$ABB2_DEVICE" \
         --batch-size "$ABB2_BATCH_SIZE" \
         "${SKIP_ARGS[@]}"
+
+    if [[ "$RENUMBER" -eq 1 || "$MINIMIZE" -eq 1 ]]; then
+        run_postprocess_predict_dirs abb2
+    fi
 fi
 
 echo ""

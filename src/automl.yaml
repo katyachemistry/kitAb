@@ -6,7 +6,7 @@ pipeline:
   random_state: 42
   # One value or comma-separated / YAML list, e.g. 0.15,0.10,0.08 or [0.15, 0.10, 0.08]
   features_frac: 0.15,0.10,0.08,0.06,0.04,0.02
-  eval_models: all
+  eval_models: all                       # final scoring regressors (not the feature selectors below)
   # Final eval regressors (optional; omit for sklearn defaults). Use eval_hyperparameters (nested
   # per model). Pipeline-level hyperparameters: is also accepted if nested by eval model name only.
   eval_hyperparameters:
@@ -14,8 +14,6 @@ pipeline:
       alpha: 0.01
     knn:
       weights: distance
-    gpr:
-      alpha: 0.1
   # Shared prefilter for every selector (optional; per-selector hyperparameters: override same keys)
   low_variance_relative_std_threshold: 0.01
   # low_variance_epsilon: 1e-8

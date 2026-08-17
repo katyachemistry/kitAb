@@ -13,8 +13,6 @@ import pandas as pd
 from scipy.stats import pearsonr, spearmanr
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.exceptions import ConvergenceWarning
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import ConstantKernel, RBF
 from sklearn.linear_model import ElasticNet, LinearRegression
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.preprocessing import MinMaxScaler
@@ -97,10 +95,6 @@ def make_regressor(
     knn_p: int | None = None,
     knn_metric: str | None = None,
     knn_metric_params: dict | None = None,
-    gpr_kernel_length_scale: float | None = None,
-    gpr_n_restarts_optimizer: int | None = None,
-    gpr_normalize_y: bool | None = None,
-    gpr_alpha: float | None = None,
     n_samples_fit: int | None = None,
     linear_fit_intercept: bool = True,
 ):
@@ -159,24 +153,17 @@ def make_regressor(
             kw["metric_params"] = knn_metric_params
         return KNeighborsRegressor(n_jobs=n_jobs, **kw)
     if mt == "gpr":
-        kw: dict = {}
-        ls = gpr_kernel_length_scale if gpr_kernel_length_scale is not None else 1.0
-        kw["kernel"] = ConstantKernel(1.0) * RBF(length_scale=float(ls))
-        kw["normalize_y"] = bool(gpr_normalize_y) if gpr_normalize_y is not None else True
-        if gpr_n_restarts_optimizer is not None:
-            kw["n_restarts_optimizer"] = int(gpr_n_restarts_optimizer)
-        if gpr_alpha is not None:
-            kw["alpha"] = float(gpr_alpha)
-        if random_state is not None:
-            kw["random_state"] = int(random_state)
-        return GaussianProcessRegressor(**kw)
+        raise ValueError(
+            "Gaussian Process Regression (gpr) has been removed from kitAb. "
+            "Use linear, elasticnet, randomforest, svm, or knn."
+        )
     raise ValueError(
-        f"Unknown model_type {model_type!r}; expected linear, elasticnet, randomforest, svm, knn, or gpr."
+        f"Unknown model_type {model_type!r}; expected linear, elasticnet, randomforest, svm, or knn."
     )
 
 
 _EVAL_MODEL_BLOCK_NAMES = frozenset(
-    {"linear", "elasticnet", "randomforest", "svm", "knn", "gpr"}
+    {"linear", "elasticnet", "randomforest", "svm", "knn"}
 )
 
 _EVAL_HP_KEY_TO_MAKE_REGRESSOR: dict[str, dict[str, str]] = {
@@ -227,17 +214,6 @@ _EVAL_HP_KEY_TO_MAKE_REGRESSOR: dict[str, dict[str, str]] = {
         "knn_metric": "knn_metric",
         "metric_params": "knn_metric_params",
         "knn_metric_params": "knn_metric_params",
-    },
-    "gpr": {
-        "kernel_length_scale": "gpr_kernel_length_scale",
-        "gpr_kernel_length_scale": "gpr_kernel_length_scale",
-        "length_scale": "gpr_kernel_length_scale",
-        "n_restarts_optimizer": "gpr_n_restarts_optimizer",
-        "gpr_n_restarts_optimizer": "gpr_n_restarts_optimizer",
-        "normalize_y": "gpr_normalize_y",
-        "gpr_normalize_y": "gpr_normalize_y",
-        "alpha": "gpr_alpha",
-        "gpr_alpha": "gpr_alpha",
     },
 }
 
@@ -309,21 +285,6 @@ def _coerce_eval_hp_value(mr_key: str, value):
         if not isinstance(value, dict):
             raise ValueError("knn_metric_params must be a mapping")
         return value
-    if mr_key in ("gpr_kernel_length_scale", "gpr_alpha"):
-        return float(value)
-    if mr_key == "gpr_n_restarts_optimizer":
-        return int(value)
-    if mr_key == "gpr_normalize_y":
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            return bool(int(value))
-        s = str(value).strip().lower()
-        if s in ("true", "1", "yes"):
-            return True
-        if s in ("false", "0", "no"):
-            return False
-        raise ValueError(f"{mr_key} must be boolean, got {value!r}")
     raise ValueError(f"Unhandled eval hyperparameter {mr_key!r}")
 
 

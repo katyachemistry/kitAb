@@ -7,10 +7,6 @@ result_folder: propermab_sequence_baseline_ginkgo_no_hc_lc
 
 predefined_descriptors:
   folder: /storage/antibody_data/PairedStructures/kitAb/descriptors_propermab_abb2
-  allowed_suffixes:
-    - _abb2_1_propermab
-    - _abb2_2_propermab
-    - _abb2_3_propermab
 
 include_features:
   - cdr_h3_length

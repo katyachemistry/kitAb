@@ -24,11 +24,16 @@ from automl.feature_selectors import (
     parse_selector_hyperparameters_mapping,
     run_feature_selection_on_one_fold,
 )
-from automl.pipeline_defaults import DEFAULT_EVAL_MODELS, DEFAULT_RANDOM_STATE
+from automl.pipeline_defaults import (
+    DEFAULT_EVAL_MODEL_ORDER,
+    DEFAULT_EVAL_MODELS,
+    DEFAULT_RANDOM_STATE,
+)
 from automl.utils import fit_regressor, make_regressor, parse_eval_hyperparameters_mapping
 
-_EVAL_MODEL_ORDER = ("linear", "elasticnet", "randomforest", "svm", "knn", "gpr")
+_EVAL_MODEL_ORDER = DEFAULT_EVAL_MODEL_ORDER
 _EVAL_MODEL_SET = frozenset(_EVAL_MODEL_ORDER)
+_REMOVED_EVAL_MODELS = frozenset({"gpr"})
 
 
 def _slug(s: str) -> str:
@@ -47,11 +52,14 @@ def _parse_eval_models(spec: str) -> list[str] | None:
     out: list[str] = []
     seen: set[str] = set()
     for p in parts:
+        if p in _REMOVED_EVAL_MODELS:
+            raise ValueError(
+                f"Eval model {p!r} has been removed from kitAb. "
+                f"Supported: {', '.join(_EVAL_MODEL_ORDER)}"
+            )
         if p not in _EVAL_MODEL_SET:
             opts = ", ".join(_EVAL_MODEL_ORDER)
-            raise ValueError(
-                f"Unknown eval model {p!r} in --eval-models. Use: {opts}, or all / none."
-            )
+            raise ValueError(f"Unknown eval model {p!r}; expected one of: {opts}, or all")
         if p not in seen:
             seen.add(p)
             out.append(p)
@@ -127,7 +135,7 @@ def _top_k_column_indices_for_eval(
     if n_cols <= k_max:
         return np.arange(n_cols, dtype=int)
 
-    if m_type in ("knn", "gpr"):
+    if m_type == "knn":
         probe_type = "elasticnet"
     else:
         probe_type = m_type
@@ -175,8 +183,6 @@ def _evaluate_fold_models(
             m: {
                 "error": "no_selected_features_present_in_train_and_test",
                 "n_features": 0,
-                "prediction_std": None,
-                "prediction_std_mean": None,
             }
             for m in eval_models
         }
@@ -216,12 +222,7 @@ def _evaluate_fold_models(
             mkw.update(ev_hp.get(m, {}))
             model = make_regressor(m, **mkw)
             fit_regressor(model, X_tr_u, y_tr)
-            prediction_std: list[float] | None = None
-            if m == "gpr":
-                y_pred, y_std = model.predict(X_te_u, return_std=True)
-                prediction_std = [_json_float(v) for v in y_std.tolist()]
-            else:
-                y_pred = model.predict(X_te_u)
+            y_pred = model.predict(X_te_u)
             r2 = r2_score(y_te, y_pred)
             mse = mean_squared_error(y_te, y_pred)
             rho_f, rho_p = _spearman_stat_p(y_te, y_pred)
@@ -238,17 +239,11 @@ def _evaluate_fold_models(
                 "n_features_after_selection": n_feat,
                 "n_features_allowed_by_frac": k_cap,
                 "n_features_used_at_eval": n_used,
-                "prediction_std": prediction_std,
-                "prediction_std_mean": (
-                    _json_float(float(np.mean(y_std)))
-                    if prediction_std is not None and len(y_std) > 0
-                    else None
-                ),
             }
             if n_used < n_feat:
                 entry["eval_features_used"] = used_names
-                if m in ("knn", "gpr"):
-                    entry[f"{m}_ranking_probe"] = "elasticnet"
+                if m == "knn":
+                    entry["knn_ranking_probe"] = "elasticnet"
             out[m] = entry
         except Exception as e:
             out[m] = {
@@ -257,8 +252,6 @@ def _evaluate_fold_models(
                 "n_test": n_test,
                 "n_features_after_selection": n_feat,
                 "n_features_allowed_by_frac": k_cap,
-                "prediction_std": None,
-                "prediction_std_mean": None,
             }
     return out
 
@@ -322,9 +315,8 @@ def main() -> None:
         default=DEFAULT_EVAL_MODELS,
         help=(
             "After selection: fit on train / predict test with each listed model. "
-            "Comma- or space-separated: linear, elasticnet, randomforest, svm, knn, gpr; "
-            "or 'all' (default), or 'none' to skip. "
-            "gpr (Gaussian Process Regression) also writes prediction_std to the output JSON."
+            "Comma- or space-separated: linear, elasticnet, randomforest, svm, knn; "
+            "or 'all' (default), or 'none' to skip."
         ),
     )
     p.add_argument(
@@ -411,7 +403,7 @@ def main() -> None:
         type=str,
         default="{}",
         help=(
-            "JSON object: top-level keys linear, elasticnet, randomforest, svm, knn, gpr; each maps to "
+            "JSON object: top-level keys linear, elasticnet, randomforest, svm, knn; each maps to "
             "hyperparameters for final eval make_regressor (omit keys for sklearn defaults). "
             "GPR keys: kernel_length_scale, n_restarts_optimizer, normalize_y, alpha. "
             "Master TSV column 14."

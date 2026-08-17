@@ -1,0 +1,14 @@
+{
+  "name": "mAb10",
+  "surface": {
+    "protein_pi": 7.1,
+    "hyd_score": 0.1
+  },
+  "core": {},
+  "general": {
+    "cdr3_length": 11
+  },
+  "sequence_motives": {
+    "fraction_gly_in_cdr": 0.1
+  }
+}

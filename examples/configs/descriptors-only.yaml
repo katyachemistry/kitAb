@@ -1,0 +1,25 @@
+# Developability descriptors only (no AutoML)
+inputs:
+  structures_dir: structures_abb2        # existing PDB/mmCIF folders
+
+run:
+  output_dir: runs/example_descriptors_only  # all generated files go here
+
+structure_prediction:
+  enabled: false                         # structures are supplied, not predicted
+
+structure_processing:
+  enabled: false                         # IMGT renumber / OpenMM minimize
+  renumber_imgt: false
+  minimize: false
+  minimize_attempts: 5                   # retries per structure if minimize is on
+
+descriptors:
+  enabled: true                          # compute developability descriptors
+  cleanup: false                         # after each JSON, delete .dssp, _full.pka/.log, _full/_H_full/_L_full.sasa
+
+automl:
+  enabled: false                         # no models
+
+tuning:
+  enabled: false                         # unused without AutoML

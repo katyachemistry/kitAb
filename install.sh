@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
-# kitAb one-shot installer: conda envs for descriptors, ABB2 (ImmuneBuilder), and ABB3.
+# kitAb one-shot installer: conda envs for descriptors/post-processing, ABB2, ABB3, and FlashABB.
 #
 # Usage:
-#   ./install.sh
-#   ./install.sh --kitab-only        # descriptors / automl env only
-#   ./install.sh --no-abb2            # kitab + abb3 + flashabb (skip abb2)
-#   ./install.sh --no-flashabb        # kitab + abb2 + abb3 (skip flashabb)
+#   ./install.sh                         # kitab + abb2 + abb3 + flashabb (default)
+#   ./install.sh --kitab-only            # kitab env only (descriptors / AutoML / IMGT / OpenMM)
+#   ./install.sh --skip abb2             # skip ABB2 / ImmuneBuilder
+#   ./install.sh --skip abb3             # skip ABB3
+#   ./install.sh --skip flashabb         # skip FlashABB
+#   ./install.sh --skip abb3 flashabb    # skip several backends
 #
+# --skip omits prediction backends only. The kitab env always provides ANARCI,
+# OpenMM, and PDBFixer for optional IMGT numbering and minimization.
+#
+# --skip accepts one or more of: abb2, abb3, flashabb (repeatable).
 # Prerequisites: git, wget or curl, mamba or conda (Miniforge/Mambaforge recommended).
-# Optional: NVIDIA GPU + driver for ABB2/ABB3 CUDA wheels.
+# Optional: NVIDIA GPU + driver for ABB2/ABB3/FlashABB CUDA wheels.
 
 set -euo pipefail
 
@@ -27,7 +33,22 @@ IMMUNEBUILDER_VERSION="${IMMUNEBUILDER_VERSION:-1.2}"
 INSTALL_ABB2=1
 INSTALL_ABB3=1
 INSTALL_FLASHABB=1
-INSTALL_MODE="full"
+
+usage() {
+    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+skip_backend() {
+    case "$1" in
+        abb2) INSTALL_ABB2=0 ;;
+        abb3) INSTALL_ABB3=0 ;;
+        flashabb) INSTALL_FLASHABB=0 ;;
+        *)
+            echo "Unknown backend to skip: $1 (expected abb2, abb3, or flashabb)" >&2
+            exit 1
+            ;;
+    esac
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -35,21 +56,23 @@ while [[ $# -gt 0 ]]; do
             INSTALL_ABB2=0
             INSTALL_ABB3=0
             INSTALL_FLASHABB=0
-            INSTALL_MODE="kitab-only"
             shift
             ;;
-        --no-abb2)
-            INSTALL_ABB2=0
-            INSTALL_ABB3=1
-            INSTALL_MODE="no-abb2"
+        --skip)
             shift
-            ;;
-        --no-flashabb)
-            INSTALL_FLASHABB=0
-            shift
+            skipped_any=0
+            while [[ $# -gt 0 && "$1" != -* ]]; do
+                skip_backend "$1"
+                skipped_any=1
+                shift
+            done
+            if [[ "$skipped_any" -eq 0 ]]; then
+                echo "--skip requires at least one backend: abb2, abb3, flashabb" >&2
+                exit 1
+            fi
             ;;
         -h|--help)
-            sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+            usage
             exit 0
             ;;
         *)
@@ -58,6 +81,14 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+skipped_backends() {
+    local s=()
+    [[ "$INSTALL_ABB2" -eq 0 ]] && s+=("abb2")
+    [[ "$INSTALL_ABB3" -eq 0 ]] && s+=("abb3")
+    [[ "$INSTALL_FLASHABB" -eq 0 ]] && s+=("flashabb")
+    echo "${s[*]}"
+}
 
 log() { echo "[install] $*" >&2; }
 warn() { echo "[install] WARNING: $*" >&2; }
@@ -144,6 +175,10 @@ install_kitab() {
     create_env_from_yml "$ENV_KITAB" "$REPO_ROOT/environment.yml"
     ensure_conda_pkg "$ENV_KITAB" mmseqs mmseqs2 "-c conda-forge -c bioconda"
     ensure_conda_pkg "$ENV_KITAB" parallel parallel "-c conda-forge"
+    ensure_conda_pkg "$ENV_KITAB" hmmscan hmmer "-c conda-forge -c bioconda"
+    ensure_python_pkg "$ENV_KITAB" openmm "openmm=8.4.0" "-c conda-forge"
+    ensure_python_pkg "$ENV_KITAB" pdbfixer "pdbfixer=1.12" "-c conda-forge"
+    ensure_python_pkg "$ENV_KITAB" anarci "anarci=2024.05.21" "-c conda-forge -c bioconda"
     patch_propka_py314 "$ENV_KITAB"
 }
 
@@ -158,6 +193,20 @@ ensure_conda_pkg() {
         return 0
     fi
     log "Installing $pkg into $env_name (missing from existing env; $ch)"
+    # shellcheck disable=SC2086
+    PIP_REQUIRE_VIRTUALENV=false "$CONDA_CMD" install -n "$env_name" $ch "$pkg" -y
+}
+
+ensure_python_pkg() {
+    local env_name="$1"
+    local import_name="$2"
+    local pkg="$3"
+    local ch="$4"
+    env_exists "$env_name" || return 0
+    if conda_run_with_env_lib "$env_name" python -c "import ${import_name}" &>/dev/null; then
+        return 0
+    fi
+    log "Installing $pkg into $env_name (missing Python import ${import_name}; $ch)"
     # shellcheck disable=SC2086
     PIP_REQUIRE_VIRTUALENV=false "$CONDA_CMD" install -n "$env_name" $ch "$pkg" -y
 }
@@ -297,63 +346,82 @@ conda_run_with_env_lib() {
 
 write_kitab_env() {
     local out="$REPO_ROOT/kitab.local.env"
-    local kitab_bin abb2_lib abb3_lib flashabb_lib ld_add=""
+    local kitab_bin kitab_lib
     kitab_bin="$(conda_env_bin_dir "$ENV_KITAB")"
-    abb2_lib="$(conda_env_lib_dir "$ENV_ABB2")"
-    abb3_lib="$(conda_env_lib_dir "$ENV_ABB3")"
-    flashabb_lib="$(conda_env_lib_dir "$ENV_FLASHABB")"
-    [[ -n "$abb2_lib" ]] && ld_add="$abb2_lib"
-    [[ -n "$abb3_lib" ]] && ld_add="${ld_add:+$ld_add:}$abb3_lib"
-    [[ -n "$flashabb_lib" ]] && ld_add="${ld_add:+$ld_add:}$flashabb_lib"
+    kitab_lib="$(conda_env_lib_dir "$ENV_KITAB")"
     cat >"$out" <<EOF
 # Generated by install.sh — source before running kitAb pipelines:
 #   source kitab.local.env
-# If you conda activate kitab-abb3 or kitab-abb2 afterward, source this file
-# *before* activating (PATH below prepends the kitab env for mkdssp/propka3/etc.).
+# If you conda activate a prediction backend afterward, source this file
+# *before* activating (PATH below prepends the kitab env for mkdssp/propka3/ANARCI/OpenMM).
 
 KITAB_ROOT="$REPO_ROOT"
 
 export KITAB_ENV=$ENV_KITAB
-export KITAB_ENV_ABB2=$ENV_ABB2
-export KITAB_ENV_ABB3=$ENV_ABB3
-export KITAB_ENV_FLASHABB=$ENV_FLASHABB
 
 export DSSP_BIN=mkdssp
 
+export PY="conda run -n ${ENV_KITAB} python"
+EOF
+    if env_exists "$ENV_ABB2"; then
+        cat >>"$out" <<EOF
+
+export KITAB_ENV_ABB2=$ENV_ABB2
+export ABB2_DEVICE=\${ABB2_DEVICE:-cuda:0}
+export ABB2_BATCH_SIZE=\${ABB2_BATCH_SIZE:-4}
+export ABB2_PYTHON="conda run -n ${ENV_ABB2} python"
+EOF
+    else
+        cat >>"$out" <<EOF
+
+# ABB2 env not installed this checkout (./install.sh --skip abb2)
+export KITAB_ENV_ABB2=$ENV_ABB2
+EOF
+    fi
+    if env_exists "$ENV_ABB3"; then
+        cat >>"$out" <<EOF
+
+export KITAB_ENV_ABB3=$ENV_ABB3
 export ABB3_SRC="$ABB3_DIR/src"
 export ABB3_CHECKPOINT="$ABB3_DIR/output/plddt-loss/best_second_stage.ckpt"
 export ABB3_DEVICE=\${ABB3_DEVICE:-cuda:0}
 export ABB3_BATCH_SIZE=\${ABB3_BATCH_SIZE:-4}
+EOF
+    else
+        cat >>"$out" <<EOF
 
-export ABB2_DEVICE=\${ABB2_DEVICE:-cuda:0}
-export ABB2_BATCH_SIZE=\${ABB2_BATCH_SIZE:-4}
-export ABB2_PYTHON="conda run -n ${ENV_ABB2} python"
+# ABB3 env not installed this checkout (./install.sh --skip abb3)
+export KITAB_ENV_ABB3=$ENV_ABB3
+export ABB3_SRC="$ABB3_DIR/src"
+export ABB3_CHECKPOINT="$ABB3_DIR/output/plddt-loss/best_second_stage.ckpt"
+EOF
+    fi
+    if env_exists "$ENV_FLASHABB"; then
+        cat >>"$out" <<EOF
 
+export KITAB_ENV_FLASHABB=$ENV_FLASHABB
 export FLASHABB_DEVICE=\${FLASHABB_DEVICE:-cuda:0}
 export FLASHABB_BATCH_SIZE=\${FLASHABB_BATCH_SIZE:-50}
-
-export PY="conda run -n ${ENV_KITAB} python"
 EOF
+    else
+        cat >>"$out" <<EOF
+
+# FlashABB env not installed this checkout (./install.sh --skip flashabb)
+export KITAB_ENV_FLASHABB=$ENV_FLASHABB
+EOF
+    fi
     if [[ -n "$kitab_bin" ]]; then
         cat >>"$out" <<EOF
 
-# mkdssp, propka3, freesasa, mmseqs, GNU parallel (kitab env)
-# hmmscan/hmmer (ANARCI for ABB2) live in the abb2 env bin dir
+# mkdssp, propka3, freesasa, mmseqs, GNU parallel, hmmscan (ANARCI) — kitab env
 export PATH="$kitab_bin:\${PATH}"
 EOF
     fi
-    local abb2_bin
-    abb2_bin="$(conda_env_bin_dir "$ENV_ABB2")"
-    if [[ -n "$abb2_bin" && "$abb2_bin" != "$kitab_bin" ]]; then
-        cat >>"$out" <<EOF
-export PATH="$abb2_bin:\${PATH}"
-EOF
-    fi
-    if [[ -n "$ld_add" ]]; then
+    if [[ -n "$kitab_lib" ]]; then
         cat >>"$out" <<EOF
 
-# OpenMM (ABB2/ABB3/FlashABB) needs conda's libstdc++ when CUDA/system paths are on LD_LIBRARY_PATH
-export LD_LIBRARY_PATH="$ld_add:\${LD_LIBRARY_PATH:-}"
+# OpenMM in the kitab env needs conda's libstdc++ when CUDA/system paths are on LD_LIBRARY_PATH
+export LD_LIBRARY_PATH="$kitab_lib:\${LD_LIBRARY_PATH:-}"
 EOF
     fi
     log "Wrote $out"
@@ -392,9 +460,22 @@ doctor() {
         check_cmd_in_env "$ENV_KITAB" propka3
         check_cmd_in_env "$ENV_KITAB" mmseqs
         check_cmd_in_env "$ENV_KITAB" parallel
+        check_cmd_in_env "$ENV_KITAB" hmmscan
         conda_run "$ENV_KITAB" python -c "import pandas, sklearn, scipy" 2>/dev/null \
             && echo "  OK   $ENV_KITAB: pandas/sklearn/scipy import" \
             || { echo "  FAIL $ENV_KITAB: Python imports"; ok=1; }
+        if conda_run_with_env_lib "$ENV_KITAB" python -c "import openmm, pdbfixer, anarci; print(openmm.__version__)" &>/dev/null; then
+            echo "  OK   $ENV_KITAB: openmm + pdbfixer + anarci import"
+        else
+            echo "  FAIL $ENV_KITAB: openmm/pdbfixer/anarci import" >&2
+            ok=1
+        fi
+        if conda_run "$ENV_KITAB" python -c "from propka.parameters import Parameters; p=Parameters(); p.parse_line('version Jan15')" &>/dev/null; then
+            echo "  OK   $ENV_KITAB: propka Parameters.parse_line (Python 3.14 patch)"
+        else
+            echo "  FAIL $ENV_KITAB: propka Parameters.parse_line" >&2
+            ok=1
+        fi
     }
 
     if [[ "$INSTALL_ABB2" -eq 1 ]]; then
@@ -410,7 +491,7 @@ doctor() {
             fi
         }
     else
-        echo "  SKIP abb2 checks ($INSTALL_MODE)"
+        echo "  SKIP abb2 checks"
         env_exists "$ENV_ABB2" && echo "  NOTE $ENV_ABB2 exists (not installed this run)"
     fi
 
@@ -431,7 +512,7 @@ doctor() {
             fi
         }
     else
-        echo "  SKIP abb3 checks ($INSTALL_MODE)"
+        echo "  SKIP abb3 checks"
         env_exists "$ENV_ABB3" && echo "  NOTE $ENV_ABB3 exists (not installed this run)"
     fi
 
@@ -450,7 +531,7 @@ doctor() {
             fi
         }
     else
-        echo "  SKIP flashabb checks ($INSTALL_MODE)"
+        echo "  SKIP flashabb checks"
         env_exists "$ENV_FLASHABB" && echo "  NOTE $ENV_FLASHABB exists (not installed this run)"
     fi
 
@@ -463,8 +544,10 @@ doctor() {
 
 main() {
     log "kitAb install (root: $REPO_ROOT)"
-    if [[ "$INSTALL_MODE" != "full" ]]; then
-        log "Mode: --$INSTALL_MODE"
+    local skipped
+    skipped="$(skipped_backends)"
+    if [[ -n "$skipped" ]]; then
+        log "Skipping backends: $skipped"
     fi
 
     install_kitab
@@ -484,6 +567,7 @@ main() {
     log "Done. Next steps:"
     echo "  source kitab.local.env"
     echo "  # optional: conda activate $ENV_ABB3  (source kitab.local.env first)"
+    echo "  # IMGT numbering / OpenMM minimization always use the kitab env"
     echo "  cd src && ./predict_structure.sh --help"
     echo "  conda activate $ENV_KITAB && ./src/get_descriptors.sh --help"
 

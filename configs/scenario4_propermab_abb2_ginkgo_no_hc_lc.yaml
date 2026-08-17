@@ -8,7 +8,3 @@ skip_existing_results: true
 
 predefined_descriptors:
   folder: /storage/antibody_data/PairedStructures/kitAb/descriptors_propermab_abb2/
-  allowed_suffixes:
-    - _abb2_1_propermab
-    - _abb2_2_propermab
-    - _abb2_3_propermab
