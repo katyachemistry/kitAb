@@ -61,9 +61,9 @@ def write_meta_with_checksum(model_dir: Path, meta: dict[str, Any]) -> dict[str,
 
 
 def load_tuned_model(model_dir: Path) -> tuple[Any, dict[str, Any]]:
-    from automl.tune_eval_hyperparameters import load_tuned_model as _load
+    from automl.model_io import load_model
 
-    return _load(Path(model_dir))
+    return load_model(Path(model_dir))
 
 
 def predict_with_tuned_model(

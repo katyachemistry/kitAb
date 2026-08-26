@@ -2,11 +2,8 @@
 # kitAb entrypoint.
 #
 #   ./kitab.sh validate CONFIG.yaml
-#   ./kitab.sh CONFIG.yaml [--resume] [--enable-tuning] ...
+#   ./kitab.sh CONFIG.yaml [--resume] [--techniques ...] ...
 #   ./kitab.sh resume RUN_DIR
-#
-# Hyperparameter tuning is OFF by default. Enable with --enable-tuning
-# or tuning.enabled: true in the manifest.
 
 set -euo pipefail
 
@@ -47,11 +44,13 @@ Usage:
 
 Options for CONFIG.yaml mode:
   --resume              Continue an interrupted run
-  --enable-tuning       Opt-in hyperparameter optimization / model export
-  --disable-automl      Skip AutoML/analysis even if config enables it
+  --disable-automl      Skip AutoML even if config enables it
   --enable-automl       Force-enable AutoML
+  --techniques LIST     Comma-separated: elasticnet,intercorr_svm,sfs_svm,sfs_knn
+  --cv-mode MODE        nested (default) or flat
+  --no-final-model      Compare techniques without saving estimator.joblib
   --output-dir DIR      Override run.output_dir / result_folder
-  --cpus N              Override CPU count
+  --cpus N              Override CPU count (AutoML worker pool)
   --device DEV          Override structure_prediction.device
   --no-clean-batch      Kept for compatibility (no longer required)
   --clean-external-outputs  Kept for compatibility (use descriptors.cleanup)
@@ -68,9 +67,11 @@ fi
 
 CONFIG=""
 RESUME=0
-ENABLE_TUNING=0
 DISABLE_AUTOML=0
 ENABLE_AUTOML=0
+TECHNIQUES=""
+CV_MODE=""
+NO_FINAL_MODEL=0
 OUTPUT_DIR=""
 CPUS=""
 DEVICE=""
@@ -85,16 +86,24 @@ while [[ $# -gt 0 ]]; do
             RESUME=1
             shift
             ;;
-        --enable-tuning)
-            ENABLE_TUNING=1
-            shift
-            ;;
         --disable-automl)
             DISABLE_AUTOML=1
             shift
             ;;
         --enable-automl)
             ENABLE_AUTOML=1
+            shift
+            ;;
+        --techniques)
+            TECHNIQUES="${2:?}"
+            shift 2
+            ;;
+        --cv-mode)
+            CV_MODE="${2:?}"
+            shift 2
+            ;;
+        --no-final-model)
+            NO_FINAL_MODEL=1
             shift
             ;;
         --output-dir)
@@ -111,6 +120,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-clean-batch|--clean-external-outputs)
             echo "[kitab] note: $1 is accepted for compatibility; prefer manifest fields." >&2
+            shift
+            ;;
+        --enable-tuning)
+            echo "[kitab] warning: --enable-tuning is no longer used; the winning technique is always refit unless --no-final-model is set." >&2
             shift
             ;;
         --)
@@ -142,14 +155,20 @@ CMD=("${PY_ARR[@]}" -m kitab run "$CONFIG")
 if [[ "$RESUME" -eq 1 ]]; then
     CMD+=(--resume)
 fi
-if [[ "$ENABLE_TUNING" -eq 1 ]]; then
-    CMD+=(--enable-tuning)
-fi
 if [[ "$DISABLE_AUTOML" -eq 1 ]]; then
     CMD+=(--disable-automl)
 fi
 if [[ "$ENABLE_AUTOML" -eq 1 ]]; then
     CMD+=(--enable-automl)
+fi
+if [[ -n "$TECHNIQUES" ]]; then
+    CMD+=(--techniques "$TECHNIQUES")
+fi
+if [[ -n "$CV_MODE" ]]; then
+    CMD+=(--cv-mode "$CV_MODE")
+fi
+if [[ "$NO_FINAL_MODEL" -eq 1 ]]; then
+    CMD+=(--no-final-model)
 fi
 if [[ -n "$OUTPUT_DIR" ]]; then
     CMD+=(--output-dir "$OUTPUT_DIR")

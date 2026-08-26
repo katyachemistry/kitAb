@@ -19,7 +19,9 @@ def plan_text(manifest: Manifest) -> str:
         f"output: {manifest.run.output_dir}",
         f"stages: {' -> '.join(manifest.stage_graph())}",
         f"automl: {manifest.automl.enabled}",
-        f"tuning: {manifest.tuning.enabled}",
+        f"techniques: {', '.join(manifest.automl.techniques)}",
+        f"cv_mode: {manifest.automl.cv_mode}",
+        f"save_final_model: {manifest.automl.save_final_model}",
         f"minimize_attempts: {manifest.structure_processing.minimize_attempts}",
         f"propka_minimize_retries: {manifest.descriptors.propka_minimize_retries}",
     ]
@@ -69,7 +71,6 @@ def run_pipeline(manifest: Manifest) -> int:
 
     exit_code = 0
     batch_root: Path | None = None
-    analysis_out: Path | None = None
     completeness: dict[str, bool] = {}
 
     try:
@@ -104,10 +105,10 @@ def run_pipeline(manifest: Manifest) -> int:
             )
             if completeness and not any(completeness.values()):
                 logger.error(
-                    "No datasets are complete for AutoML; skipping AutoML/analysis/model export"
+                    "No datasets are complete for AutoML; skipping AutoML and model export"
                 )
                 exit_code = 1
-                graph = [s for s in graph if s not in {"automl", "analysis", "tuning"}]
+                graph = [s for s in graph if s != "automl"]
             elif completeness and not all(completeness.values()):
                 exit_code = 1
                 filtered = stages.filter_run_config_for_complete(
@@ -128,20 +129,6 @@ def run_pipeline(manifest: Manifest) -> int:
                 logger.error(f"automl failed: {exc}")
                 logger.event(stage="automl", status="error", message=str(exc))
 
-        if "analysis" in graph and batch_root is not None:
-            try:
-                analysis_out = stages.run_analysis(manifest, logger, batch_root)
-            except Exception as exc:  # noqa: BLE001
-                exit_code = 1
-                logger.error(f"analysis failed: {exc}")
-
-        if "tuning" in graph and batch_root is not None and analysis_out is not None:
-            try:
-                stages.run_tuning(manifest, logger, batch_root, analysis_out)
-            except Exception as exc:  # noqa: BLE001
-                exit_code = 1
-                logger.error(f"tuning failed: {exc}")
-
         stages.assert_inputs_unchanged(input_hashes)
         logger.info("Input immutability check passed")
     except Exception as exc:  # noqa: BLE001
@@ -154,7 +141,9 @@ def run_pipeline(manifest: Manifest) -> int:
         "stages": manifest.stage_graph(),
         "completeness": completeness,
         "output_dir": str(out),
-        "tuning_enabled": manifest.tuning.enabled,
+        "techniques": list(manifest.automl.techniques),
+        "cv_mode": manifest.automl.cv_mode,
+        "models_dir": str(out / "models") if batch_root is not None else None,
         "legacy_config": manifest.legacy,
     }
     logger.write_summary(summary)

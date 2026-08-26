@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from kitab.config import ConfigError, load_manifest, parse_manifest_dict
+from kitab.config import ConfigError, SUPPORTED_TECHNIQUES, load_manifest, parse_manifest_dict
 
 
 def test_validate_starter_manifest(tmp_path: Path, repo_root: Path):
@@ -29,9 +29,12 @@ tuning:
     assert m.mode == "predict"
     assert m.structure_prediction.enabled is True
     assert m.structure_prediction.model == ["abb2"]
-    assert m.tuning.enabled is False
-    assert "gpr" not in m.automl.eval_models or m.automl.eval_models == "all"
-    assert m.stage_graph()[0] == "predict"
+    assert m.automl.enabled is True
+    assert m.automl.techniques == list(SUPPORTED_TECHNIQUES)
+    assert m.automl.cv_mode == "nested"
+    assert m.automl.save_final_model is True
+    assert m.stage_graph()[-1] == "automl"
+    assert any("tuning" in w for w in m.warnings)
 
 
 def test_validate_reports_multiple_errors(tmp_path: Path, repo_root: Path):
@@ -57,14 +60,14 @@ def test_legacy_scenario1(repo_root: Path):
     m = load_manifest(repo_root / "configs/scenario1.yaml", repo_root=repo_root)
     assert m.legacy is True
     assert m.mode == "predict"
-    assert m.tuning.enabled is False
+    assert m.automl.enabled is True
     assert m.warnings
 
 
 def test_legacy_scenario4(repo_root: Path):
     m = load_manifest(repo_root / "configs/scenario4.yaml", repo_root=repo_root)
     assert m.mode == "automl"
-    assert m.stage_graph() == ["automl", "analysis", "tuning"]
+    assert m.stage_graph() == ["automl"]
 
 
 def test_structure_models_accept_list_and_csv(repo_root: Path):
@@ -160,55 +163,69 @@ def test_dataset_stem_for_name():
     assert _dataset_stem_for_name("other", stems) is None
 
 
-def test_eval_models_accept_list(repo_root: Path):
+def test_ignored_automl_yaml_keys_warn(repo_root: Path):
     m = parse_manifest_dict(
         {
             "inputs": {"datasets_dir": "tests/fixtures/csv"},
             "run": {"output_dir": "runs/x"},
             "structure_prediction": {"enabled": True},
             "descriptors": {"enabled": True},
-            "automl": {"eval_models": ["linear", "svm"]},
+            "automl": {
+                "enabled": True,
+                "eval_models": ["linear", "svm"],
+                "techniques": ["elasticnet"],
+                "cv_mode": "flat",
+                "config_path": "src/automl.yaml",
+            },
         },
         source_path=Path("t.yaml"),
         repo_root=repo_root,
     )
-    assert m.automl.eval_models == "linear,svm"
+    assert m.automl.techniques == list(SUPPORTED_TECHNIQUES)
+    assert m.automl.cv_mode == "nested"
+    assert any("eval_models" in w for w in m.warnings)
+    assert any("techniques" in w for w in m.warnings)
 
 
-def test_gpr_rejected(repo_root: Path):
-    with pytest.raises(ConfigError, match="gpr"):
-        parse_manifest_dict(
-            {
-                "inputs": {"datasets_dir": "tests/fixtures/csv"},
-                "run": {"output_dir": "runs/x"},
-                "structure_prediction": {"enabled": True},
-                "automl": {"eval_models": "gpr"},
-            },
-            source_path=Path("t.yaml"),
-            repo_root=repo_root,
-        )
-
-
-def test_cli_override_enable_tuning(repo_root: Path, tmp_path: Path, fixtures_dir: Path):
+def test_cli_automl_overrides(repo_root: Path, tmp_path: Path, fixtures_dir: Path):
     cfg = tmp_path / "c.yaml"
     cfg.write_text(
         f"""
 inputs:
   datasets_dir: {fixtures_dir / 'csv'}
-  structures_dir: {fixtures_dir / 'structures'}
+  predefined_descriptors_dir: {fixtures_dir / 'descriptors'}
 run:
   output_dir: {tmp_path / 'out'}
-descriptors:
-  enabled: true
 automl:
   enabled: true
-tuning:
-  enabled: false
 """
     )
-    m = load_manifest(cfg, repo_root=repo_root, cli_overrides={"enable_tuning": True})
-    assert m.tuning.enabled is True
-    assert "tuning" in m.stage_graph()
+    m = load_manifest(
+        cfg,
+        repo_root=repo_root,
+        cli_overrides={
+            "techniques": "elasticnet,sfs_svm",
+            "cv_mode": "flat",
+            "no_final_model": True,
+        },
+    )
+    assert m.automl.techniques == ["elasticnet", "sfs_svm"]
+    assert m.automl.cv_mode == "flat"
+    assert m.automl.save_final_model is False
+
+
+def test_cli_has_no_enable_tuning():
+    import argparse
+
+    from kitab.cli import _add_common_overrides
+
+    parser = argparse.ArgumentParser()
+    _add_common_overrides(parser)
+    option_strings = {opt for a in parser._actions for opt in a.option_strings}
+    assert "--enable-tuning" not in option_strings
+    assert "--techniques" in option_strings
+    assert "--cv-mode" in option_strings
+    assert "--no-final-model" in option_strings
 
 
 def test_example_manifests_validate(repo_root: Path):
@@ -217,7 +234,6 @@ def test_example_manifests_validate(repo_root: Path):
         "existing-structures.yaml",
         "descriptors-only.yaml",
         "automl-only.yaml",
-        "full-with-tuning.yaml",
         "reproduce-paper-abb2.yaml",
         "reproduce-paper-abb3.yaml",
         "reproduce-paper-flashabb.yaml",

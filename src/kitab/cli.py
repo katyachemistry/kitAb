@@ -48,7 +48,24 @@ def _add_common_overrides(p: argparse.ArgumentParser) -> None:
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--enable-automl", action="store_true", default=None)
     p.add_argument("--disable-automl", action="store_true", default=None)
-    p.add_argument("--enable-tuning", action="store_true", default=None)
+    p.add_argument(
+        "--techniques",
+        type=str,
+        default=None,
+        help="Comma-separated AutoML techniques (default: all four)",
+    )
+    p.add_argument(
+        "--cv-mode",
+        choices=("nested", "flat"),
+        default=None,
+        help="AutoML cross-validation mode (default: nested)",
+    )
+    p.add_argument(
+        "--no-final-model",
+        action="store_true",
+        default=None,
+        help="Compare techniques without refitting the winner on all data",
+    )
     p.add_argument("--resume", action="store_true", default=None)
 
 
@@ -66,8 +83,12 @@ def _overrides_from_args(args: argparse.Namespace) -> dict[str, Any]:
         out["enable_automl"] = True
     if getattr(args, "disable_automl", None):
         out["enable_automl"] = False
-    if getattr(args, "enable_tuning", None):
-        out["enable_tuning"] = True
+    if getattr(args, "techniques", None):
+        out["techniques"] = args.techniques
+    if getattr(args, "cv_mode", None):
+        out["cv_mode"] = args.cv_mode
+    if getattr(args, "no_final_model", None):
+        out["no_final_model"] = True
     if getattr(args, "resume", None):
         out["resume"] = True
     return out

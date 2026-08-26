@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing as mp
-import re
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -26,16 +25,9 @@ from analysis.nested_elasticnet_all_targets import (
     _run_outer,
     _spearman,
 )
+from analysis.nested_elasticnet_all_methods import _root_key
 
 REPO = Path("/storage/antibody_data/PairedStructures/kitAb")
-_SEED_RE = re.compile(r"__rs(\d+)$")
-
-
-def _root_key(path: Path) -> tuple[str, str]:
-    stem = path.name.split("_cv_prepare__", 1)[0]
-    match = _SEED_RE.search(path.name)
-    split = f"rs{match.group(1)}" if match else "sequence_aware"
-    return stem, split
 
 
 def _discover_roots() -> dict[str, dict[tuple[str, str], Path]]:

@@ -13,6 +13,7 @@ skips valid checkpoints, making this suitable for a long parallel batch.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import multiprocessing as mp
@@ -70,13 +71,39 @@ METHOD_SLUGS = {
 EXCLUDED_TARGETS = frozenset({"target_Fab_pI"})
 CONFIG_COMPARE_KEYS = ("alphas", "l1_ratios", "excluded_targets")
 _SEED_RE = re.compile(r"__rs(\d+)$")
+_DATASETS_DIR = REPO / "datasets"
+_HAS_FOLD_COL_CACHE: dict[str, bool] = {}
+
+
+def _dataset_has_predefined_fold(stem: str) -> bool:
+    """True if datasets/{stem}.csv already carries a fold column."""
+    if stem not in _HAS_FOLD_COL_CACHE:
+        csv_path = _DATASETS_DIR / f"{stem}.csv"
+        if not csv_path.is_file():
+            _HAS_FOLD_COL_CACHE[stem] = False
+        else:
+            with csv_path.open(newline="", encoding="utf-8") as handle:
+                header = next(csv.reader(handle), [])
+            _HAS_FOLD_COL_CACHE[stem] = "fold" in {c.strip() for c in header}
+    return _HAS_FOLD_COL_CACHE[stem]
 
 
 def _root_key(path: Path) -> tuple[str, str]:
+    """Return (dataset_stem, split_label) for a prepared fold root.
+
+    Labels:
+      * ``rs{seed}`` — random/shuffled CV (``__rs*`` suffix on the root)
+      * ``predefined`` — non-random root whose dataset CSV already has ``fold``
+      * ``sequence_aware`` — non-random root without a predefined fold column
+        (folds produced by MMseqs2 sequence clustering at prepare time)
+    """
     stem = path.name.split("_cv_prepare__", 1)[0]
     match = _SEED_RE.search(path.name)
-    split = f"rs{match.group(1)}" if match else "sequence_aware"
-    return stem, split
+    if match:
+        return stem, f"rs{match.group(1)}"
+    if _dataset_has_predefined_fold(stem):
+        return stem, "predefined"
+    return stem, "sequence_aware"
 
 
 def _choose(

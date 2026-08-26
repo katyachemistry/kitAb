@@ -68,7 +68,6 @@ Pick an example yaml, copy it, and edit paths (`datasets_dir`, `output_dir`, …
 | `existing-structures.yaml` | Dataset(s) with seqs and targets + existing structures → get descriptors → AutoML |
 | `descriptors-only.yaml` | Existing structures → get descriptors |
 | `automl-only.yaml` | Existing descriptors → AutoML on precomputed descriptors |
-| `full-with-tuning.yaml` | Existing structures → descriptors → AutoML + hyperparameter tuning |
 
 ```bash
 mkdir -p my_configs
@@ -76,8 +75,23 @@ cp examples/configs/predict-and-automl.yaml my_configs/run.yaml # or another sta
 
 ./kitab.sh validate my_configs/run.yaml # check the config
 ./kitab.sh my_configs/run.yaml # run tool from the config
+./kitab.sh my_configs/run.yaml --techniques elasticnet,sfs_svm --cv-mode nested
 ./kitab.sh resume runs/example_predict_automl # run.output_dir from the YAML, if interrupted
 ```
+
+### CLI overrides (AutoML)
+
+User YAML keeps only `automl.enabled`. Technique choice, CV mode, and final-model saving are CLI flags:
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--enable-automl` / `--disable-automl` | YAML `automl.enabled` | turn AutoML stage on/off |
+| `--techniques` | all four | `elasticnet,intercorr_svm,sfs_svm,sfs_knn` (comma-separated) |
+| `--cv-mode` | `nested` | `nested` or `flat` cross-validation |
+| `--no-final-model` | off | skip full-data refit (`estimator.joblib`) |
+| `--cpus` | `run.n_cpu` | worker pool for technique × fold × target jobs |
+
+Internal defaults (SFS fraction, ElasticNet grid, intercorr threshold) live in [`src/automl.yaml`](src/automl.yaml); users do not point at a custom AutoML YAML.
 
 ## Example config
 
@@ -93,7 +107,7 @@ inputs:
 run:
   output_dir: runs/my_kitab_run          
   resume: false                          # false aborts if output_dir has files; true continues it and skips finished descriptor JSONs
-  n_cpu: 8                             # parallelization with GNU Parallel
+  n_cpu: 8                             # descriptor workers (GNU Parallel) and AutoML pool size (Python multiprocessing)
 
 structure_prediction:
   enabled: true
@@ -113,20 +127,13 @@ descriptors:
 
 automl:
   enabled: true
-  eval_models: all                       # regressors: all, or linear,elasticnet,andomforest,svm,knn
-  # config_path: src/automl.yaml         # optional: custom AutoML YAML (selectors, features_frac); default is src/automl.yaml
-
-tuning: # HPO; top models are always saved after AutoML
-  enabled: false
-  # margin: 0.1                          # shortlist models within this CV Spearman of the best
-  # max_rank: 3                          # at most this many models enter the shortlist
 ```
 
 ### Cross-validation
 
 By default, balanced CV folds are derived with MMseqs2 sequence-identity clustering (0.50–0.80 cascade). If a CSV already has a `fold` column it is used. Force random 5-fold CV (seeds 42,43,44) with `inputs.split_randomly`.
 
-Shared AutoML defaults live in [`src/automl.yaml`](src/automl.yaml).
+AutoML compares four techniques in parallel (`elasticnet`, intercorrelation+SVM, SFS+SVM, SFS+KNN), ranks them by pooled out-of-fold Spearman correlation, and refits the winner on all labelled rows. Inner choices (ElasticNet `(alpha, l1_ratio)` grid; SFS eval model among `svm`, `knn`, `linear`, `randomforest`) happen inside cross-validation; there is no separate hyperparameter-tuning stage.
 
 ### Failure policy
 
@@ -137,7 +144,7 @@ Shared AutoML defaults live in [`src/automl.yaml`](src/automl.yaml).
 
 ### Saved models
 
-After AutoML the top model per dataset/source/target is refit and written to `models/<dataset>__<source>__<target>/` (`estimator.joblib`, `meta.json`) plus `models/model_index.json`. Shortlist is CV Spearman (`tuning.margin` / `tuning.max_rank`). Defaults unless `tuning.enabled: true`; `meta.json` records `tuned`.
+After AutoML the winning technique per dataset/source/target is refit on all labelled rows and written to `models/<dataset>__<source>__<target>/` (`estimator.joblib`, `meta.json`) plus `models/model_index.json`. Pass `--no-final-model` to compare techniques without saving fitted models.
 
 Load/predict:
 
@@ -146,8 +153,6 @@ from kitab.models import load_tuned_model, predict_with_tuned_model
 est, meta = load_tuned_model("runs/.../models/...")
 yhat = predict_with_tuned_model("runs/.../models/...", feature_dataframe)
 ```
-
-Eval models are `linear`, `elasticnet`, `randomforest`, `svm`, and `knn`.
 
 ## Reproduce paper results
 

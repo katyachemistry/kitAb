@@ -24,9 +24,4 @@ descriptors:
   cleanup: false                         # after each JSON, delete .dssp, _full.pka/.log, _full/_H_full/_L_full.sasa
 
 automl:
-  enabled: true                          # train/eval models on descriptors
-  eval_models: all                       # final scoring regressors only (not selectors): all, or linear,elasticnet,randomforest,svm,knn
-  # config_path: src/automl.yaml         # optional: custom AutoML YAML (selectors, features_frac); default is src/automl.yaml
-
-tuning:
-  enabled: false                         # opt-in hyperparameter search (top models are always saved after AutoML)
+  enabled: true

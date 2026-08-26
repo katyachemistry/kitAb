@@ -24,7 +24,6 @@ def translate_legacy_config(
     run: dict[str, Any] = {}
     descriptors: dict[str, Any] = {}
     automl: dict[str, Any] = {}
-    tuning: dict[str, Any] = {"enabled": False}
     structure_prediction: dict[str, Any] = {}
     structure_processing: dict[str, Any] = {}
 
@@ -112,14 +111,16 @@ def translate_legacy_config(
         )
 
     if raw.get("automl_config"):
-        automl["config_path"] = raw["automl_config"]
+        warnings.append(
+            "automl_config is no longer used; AutoML defaults live in src/automl.yaml. "
+            "Pass --techniques, --cv-mode, and --no-final-model on the CLI."
+        )
 
-    if "hyperparameter_tuning" in raw:
-        tuning["enabled"] = bool(raw["hyperparameter_tuning"])
-    elif "tuning" in raw and isinstance(raw["tuning"], dict):
-        tuning = dict(raw["tuning"])
-    else:
-        tuning["enabled"] = False
+    if raw.get("hyperparameter_tuning") or raw.get("tuning"):
+        warnings.append(
+            "hyperparameter_tuning / tuning are no longer used; kitAb fits the "
+            "winning technique on all data without a hyperparameter search."
+        )
 
     out: dict[str, Any] = {
         "inputs": inputs,
@@ -128,7 +129,6 @@ def translate_legacy_config(
         "structure_processing": structure_processing,
         "descriptors": descriptors,
         "automl": automl,
-        "tuning": tuning,
         "_legacy_raw": True,
     }
     return out, warnings
@@ -171,6 +171,4 @@ def _example_snippet(raw: dict[str, Any]) -> str:
         lines.append("  enabled: true")
         lines.append("automl:")
         lines.append("  enabled: true")
-    lines.append("tuning:")
-    lines.append("  enabled: false")
     return "\n".join(lines)

@@ -40,14 +40,18 @@ def test_model_roundtrip(tmp_path: Path):
         predict_with_tuned_model(model_dir, pd.DataFrame({"other": [1.0]}))
 
 
-def test_untuned_eval_hyperparameters_from_manifest():
-    from automl.tune_eval_hyperparameters import _hp_from_manifest_block
+def test_load_tuned_model_uses_model_io(tmp_path: Path):
+    from automl.model_io import save_model
+    from kitab.models import load_tuned_model
 
-    _raw, kwargs = _hp_from_manifest_block({}, "elasticnet")
-    assert kwargs["enet_alpha"] == 0.01
-
-    _raw, kwargs = _hp_from_manifest_block(
-        {"eval_hyperparameters": {"elasticnet": {"alpha": 0.5}}},
-        "elasticnet",
+    model_dir = tmp_path / "saved"
+    est = LinearRegression()
+    est.fit(np.array([[1.0], [2.0]]), np.array([1.0, 2.0]))
+    save_model(
+        model_dir,
+        estimator=est,
+        meta={"feature_cols": ["f1"], "target_col": "target_viscosity"},
     )
-    assert kwargs["enet_alpha"] == 0.5
+    loaded, meta = load_tuned_model(model_dir)
+    assert meta["feature_cols"] == ["f1"]
+    assert hasattr(loaded, "predict")

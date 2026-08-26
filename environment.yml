@@ -9,7 +9,7 @@
 #   freesasa (conda package `freesasa-c`)
 #   propka3  (conda package `propka`)
 #   mmseqs   (conda package `mmseqs2` from bioconda — sequence clustering for CV folds)
-#   parallel (GNU parallel — get_descriptors.sh / run_automl.sh)
+#   parallel (GNU parallel — get_descriptors.sh)
 #   hmmscan  (HMMER, pulled in with anarci)
 #
 # Create (mamba recommended):
@@ -37,7 +37,7 @@ dependencies:
   - freesasa-c=2.1.2    # provides `freesasa`
   - propka=3.5.1        # provides `propka3` (install.sh patches for Python 3.14)
   - mmseqs2             # provides `mmseqs` (sequence-identity clustering for AutoML CV folds)
-  - parallel            # GNU parallel (get_descriptors.sh / run_automl.sh)
+  - parallel            # GNU parallel (get_descriptors.sh)
 
   # --- Shared structure post-processing (independent of prediction backends) ---
   - openmm=8.4.0
@@ -51,8 +51,8 @@ dependencies:
   - scikit-learn=1.8.0
 
   # --- Automl / batch orchestration (src/automl) ---
-  - pyyaml=6.0.3        # prepare_parallel_from_config.py
-  - pyarrow=23.0.1      # optional parquet fold I/O in prepare_parallel_from_config.py
+  - pyyaml=6.0.3        # kitAb manifests and run configs
+  - pyarrow=23.0.1      # parquet fold I/O in AutoML
 
   # --- Optional plotting (soft imports in aggregate_batch_results.py, automl/utils.py) ---
   - matplotlib=3.10.8

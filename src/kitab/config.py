@@ -8,8 +8,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-SUPPORTED_EVAL_MODELS = ("linear", "elasticnet", "randomforest", "svm", "knn")
 STRUCTURE_BACKENDS = ("abb2", "abb3", "flashabb")
+SUPPORTED_TECHNIQUES = ("elasticnet", "intercorr_svm", "sfs_svm", "sfs_knn")
+CV_MODES = ("nested", "flat")
 
 KNOWN_TOP_KEYS = frozenset(
     {
@@ -19,11 +20,10 @@ KNOWN_TOP_KEYS = frozenset(
         "structure_processing",
         "descriptors",
         "automl",
-        "tuning",
     }
 )
 # Accepted but unused (older YAMLs). workflow is mapped to section enabled flags.
-_IGNORED_TOP_KEYS = frozenset({"schema_version", "workflow"})
+_IGNORED_TOP_KEYS = frozenset({"schema_version", "workflow", "tuning"})
 KNOWN_INPUT_KEYS = frozenset(
     {
         "datasets_dir",
@@ -51,8 +51,7 @@ KNOWN_DESC_KEYS = frozenset(
         "propka_minimize_retries",
     }
 )
-KNOWN_AUTOML_KEYS = frozenset({"enabled", "eval_models", "config_path"})
-KNOWN_TUNING_KEYS = frozenset({"enabled", "margin", "max_rank", "clean_folds_after"})
+KNOWN_AUTOML_KEYS = frozenset({"enabled"})
 
 
 class ConfigError(ValueError):
@@ -217,16 +216,9 @@ class DescriptorsConfig:
 @dataclass
 class AutomlConfig:
     enabled: bool = True
-    config_path: Path | None = None
-    eval_models: str = "all"
-
-
-@dataclass
-class TuningConfig:
-    enabled: bool = False
-    margin: float = 0.1
-    max_rank: int = 3
-    clean_folds_after: bool = True
+    techniques: list[str] = field(default_factory=lambda: list(SUPPORTED_TECHNIQUES))
+    cv_mode: str = "nested"
+    save_final_model: bool = True
 
 
 @dataclass
@@ -240,7 +232,6 @@ class Manifest:
     structure_processing: StructureProcessingConfig
     descriptors: DescriptorsConfig
     automl: AutomlConfig
-    tuning: TuningConfig
     warnings: list[str] = field(default_factory=list)
     stages_override: list[str] = field(default_factory=list)
 
@@ -266,11 +257,8 @@ class Manifest:
             graph.append("descriptors")
         if self.automl.enabled:
             if self.descriptors.enabled or self.structure_prediction.enabled:
-                graph.extend(["completeness", "automl", "analysis"])
-            else:
-                graph.extend(["automl", "analysis"])
-            # Export shortlisted models; grid-search only if tuning.enabled.
-            graph.append("tuning")
+                graph.append("completeness")
+            graph.append("automl")
         return graph
 
     def to_resolved_dict(self) -> dict[str, Any]:
@@ -309,10 +297,10 @@ class Manifest:
             },
             "automl": {
                 "enabled": self.automl.enabled,
-                "config_path": _path(self.automl.config_path),
-                "eval_models": self.automl.eval_models,
+                "techniques": list(self.automl.techniques),
+                "cv_mode": self.automl.cv_mode,
+                "save_final_model": self.automl.save_final_model,
             },
-            "tuning": asdict(self.tuning),
         }
 
     def checksum(self) -> str:
@@ -365,31 +353,34 @@ def _apply_deprecated_workflow(
         )
 
 
-def _eval_models_spec(raw: Any) -> str:
+def _validate_techniques(raw: Any) -> list[str]:
     if raw is None or raw == "":
-        return "all"
-    if isinstance(raw, (list, tuple)):
-        return ",".join(str(p).strip() for p in raw if str(p).strip()) or "all"
-    return str(raw)
+        return list(SUPPORTED_TECHNIQUES)
+    names = _as_str_list(raw, field_name="automl.techniques")
+    if not names:
+        return list(SUPPORTED_TECHNIQUES)
+    out: list[str] = []
+    for name in names:
+        key = name.strip().lower()
+        if key not in SUPPORTED_TECHNIQUES:
+            raise ConfigError(
+                f"Unknown technique {name!r}. "
+                f"Supported: {', '.join(SUPPORTED_TECHNIQUES)}"
+            )
+        if key not in out:
+            out.append(key)
+    return out
 
 
-def _validate_eval_models(spec: str) -> str:
-    s = str(spec).strip().lower()
-    if s in ("", "all", "none", "skip", "off"):
-        return s or "all"
-    parts = [p for p in s.replace(",", " ").split() if p]
-    for p in parts:
-        if p == "gpr":
-            raise ConfigError(
-                "Eval model 'gpr' has been removed from kitAb. "
-                f"Supported: {', '.join(SUPPORTED_EVAL_MODELS)}"
-            )
-        if p not in SUPPORTED_EVAL_MODELS:
-            raise ConfigError(
-                f"Unknown eval model {p!r}. "
-                f"Supported: {', '.join(SUPPORTED_EVAL_MODELS)}, or all"
-            )
-    return ",".join(parts)
+def _validate_cv_mode(raw: Any) -> str:
+    if raw is None or str(raw).strip() == "":
+        return "nested"
+    mode = str(raw).strip().lower()
+    if mode not in CV_MODES:
+        raise ConfigError(
+            f"automl.cv_mode must be one of {', '.join(CV_MODES)}, got {mode!r}"
+        )
+    return mode
 
 
 def _parse_structure_models(value: Any) -> list[str]:
@@ -485,9 +476,22 @@ def parse_manifest_dict(
     automl_raw = collect(
         lambda: _as_mapping(raw.get("automl"), field_name="automl"), {}
     )
-    tuning_raw = collect(
-        lambda: _as_mapping(raw.get("tuning"), field_name="tuning"), {}
+    if raw.get("tuning") is not None:
+        warnings.append(
+            "The tuning: section is no longer used. kitAb fits the winning "
+            "technique on all data at the end of the automl stage and does not "
+            "search hyperparameters."
+        )
+    _ignored_automl_yaml = (
+        ("config_path", "automl.config_path is ignored; use src/automl.yaml (internal defaults)."),
+        ("techniques", "automl.techniques is ignored; pass --techniques on the CLI."),
+        ("cv_mode", "automl.cv_mode is ignored; pass --cv-mode on the CLI."),
+        ("save_final_model", "automl.save_final_model is ignored; pass --no-final-model on the CLI."),
+        ("eval_models", "automl.eval_models is no longer used."),
     )
+    for key, msg in _ignored_automl_yaml:
+        if automl_raw.pop(key, None) is not None:
+            warnings.append(msg)
 
     _apply_deprecated_workflow(
         workflow_raw, pred_raw, desc_raw, automl_raw, warnings
@@ -519,7 +523,6 @@ def parse_manifest_dict(
         note(_unknown_keys(proc_raw, KNOWN_PROC_KEYS, "structure_processing"))
         note(_unknown_keys(desc_raw, KNOWN_DESC_KEYS, "descriptors"))
         note(_unknown_keys(automl_raw, KNOWN_AUTOML_KEYS, "automl"))
-        note(_unknown_keys(tuning_raw, KNOWN_TUNING_KEYS, "tuning"))
 
     if overrides.get("output_dir") is not None:
         run_raw["output_dir"] = overrides["output_dir"]
@@ -531,8 +534,22 @@ def parse_manifest_dict(
         pred_raw["device"] = overrides["device"]
     if overrides.get("enable_automl") is not None:
         automl_raw["enabled"] = overrides["enable_automl"]
-    if overrides.get("enable_tuning") is not None:
-        tuning_raw["enabled"] = overrides["enable_tuning"]
+
+    techniques = list(SUPPORTED_TECHNIQUES)
+    cv_mode = "nested"
+    save_final_model = True
+    if overrides.get("techniques") is not None:
+        techniques = collect(
+            lambda: _validate_techniques(overrides["techniques"]),
+            list(SUPPORTED_TECHNIQUES),
+        )
+    if overrides.get("cv_mode") is not None:
+        cv_mode = collect(
+            lambda: _validate_cv_mode(overrides["cv_mode"]),
+            "nested",
+        )
+    if overrides.get("no_final_model"):
+        save_final_model = False
 
     stages_override = collect(
         lambda: _as_str_list(
@@ -616,12 +633,6 @@ def parse_manifest_dict(
         device = f"cuda:{device_raw}"
     else:
         device = str(device_raw).strip() or "cuda:0"
-
-    eval_models = collect(
-        lambda: _validate_eval_models(_eval_models_spec(automl_raw.get("eval_models"))),
-        "all",
-    )
-    automl_cfg_path = _resolve_path(repo_root, automl_raw.get("config_path"))
 
     exclude_datasets = collect(
         lambda: _as_str_list(
@@ -732,35 +743,6 @@ def parse_manifest_dict(
         5,
     )
 
-    tuning_enabled = collect(
-        lambda: _as_bool(
-            tuning_raw.get("enabled"), field_name="tuning.enabled", default=False
-        ),
-        False,
-    )
-    try:
-        margin = float(tuning_raw.get("margin", 0.1))
-    except (TypeError, ValueError):
-        note(f"tuning.margin must be a number, got {tuning_raw.get('margin')!r}")
-        margin = 0.1
-    max_rank = collect(
-        lambda: _as_int(
-            tuning_raw.get("max_rank"),
-            field_name="tuning.max_rank",
-            default=3,
-            min_value=1,
-        ),
-        3,
-    )
-    clean_folds_after = collect(
-        lambda: _as_bool(
-            tuning_raw.get("clean_folds_after"),
-            field_name="tuning.clean_folds_after",
-            default=True,
-        ),
-        True,
-    )
-
     if issues:
         raise ConfigError("invalid manifest", issues=issues)
     if output_dir is None:
@@ -805,14 +787,9 @@ def parse_manifest_dict(
         ),
         automl=AutomlConfig(
             enabled=automl_enabled,
-            config_path=automl_cfg_path,
-            eval_models=eval_models,
-        ),
-        tuning=TuningConfig(
-            enabled=tuning_enabled,
-            margin=margin,
-            max_rank=max_rank,
-            clean_folds_after=clean_folds_after,
+            techniques=techniques,
+            cv_mode=cv_mode,
+            save_final_model=save_final_model,
         ),
         warnings=warnings,
         stages_override=stages_override,
@@ -958,9 +935,4 @@ def manifest_to_legacy_generic(manifest: Manifest) -> dict[str, Any]:
         if manifest.structure_prediction.batch_size is not None:
             sp["batch_size"] = manifest.structure_prediction.batch_size
         out["structure_prediction"] = sp
-    if manifest.automl.config_path is not None:
-        out["automl_config"] = _rel_or_abs(
-            manifest.repo_root, manifest.automl.config_path
-        )
-    out["hyperparameter_tuning"] = bool(manifest.tuning.enabled)
     return out

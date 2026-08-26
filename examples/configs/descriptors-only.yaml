@@ -19,7 +19,4 @@ descriptors:
   cleanup: false                         # after each JSON, delete .dssp, _full.pka/.log, _full/_H_full/_L_full.sasa
 
 automl:
-  enabled: false                         # no models
-
-tuning:
-  enabled: false                         # unused without AutoML
+  enabled: false

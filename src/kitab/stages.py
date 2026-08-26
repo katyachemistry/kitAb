@@ -820,100 +820,34 @@ def filter_run_config_for_complete(
 
 
 def run_automl(manifest: Manifest, logger: RunLogger, run_config: Path) -> Path:
+    """Compare the four techniques, then fit and save the winner per target."""
     script = manifest.repo_root / "src" / "run_automl.sh"
-    cmd = ["bash", str(script), "--config", str(run_config)]
+    models_root = manifest.run.output_dir / "models"
+    cmd = [
+        "bash",
+        str(script),
+        "--config",
+        str(run_config),
+        "--techniques",
+        ",".join(manifest.automl.techniques),
+        "--cv-mode",
+        manifest.automl.cv_mode,
+        "--models-root",
+        str(models_root),
+    ]
     if manifest.run.n_cpu:
-        cmd.extend(["--parallel-jobs", str(manifest.run.n_cpu)])
+        cmd.extend(["--jobs", str(manifest.run.n_cpu)])
+    if manifest.run.resume or manifest.run.skip_existing_results:
+        cmd.append("--resume")
+    if not manifest.automl.save_final_model:
+        cmd.append("--no-final-model")
     logger.event(stage="automl", status="started", command=" ".join(cmd))
     _run(cmd, cwd=manifest.repo_root, check=True)
     batch_root = manifest.run.output_dir / "automl"
+    if manifest.automl.save_final_model:
+        _publish_model_index(models_root, manifest, logger)
     logger.event(stage="automl", status="ok", message=str(batch_root))
     return batch_root
-
-
-def run_analysis(manifest: Manifest, logger: RunLogger, batch_root: Path) -> Path:
-    agg = sorted(batch_root.glob("aggregated_*.csv"))
-    if not agg:
-        raise RuntimeError(f"No aggregated_*.csv under {batch_root}")
-    analysis_out = manifest.run.output_dir / "analysis_results"
-    analysis_out.mkdir(parents=True, exist_ok=True)
-    # Pick a reference json if available.
-    ref = None
-    sample = sorted((manifest.run.output_dir / "descriptors").glob("*/results/*.json"))
-    if sample:
-        ref = sample[0]
-    src = manifest.repo_root / "src"
-    cmd = _py_cmd() + [
-        "-m",
-        "analysis.analyze_results",
-        *[str(p) for p in agg],
-        "--out-dir",
-        str(analysis_out),
-        "--stability-seed",
-        "42",
-        "--no-plots",
-    ]
-    if ref is not None:
-        cmd.extend(["--reference-json", str(ref)])
-    env = {"PYTHONPATH": str(src) + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")}
-    logger.event(stage="analysis", status="started", command=" ".join(cmd))
-    _run(cmd, cwd=src, env=env, check=True)
-    logger.event(stage="analysis", status="ok", message=str(analysis_out))
-    return analysis_out
-
-
-def run_tuning(manifest: Manifest, logger: RunLogger, batch_root: Path, analysis_out: Path) -> Path | None:
-    summary = analysis_out / "best_metrics_summary.csv"
-    manifest_path = batch_root / "batch_manifest.json"
-    if not summary.is_file() or not manifest_path.is_file():
-        logger.event(
-            stage="tuning",
-            status="skipped",
-            message="missing analysis summary or batch manifest",
-        )
-        return None
-    models_root = manifest.run.output_dir / "models"
-    src = manifest.repo_root / "src"
-    cmd = _py_cmd() + [
-        "-m",
-        "automl.tune_eval_hyperparameters",
-        "--batch-root",
-        str(batch_root),
-        "--best-metrics-summary",
-        str(summary),
-        "--aggregated-glob",
-        str(batch_root / "aggregated_*.csv"),
-        "--out-dir",
-        str(analysis_out),
-        "--manifest",
-        str(manifest_path),
-        "--models-root",
-        str(models_root),
-        "--margin",
-        str(manifest.tuning.margin),
-        "--max-rank",
-        str(manifest.tuning.max_rank),
-    ]
-    if not manifest.tuning.enabled:
-        cmd.append("--skip-grid-search")
-    if manifest.tuning.enabled and manifest.tuning.clean_folds_after:
-        cmd.append("--clean-folds")
-    mode = (
-        "hyperparameter search"
-        if manifest.tuning.enabled
-        else "export shortlisted models (untuned)"
-    )
-    env = {"PYTHONPATH": str(src) + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")}
-    logger.event(stage="tuning", status="started", command=" ".join(cmd), message=mode)
-    try:
-        _run(cmd, cwd=src, env=env, check=True)
-        # Enrich model metas with checksums / index.
-        _publish_model_index(models_root, manifest, logger)
-        logger.event(stage="tuning", status="ok", message=str(models_root))
-        return models_root
-    except subprocess.CalledProcessError as exc:
-        logger.event(stage="tuning", status="error", message=str(exc))
-        raise
 
 
 def _publish_model_index(models_root: Path, manifest: Manifest, logger: RunLogger) -> None:
@@ -937,17 +871,18 @@ def _publish_model_index(models_root: Path, manifest: Manifest, logger: RunLogge
             index.append(
                 {
                     "model_dir": str(model_dir),
+                    "technique": meta.get("technique"),
                     "eval_model": meta.get("eval_model"),
                     "target_col": meta.get("target_col"),
                     "dataset_stem": meta.get("dataset_stem"),
-                    "cv_spearman_mean": meta.get("cv_spearman_mean"),
-                    "tuned": meta.get("tuned"),
+                    "cv_spearman_pooled_oof": meta.get("cv_spearman_pooled_oof"),
+                    "n_features": meta.get("n_features"),
                     "estimator_sha256": meta.get("estimator_sha256"),
                 }
             )
         except Exception as exc:  # noqa: BLE001
             logger.failure(
-                stage="tuning",
+                stage="automl",
                 dataset=str(model_dir.name),
                 item="model_index",
                 reason=f"model validation failed: {exc}",

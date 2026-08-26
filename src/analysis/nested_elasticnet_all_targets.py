@@ -2,9 +2,10 @@
 """Nested Elastic Net on all targets in a sequence-aware fold root.
 
 For each outer fold, alpha and l1_ratio are selected by pooled Spearman across
-the predefined inner validation folds. Imputation and scaling are fitted only
-on the corresponding training split. The selected model is then refitted on
-the complete outer-training set and evaluated on the untouched outer test set.
+the predefined inner validation folds. Scaling is fitted only on the
+corresponding training split; missing feature values raise an error. The
+selected model is then refitted on the complete outer-training set and
+evaluated on the untouched outer test set.
 """
 
 from __future__ import annotations
@@ -22,8 +23,8 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.exceptions import ConvergenceWarning
-from sklearn.impute import SimpleImputer
 from sklearn.linear_model import ElasticNet
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -76,10 +77,32 @@ def _xy(
     return x, y.loc[mask]
 
 
+class _RejectMissing(BaseEstimator, TransformerMixin):
+    """Fail fast if any feature value is missing; do not impute."""
+
+    def fit(self, X, y=None):
+        self._check(X, stage="fit")
+        return self
+
+    def transform(self, X):
+        self._check(X, stage="transform")
+        return X
+
+    @staticmethod
+    def _check(X, *, stage: str) -> None:
+        arr = np.asarray(X, dtype=float)
+        n_missing = int(np.isnan(arr).sum())
+        if n_missing:
+            raise ValueError(
+                f"Missing feature values are not allowed "
+                f"({n_missing} NaN(s) during elastic-net {stage})"
+            )
+
+
 def _make_model(alpha: float, l1_ratio: float) -> Pipeline:
     return Pipeline(
         [
-            ("imputer", SimpleImputer(strategy="median")),
+            ("reject_missing", _RejectMissing()),
             ("scaler", StandardScaler()),
             (
                 "elasticnet",

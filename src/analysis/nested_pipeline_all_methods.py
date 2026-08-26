@@ -7,7 +7,7 @@ Pipelines:
     svm / knn / linear / randomforest
   * sfs_knn: same as sfs_svm but SFS selector model is KNN
   * elasticnet: nested alpha/l1 grid on all input features
-    (median impute + StandardScaler; no selector)
+    (StandardScaler only; missing values raise an error)
 
 Artifacts written under --out-dir:
   predictions/oof.parquet
@@ -45,10 +45,10 @@ for _variable in (
 import numpy as np
 import pandas as pd
 from scipy.stats import ConstantInputWarning, pearsonr, spearmanr
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.exceptions import ConvergenceWarning
-from sklearn.impute import SimpleImputer
 from sklearn.inspection import permutation_importance
-from sklearn.linear_model import ElasticNet
+from sklearn.linear_model import ElasticNet, ElasticNetCV
 from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
@@ -74,11 +74,11 @@ from analysis.nested_elasticnet_all_targets import (
     DEFAULT_L1_RATIOS,
     _spearman,
 )
-from automl.feature_selectors import (
+from automl.utils import (
     reduce_correlated_features,
     remove_low_variance_features,
-    sequential_forward_selector,
 )
+from automl.feature_selectors import sequential_forward_selector
 from automl.pipeline_defaults import (
     DEFAULT_EVAL_HYPERPARAMETERS_RAW,
     DEFAULT_INTERCORR_IMPORTANCE_METRIC,
@@ -138,6 +138,8 @@ SFS_INNER_CV = 5
 PERM_REPEATS = 10
 CONFIG_COMPARE_KEYS = (
     "pipelines",
+    "cv_mode",
+    "stems",
     "eval_hyperparameters",
     "intercorr_threshold",
     "intercorr_importance_metric",
@@ -305,10 +307,32 @@ def _run_selector_feature_selection(
     }
 
 
+class _RejectMissing(BaseEstimator, TransformerMixin):
+    """Fail fast if any feature value is missing; do not impute."""
+
+    def fit(self, X, y=None):
+        self._check(X, stage="fit")
+        return self
+
+    def transform(self, X):
+        self._check(X, stage="transform")
+        return X
+
+    @staticmethod
+    def _check(X, *, stage: str) -> None:
+        arr = np.asarray(X, dtype=float)
+        n_missing = int(np.isnan(arr).sum())
+        if n_missing:
+            raise ValueError(
+                f"Missing feature values are not allowed "
+                f"({n_missing} NaN(s) during elastic-net {stage})"
+            )
+
+
 def _make_elasticnet(alpha: float, l1_ratio: float) -> Pipeline:
     return Pipeline(
         [
-            ("imputer", SimpleImputer(strategy="median")),
+            ("reject_missing", _RejectMissing()),
             ("scaler", StandardScaler()),
             (
                 "elasticnet",
@@ -322,6 +346,35 @@ def _make_elasticnet(alpha: float, l1_ratio: float) -> Pipeline:
             ),
         ]
     )
+
+
+def _make_elasticnet_cv(alphas: list[float], l1_ratios: list[float], *, cv: int) -> Pipeline:
+    return Pipeline(
+        [
+            ("reject_missing", _RejectMissing()),
+            ("scaler", StandardScaler()),
+            (
+                "elasticnet",
+                ElasticNetCV(
+                    alphas=[float(a) for a in alphas],
+                    l1_ratio=[float(x) for x in l1_ratios],
+                    cv=max(2, int(cv)),
+                    max_iter=100_000,
+                    tol=1e-5,
+                    random_state=DEFAULT_RANDOM_STATE,
+                    n_jobs=1,
+                ),
+            ),
+        ]
+    )
+
+
+# Datasets plotted as random-split / flat CV (not nested).
+FLAT_CV_STEMS = {
+    "ab21",
+    "pdgf38",
+    "jain2024assessment_folded_08_4",
+}
 
 
 def _xy(
@@ -948,7 +1001,7 @@ def _run_outer_elasticnet(
         model.named_steps["elasticnet"],
         model_type="elasticnet",
         feature_names=features,
-        scaling_method="standardize_after_median_impute",
+        scaling_method="standardize",
         scaler_stats=None,
         pipeline_model=model,
     )
@@ -1055,7 +1108,27 @@ def _run_outer(
     pipeline: dict[str, Any],
     work_root: Path,
     eval_hp_by_model: dict[str, dict],
+    cv_mode: str = "nested",
 ) -> dict[str, Any]:
+    if cv_mode == "flat":
+        if pipeline["kind"] == "elasticnet":
+            return _run_outer_elasticnet_flat(
+                fold_dir,
+                target_col=target_col,
+                outer_k=outer_k,
+                features=features,
+                pipeline_key=pipeline_key,
+                pipeline=pipeline,
+            )
+        return _run_outer_selector_flat(
+            fold_dir,
+            target_col=target_col,
+            outer_k=outer_k,
+            features=features,
+            pipeline_key=pipeline_key,
+            pipeline=pipeline,
+            eval_hp_by_model=eval_hp_by_model,
+        )
     if pipeline["kind"] == "elasticnet":
         return _run_outer_elasticnet(
             fold_dir,
@@ -1076,6 +1149,209 @@ def _run_outer(
         work_root=work_root,
         eval_hp_by_model=eval_hp_by_model,
     )
+
+
+def _run_outer_selector_flat(
+    fold_dir: Path,
+    *,
+    target_col: str,
+    outer_k: int,
+    features: list[str],
+    pipeline_key: str,
+    pipeline: dict[str, Any],
+    eval_hp_by_model: dict[str, dict],
+) -> dict[str, Any]:
+    """Single-level CV: select features on outer-train only; no inner eval search."""
+    outer_train = pd.read_parquet(fold_dir / f"fold_{outer_k}_train.parquet")
+    outer_test = pd.read_parquet(fold_dir / f"fold_{outer_k}_test.parquet")
+    best_eval = pipeline.get("selector_model") or pipeline["eval_models"][0]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConstantInputWarning)
+        selection = _run_selector_feature_selection(
+            outer_train,
+            outer_test,
+            target_col=target_col,
+            candidate_features=features,
+            pipeline=pipeline,
+        )
+        fit = _fit_predict_selector(
+            selection["train_df"],
+            selection["test_df"],
+            target_col=target_col,
+            selected_features=selection["selected_features"],
+            eval_model=best_eval,
+            eval_hp_by_model=eval_hp_by_model,
+            scaling_method=selection["scaling_method"],
+            scaler_stats=selection["scaler_stats"],
+            compute_attribution=True,
+        )
+    feature_usage = _build_feature_usage_rows(
+        input_features=selection["input_features"],
+        after_lowvar=selection["after_lowvar"],
+        after_intercorr=selection["after_intercorr"],
+        selected_features=selection["selected_features"],
+        final_features=fit["final_features"],
+        attributions=fit["attributions"],
+    )
+    print(
+        f"[flat] {pipeline_key} {target_col} outer {outer_k}: "
+        f"rho={fit['evaluation']['spearman']} r2={fit['evaluation']['r2']} "
+        f"eval={best_eval} n_selected={len(selection['selected_features'])}",
+        flush=True,
+    )
+    return {
+        "pipeline": pipeline_key,
+        "pipeline_label": pipeline["label"],
+        "cv_mode": "flat",
+        "target_col": target_col,
+        "outer_fold": outer_k,
+        "n_test": int(fit["evaluation"]["n_test"]),
+        "n_train": int(fit["evaluation"]["n_train"]),
+        "spearman": fit["evaluation"]["spearman"],
+        "spearman_p": fit["evaluation"].get("spearman_p"),
+        "pearson_r": fit["evaluation"]["pearson_r"],
+        "pearson_p": fit["evaluation"].get("pearson_p"),
+        "r2": fit["evaluation"]["r2"],
+        "mse": fit["evaluation"]["mse"],
+        "eval_model": best_eval,
+        "alpha": None,
+        "l1_ratio": None,
+        "inner_pooled_spearman": None,
+        "n_selected_features": len(selection["selected_features"]),
+        "n_final_features": len(fit["final_features"]),
+        "n_nonzero": sum(
+            1 for row in feature_usage if row.get("is_nonzero") and row["final_model_input"]
+        ),
+        "selected_features": selection["selected_features"],
+        "final_features": fit["final_features"],
+        "feature_usage": feature_usage,
+        "inner_scores": [],
+        "inner_feature_rows": [],
+        "grid_scores": [],
+        "outer_evaluation": fit["evaluation"],
+        "n_inner_folds": 0,
+        "selection_rule": "flat CV train-only selection",
+        "oof_rows": [
+            {
+                "name": str(name),
+                "target_col": target_col,
+                "outer_fold": outer_k,
+                "pipeline": pipeline_key,
+                "eval_model": best_eval,
+                "alpha": None,
+                "l1_ratio": None,
+                "y": float(y),
+                "yhat": float(yhat),
+            }
+            for name, y, yhat in zip(fit["names"], fit["y"], fit["yhat"])
+        ],
+    }
+
+
+def _run_outer_elasticnet_flat(
+    fold_dir: Path,
+    *,
+    target_col: str,
+    outer_k: int,
+    features: list[str],
+    pipeline_key: str,
+    pipeline: dict[str, Any],
+) -> dict[str, Any]:
+    """Single-level CV: ElasticNetCV on outer-train only (no nested leftover folds)."""
+    outer_train = pd.read_parquet(fold_dir / f"fold_{outer_k}_train.parquet")
+    outer_test = pd.read_parquet(fold_dir / f"fold_{outer_k}_test.parquet")
+    x_train, y_train, _ = _xy(outer_train, target_col, features)
+    x_test, y_test, names = _xy(outer_test, target_col, features)
+    n_train = int(len(y_train))
+    cv = min(5, max(2, n_train // 2)) if n_train >= 4 else 2
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        warnings.simplefilter("ignore", ConstantInputWarning)
+        model = _make_elasticnet_cv(
+            list(pipeline["alphas"]),
+            list(pipeline["l1_ratios"]),
+            cv=cv,
+        )
+        model.fit(x_train, y_train)
+        pred = pd.Series(model.predict(x_test), index=y_test.index)
+    en = model.named_steps["elasticnet"]
+    best_alpha = float(en.alpha_)
+    best_l1 = float(en.l1_ratio_)
+    metrics = _metric_bundle(y_test, pred)
+    attributions = _extract_attributions(
+        en,
+        model_type="elasticnet",
+        feature_names=features,
+        scaling_method="standardize",
+        scaler_stats=None,
+        pipeline_model=model,
+    )
+    perm = _permutation_rows(model, x_test, y_test, features)
+    for row in attributions:
+        row.update(perm.get(row["feature"], {}))
+    feature_usage = _build_feature_usage_rows(
+        input_features=features,
+        after_lowvar=features,
+        after_intercorr=features,
+        selected_features=features,
+        final_features=features,
+        attributions=attributions,
+    )
+    nonzero_features = [
+        row["feature"] for row in attributions if row.get("is_nonzero")
+    ]
+    print(
+        f"[flat] {pipeline_key} {target_col} outer {outer_k}: "
+        f"rho={metrics['spearman']} r2={metrics['r2']} "
+        f"alpha={best_alpha} l1={best_l1} n_nonzero={len(nonzero_features)}",
+        flush=True,
+    )
+    return {
+        "pipeline": pipeline_key,
+        "pipeline_label": pipeline["label"],
+        "cv_mode": "flat",
+        "target_col": target_col,
+        "outer_fold": outer_k,
+        "n_test": int(metrics["n"]),
+        "n_train": n_train,
+        "spearman": metrics["spearman"],
+        "spearman_p": metrics.get("spearman_p"),
+        "pearson_r": metrics["pearson_r"],
+        "pearson_p": metrics.get("pearson_p"),
+        "r2": metrics["r2"],
+        "mse": metrics["mse"],
+        "eval_model": "elasticnet",
+        "alpha": best_alpha,
+        "l1_ratio": best_l1,
+        "inner_pooled_spearman": None,
+        "n_selected_features": len(features),
+        "n_final_features": len(features),
+        "n_nonzero": len(nonzero_features),
+        "selected_features": list(features),
+        "final_features": list(features),
+        "nonzero_features": nonzero_features,
+        "feature_usage": feature_usage,
+        "inner_scores": [],
+        "inner_feature_rows": [],
+        "grid_scores": [],
+        "outer_evaluation": metrics,
+        "n_inner_folds": cv,
+        "selection_rule": "flat ElasticNetCV on outer-train",
+        "oof_rows": [
+            {
+                "name": str(name),
+                "target_col": target_col,
+                "outer_fold": outer_k,
+                "pipeline": pipeline_key,
+                "eval_model": "elasticnet",
+                "alpha": best_alpha,
+                "l1_ratio": best_l1,
+                "y": float(y),
+                "yhat": float(yhat),
+            }
+            for name, y, yhat in zip(names, y_test, pred)
+        ],
+    }
 
 
 def _task_checkpoint(out_dir: Path, task: dict[str, Any]) -> Path:
@@ -1104,9 +1380,13 @@ def _checkpoint_matches_task(result: dict[str, Any], task: dict[str, Any]) -> bo
         "outer_fold": task["outer_k"],
         "fold_root": str(task["fold_dir"]),
         "n_input_features": len(task["features"]),
+        "cv_mode": task.get("cv_mode", "nested"),
     }
     for key, value in expected.items():
-        if result.get(key) != value:
+        got = result.get(key)
+        if key == "cv_mode":
+            got = result.get("cv_mode", "nested")
+        if got != value:
             return False
     required = {
         "oof_rows",
@@ -1158,6 +1438,7 @@ def _run_task(task: dict[str, Any]) -> dict[str, Any]:
         pipeline=PIPELINES[task["pipeline"]],
         work_root=task["work_root"],
         eval_hp_by_model=task["eval_hp_by_model"],
+        cv_mode=task.get("cv_mode", "nested"),
     )
     result.update(
         {
@@ -1168,6 +1449,7 @@ def _run_task(task: dict[str, Any]) -> dict[str, Any]:
             "split": task["split"],
             "n_input_features": len(task["features"]),
             "fold_root": str(task["fold_dir"]),
+            "cv_mode": task.get("cv_mode", "nested"),
         }
     )
     return result
@@ -1194,6 +1476,8 @@ def _build_pipeline_tasks(
     *,
     out_dir: Path,
     eval_hp_by_model: dict[str, dict],
+    stems: set[str] | None = None,
+    cv_mode: str = "nested",
 ) -> tuple[list[dict[str, Any]], pd.DataFrame]:
     kitab = _discover_kitab()
     propermab = _discover_propermab()
@@ -1218,6 +1502,8 @@ def _build_pipeline_tasks(
         ("PROPERMAB", propermab, "propermab", "_propermab"),
     ):
         for (stem, split, backend, variant), root in sorted(root_map.items()):
+            if stems is not None and stem not in stems:
+                continue
             configs.append(
                 {
                     "method": method,
@@ -1233,6 +1519,8 @@ def _build_pipeline_tasks(
     for (stem, split, backend, variant), root in sorted(propermab.items()):
         if backend != "abb2" or variant != 1:
             continue
+        if stems is not None and stem not in stems:
+            continue
         configs.append(
             {
                 "method": "Sequence features baseline",
@@ -1246,6 +1534,8 @@ def _build_pipeline_tasks(
         )
 
     for (stem, split), root in sorted(tap.items()):
+        if stems is not None and stem not in stems:
+            continue
         configs.append(
             {
                 "method": "TAP",
@@ -1297,6 +1587,7 @@ def _build_pipeline_tasks(
                     {
                         "pipeline": pipeline_key,
                         "pipeline_label": pipeline["label"],
+                        "cv_mode": cv_mode,
                         **{
                             key: config[key]
                             for key in (
@@ -1333,6 +1624,7 @@ def _build_pipeline_tasks(
                         "features": features,
                         "outer_k": outer_k,
                         "eval_hp_by_model": eval_hp_by_model,
+                        "cv_mode": cv_mode,
                         "work_root": (
                             out_dir
                             / "work"
@@ -1616,9 +1908,28 @@ def main() -> None:
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--cv-mode",
+        choices=("nested", "flat"),
+        default="nested",
+        help="nested: inner leftover-fold selection; flat: train-only CV per fold",
+    )
+    parser.add_argument(
+        "--stems",
+        default="",
+        help="Comma-separated Dataset_stem filter (default: all; flat default: FLAT_CV_STEMS)",
+    )
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be >= 1")
+
+    stem_filter: set[str] | None
+    if args.stems.strip():
+        stem_filter = {s.strip() for s in args.stems.split(",") if s.strip()}
+    elif args.cv_mode == "flat":
+        stem_filter = set(FLAT_CV_STEMS)
+    else:
+        stem_filter = None
 
     eval_hp_by_model = parse_eval_hyperparameters_mapping(
         DEFAULT_EVAL_HYPERPARAMETERS_RAW
@@ -1627,6 +1938,8 @@ def main() -> None:
     config_path = args.out_dir / "run_config.json"
     run_config: dict[str, Any] = {
         "pipelines": PIPELINES,
+        "cv_mode": args.cv_mode,
+        "stems": sorted(stem_filter) if stem_filter is not None else None,
         "jobs": args.jobs,
         "eval_hyperparameters": DEFAULT_EVAL_HYPERPARAMETERS_RAW,
         "intercorr_threshold": DEFAULT_INTERCORR_THRESHOLD,
@@ -1646,6 +1959,8 @@ def main() -> None:
     tasks, manifest = _build_pipeline_tasks(
         out_dir=args.out_dir,
         eval_hp_by_model=eval_hp_by_model,
+        stems=stem_filter,
+        cv_mode=args.cv_mode,
     )
     run_config["manifest_sha1"] = _manifest_fingerprint(manifest)
 

@@ -1,75 +1,61 @@
-# Shared AutoML / pipeline settings for all run configs.
-# Default path: src/automl.yaml (override with automl_config: in run config or --automl-config).
+# kitAb AutoML pipeline settings (internal defaults — not a user config).
+#
+# The four techniques run in parallel (technique × outer fold × target) via a
+# worker pool. Each technique is ranked by Spearman correlation over pooled
+# out-of-fold predictions; the winner is refit on the whole dataset.
+#
+# ElasticNet (alpha, l1_ratio) and SFS eval-model choice are resolved inside
+# cross-validation — there is no separate hyperparameter-tuning stage.
+#
+# Override for development: run_automl.sh --automl-config PATH
 
 pipeline:
-  # Per-dataset random_seeds in run configs override this (42,43,44 for shuffled CV).
+  # Seed for splits, feature selection and every estimator.
   random_state: 42
-  # One value or comma-separated / YAML list, e.g. 0.15,0.10,0.08 or [0.15, 0.10, 0.08]
-  features_frac: 0.15,0.10,0.08,0.06,0.04,0.02
-  eval_models: all                       # final scoring regressors (not the feature selectors below)
-  # Final eval regressors (optional; omit for sklearn defaults). Use eval_hyperparameters (nested
-  # per model). Pipeline-level hyperparameters: is also accepted if nested by eval model name only.
+
+  # Techniques compared for every target. Drop entries to run fewer (kitAb CLI:
+  # --techniques elasticnet,sfs_svm overrides this list).
+  #   elasticnet     - ElasticNet on all descriptors, alpha/l1_ratio chosen by CV
+  #   intercorr_svm  - intercorrelation pruning, then SVM on every survivor
+  #   sfs_svm        - pruning + sequential forward selection driven by an SVM
+  #   sfs_knn        - pruning + sequential forward selection driven by KNN
+  techniques: [elasticnet, intercorr_svm, sfs_svm, sfs_knn]
+
+  cv:
+    # nested: inner folds choose the eval model and ElasticNet grid point.
+    # flat:   selection on outer-train only (cheaper; small variant series).
+    mode: nested
+    # Outer folds for datasets without a fold column; per-dataset n_splits and
+    # random_seeds in the generated run config take precedence.
+    n_splits: 5
+
+  # Prefilters applied before selection in every technique except elasticnet.
+  low_variance_relative_std_threshold: 0.01
+  # low_variance_epsilon: 1e-8
+  intercorr_threshold: 0.9
+  intercorr_importance_metric: pearson    # pearson | spearman
+  intercorr_reduction_mode: pairwise      # pairwise | cluster
+
+  sfs:
+    # Feature budget as a fraction of the training rows.
+    features_frac: 0.15
+    min_improvement: 0.02
+    inner_cv: 5
+    # Cross-validation picks one of these to score the selected features.
+    eval_models: [svm, knn, linear, randomforest]
+
+  elasticnet:
+    alphas: [0.0001, 0.0003, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0]
+    l1_ratios: [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0]
+
+  # Fixed settings for the eval regressors (sklearn defaults where omitted).
   eval_hyperparameters:
     elasticnet:
       alpha: 0.01
     knn:
       weights: distance
-  # Shared prefilter for every selector (optional; per-selector hyperparameters: override same keys)
-  low_variance_relative_std_threshold: 0.01
-  # low_variance_epsilon: 1e-8
-  intercorr_threshold: 0.9
-  intercorr_importance_metric: pearson
-  intercorr_reduction_mode: pairwise
-  track_linear:
-    # Train-fold Spearman |rho(feature, target)|; elbow on the descending curve; keep
-    # max(min_n_features, elbow_n), capped by intercorr prefilter size. Runs before stability_reduction.
-    correlation_reduction:
-      min_n_features: 25
-    selector1:
-      type: stability
-      model: svm,elasticnet
-      hyperparameters:
-        stability_n_subsamples: fold_train_log10_ns_500
-        stability_sample_fraction: fold_train_log10_const_5
-    selector2:
-      type: correlation
-    selector3:
-      type: rfe
-      model: svm,elasticnet
-      hyperparameters:
-        rfe_step: 1
-    selector4:
-      type: sfs
-      model: svm,elasticnet
-      hyperparameters:
-        sfs_min_improvement: 0.02
-    # final_floating_sfs:
-    #   max_feature_fraction: 0.15
-    #   model: elasticnet,svm
-  track_nonlinear:
-    stability_reduction:
-      model: randomforest
-      min_n_features: 25 # max(min_n_features, elbow_n)
-      subsample_fraction: fold_train_log10_const_5
-      n_subsamples: fold_train_log10_ns_500
-    selector1:
-      type: stability
-      model: randomforest
-      hyperparameters:
-        stability_n_subsamples: fold_train_log10_ns_500
-        stability_sample_fraction: fold_train_log10_const_5
-    selector2:
-      type: correlation
-    selector3:
-      type: rfe
-      model: randomforest
-      hyperparameters:
-        rfe_step: 1
-    selector4:
-      type: sfs
-      model: randomforest,knn
-      hyperparameters:
-        sfs_min_improvement: 0.02
-    # final_floating_sfs:
-    #   max_feature_fraction: 0.15
-    #   model: randomforest,knn
+
+  # Permutation importances on the held-out fold; 0 disables.
+  permutation_repeats: 10
+
+  save_final_model: true

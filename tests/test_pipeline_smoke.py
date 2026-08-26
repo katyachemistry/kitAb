@@ -180,8 +180,8 @@ def test_model_export_in_stage_graph_when_automl(repo_root: Path, tmp_path: Path
         },
     )
     m = load_manifest(cfg, repo_root=repo_root)
-    assert m.tuning.enabled is False
-    assert "tuning" in m.stage_graph()
+    assert m.automl.save_final_model is True
+    assert m.stage_graph() == ["automl"]
 
 
 def test_matrix_manifest_modes(repo_root: Path, tmp_path: Path, fixtures_dir: Path):
@@ -210,8 +210,6 @@ def test_matrix_manifest_modes(repo_root: Path, tmp_path: Path, fixtures_dir: Pa
                 "descriptors",
                 "completeness",
                 "automl",
-                "analysis",
-                "tuning",
             ],
         ),
         (
@@ -223,10 +221,10 @@ def test_matrix_manifest_modes(repo_root: Path, tmp_path: Path, fixtures_dir: Pa
                 },
                 "automl": {"enabled": True},
             },
-            ["automl", "analysis", "tuning"],
+            ["automl"],
         ),
         (
-            "full_tuning",
+            "automl_with_tuning_yaml_ignored",
             {
                 "inputs": {
                     "datasets_dir": str(fixtures_dir / "csv"),
@@ -241,8 +239,6 @@ def test_matrix_manifest_modes(repo_root: Path, tmp_path: Path, fixtures_dir: Pa
                 "descriptors",
                 "completeness",
                 "automl",
-                "analysis",
-                "tuning",
             ],
         ),
     ]
