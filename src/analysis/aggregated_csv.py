@@ -10,8 +10,13 @@ COL_TRACK = "Track"
 COL_DATASET = "Dataset_stem"
 COL_SOURCE = "Developability_source"
 COL_SPEAR = "Spearman"
+COL_SPEAR_POOLED = "Spearman_pooled_oof"
 COL_PEAR = "Pearson"
+COL_PEAR_POOLED = "Pearson_pooled_oof"
 COL_R2 = "R2"
+COL_R2_POOLED = "R2_pooled_oof"
+COL_N_OOF = "n_oof"
+COL_N_FOLDS_PRESENT = "n_folds_present"
 COL_FEATURES = "selected_features_by_fold"
 
 ANALYSIS_RESULTS_DIRNAME = "analysis_results"
@@ -21,7 +26,7 @@ _FOLD_SPEAR_RE = re.compile(r"^fold_(\d+)_spearman$")
 
 def is_our_source(source: str) -> bool:
     s = str(source)
-    if s.startswith("descriptors_"):
+    if s.startswith("descriptors_") or "__descriptors_" in s:
         return True
     return "_results" in s or "_our_" in s or "_our__" in s or s.endswith("_our")
 

@@ -22,7 +22,12 @@ from automl.dataset_validation import (
     require_no_nans_in_dataframe,
     validate_experimental_dataset,
 )
-from automl.feature_selectors import cv_shuffled_fold_ilocs, cv_split_col_ilocs
+from automl.feature_selectors import (
+    _sorted_split_labels,
+    cv_shuffled_fold_ilocs,
+    cv_split_col_ilocs,
+)
+from utils.assign_sequence_folds import BALANCE_RATIO
 from automl.pipeline_defaults import DEFAULT_FEATURES_FRAC, DEFAULT_RANDOM_STATE
 from analysis.features import normalize_feature_name
 from utils.load_results_to_dataframe import load_json_results
@@ -736,6 +741,7 @@ def write_folds_for_target(
     dataset_stem: str,
     max_target_nan_frac: float = 0.7,
     split_col: str | None = None,
+    allow_unbalanced_splits: bool = False,
 ) -> tuple[Path, list[str]]:
     name_col = str(name_col)
     user_target_col = str(user_target_col)
@@ -743,6 +749,11 @@ def write_folds_for_target(
     m = drop_invalid_target_rows(
         merged, user_target_col, max_nan_frac=max_target_nan_frac
     )
+    labels_before: list | None = None
+    if split_col:
+        sc0 = str(split_col)
+        if sc0 in merged.columns:
+            labels_before = _sorted_split_labels(merged[sc0])
     other_targets = {str(t) for t in all_target_cols if str(t) != user_target_col}
     require_no_nans_except_columns(
         m,
@@ -780,10 +791,45 @@ def write_folds_for_target(
         segment_sizes, fold_ilocs = cv_split_col_ilocs(split_series)
         split_scheme = "column"
         meta_n_splits = len(fold_ilocs)
+        labels_after = _sorted_split_labels(split_series)
+        if labels_before is not None:
+            vanished = [x for x in labels_before if x not in set(labels_after)]
+            if vanished:
+                raise ValueError(
+                    f"target {user_target_col!r}: fold label(s) {vanished!r} vanished after "
+                    f"NaN drop (had {labels_before}, now {labels_after})."
+                )
+        if segment_sizes and min(segment_sizes) <= 1:
+            raise ValueError(
+                f"target {user_target_col!r}: test fold size {min(segment_sizes)} <= 1 "
+                f"(sizes={segment_sizes})."
+            )
+        if segment_sizes and min(segment_sizes) > 0:
+            ratio = max(segment_sizes) / min(segment_sizes)
+            if ratio > float(BALANCE_RATIO) and not allow_unbalanced_splits:
+                raise ValueError(
+                    f"target {user_target_col!r}: post-NaN-drop fold imbalance "
+                    f"{ratio:.2f} > {BALANCE_RATIO} (sizes={segment_sizes})."
+                )
+        print(
+            f"[prepare_run] {dataset_stem} target={user_target_col!r}: "
+            f"column-split fold sizes (test)={segment_sizes}",
+            file=sys.stderr,
+        )
     else:
         segment_sizes, fold_ilocs = cv_shuffled_fold_ilocs(N, n_splits, random_state)
         split_scheme = "shuffled"
         meta_n_splits = int(n_splits)
+        if segment_sizes and min(segment_sizes) <= 1:
+            raise ValueError(
+                f"target {user_target_col!r}: shuffled test fold size {min(segment_sizes)} <= 1 "
+                f"(sizes={segment_sizes})."
+            )
+        print(
+            f"[prepare_run] {dataset_stem} target={user_target_col!r}: "
+            f"shuffled fold sizes (test)={segment_sizes}",
+            file=sys.stderr,
+        )
 
     target_dir = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(pipe_target)).strip("_") or "target"
     fold_root = Path(output_dir) / target_dir
@@ -965,6 +1011,15 @@ def main() -> None:
             "Omit for shuffled contiguous blocks (default)."
         ),
     )
+    parser.add_argument(
+        "--allow-unbalanced-splits",
+        action="store_true",
+        help=(
+            "Do not reject predefined --split-col folds whose sizes differ by more "
+            "than the usual 2:1 ratio. Used when replaying published CSV folds "
+            "(nested CV / TAP restore), including Garbinski 33/21/18/14."
+        ),
+    )
     args = parser.parse_args()
     if not (0.0 < float(args.max_target_nan_frac) <= 1.0):
         print("--max-target-nan-frac must be in (0, 1].", file=sys.stderr)
@@ -1043,6 +1098,7 @@ def main() -> None:
                 dataset_stem=dataset_stem,
                 max_target_nan_frac=float(args.max_target_nan_frac),
                 split_col=split_col,
+                allow_unbalanced_splits=bool(args.allow_unbalanced_splits),
             )
         except ValueError as e:
             print(f"Target {user_target!r}: {e}", file=sys.stderr)

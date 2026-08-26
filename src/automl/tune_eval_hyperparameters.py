@@ -27,6 +27,7 @@ from analysis.aggregated_csv import (
     COL_RUN_ID,
     COL_SOURCE,
     COL_SPEAR,
+    COL_SPEAR_POOLED,
     COL_TARGET,
     COL_TRACK,
     eval_model_slug,
@@ -675,7 +676,11 @@ def run_tuning(
 
         shortlisted = select_close_top_models(
             pool,
-            metric_col=COL_SPEAR,
+            metric_col=(
+                COL_SPEAR_POOLED
+                if any(parse_metric_cell(r.get(COL_SPEAR_POOLED, "")) is not None for r in pool)
+                else COL_SPEAR
+            ),
             max_rank=max_rank,
             margin=margin,
         )
@@ -774,6 +779,8 @@ def run_tuning(
             "eval_model": em,
             "target_col": tgt,
             "feature_cols": used_cols,
+            "selected_features_by_fold": feats_by_fold,
+            "feature_set_rule": "union_of_fold_selections_then_features_frac_cap",
             "features_frac": win_frac,
             "hyperparameters": best_hp_raw,
             "winning_run_id": run_id,
@@ -783,6 +790,10 @@ def run_tuning(
             "developability_source": src,
             "cv_spearman_mean": _json_float(best_spear),
             "cv_pearson_mean": _json_float(best_pear),
+            "cv_metric_note": (
+                "cv_spearman_mean is the same-fold AutoML/tuning CV estimate "
+                "(not an independent nested-CV holdout)."
+            ),
             "training_row_count": int(n_train),
             "n_features": len(used_cols),
             "tuned": bool(grid_search),

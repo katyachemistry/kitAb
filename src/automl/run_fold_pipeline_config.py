@@ -158,11 +158,30 @@ def _top_k_column_indices_for_eval(
         fit_regressor(probe, X_tr, y_tr)
         scores = _ranking_scores_from_fitted_model(probe)
     if scores is None or scores.shape[0] != n_cols:
-        return np.arange(min(k_max, n_cols), dtype=int)
+        raise ValueError(
+            f"eval ranking scores unavailable for probe {probe_type!r} "
+            f"(n_cols={n_cols}); refusing column-order fallback"
+        )
 
     order = np.argsort(-scores)
     picked = order[:k_max]
     return np.sort(picked)
+
+
+_OOF_NAME_COL = "name"
+_SKIP_EVAL_MODELS = frozenset({"gpr"})
+
+# RandomForestRegressor.predict sums per-tree predictions across threads in a
+# nondeterministic order, so repeated runs differ by ~1e-15. That is enough to
+# swap near-tied predictions and move the fold Spearman by up to ~0.1 on small
+# test folds, so the eval fit is pinned to one thread.
+_EVAL_FIT_N_JOBS: dict[str, int] = {"randomforest": 1}
+
+
+def _test_row_names(test_df: pd.DataFrame, n_test: int) -> list[str]:
+    if _OOF_NAME_COL in test_df.columns:
+        return [str(x) for x in test_df[_OOF_NAME_COL].tolist()]
+    return [str(i) for i in range(n_test)]
 
 
 def _evaluate_fold_models(
@@ -175,17 +194,22 @@ def _evaluate_fold_models(
     random_state: int,
     features_frac: float,
     eval_hp_by_model: dict[str, dict] | None = None,
-) -> dict[str, dict]:
+    n_jobs: int = -1,
+) -> tuple[dict[str, dict], pd.DataFrame]:
     tcol = str(target_col)
+    models = [m for m in eval_models if str(m).strip().lower() not in _SKIP_EVAL_MODELS]
     cols = [c for c in feature_cols if c in train_df.columns and c in test_df.columns]
     if len(cols) == 0:
-        return {
-            m: {
-                "error": "no_selected_features_present_in_train_and_test",
-                "n_features": 0,
-            }
-            for m in eval_models
-        }
+        return (
+            {
+                m: {
+                    "error": "no_selected_features_present_in_train_and_test",
+                    "n_features": 0,
+                }
+                for m in models
+            },
+            pd.DataFrame(columns=["name", "y", "yhat", "eval_model"]),
+        )
 
     y_tr = train_df[tcol].to_numpy(dtype=np.float64, copy=True)
     y_te = test_df[tcol].to_numpy(dtype=np.float64, copy=True)
@@ -196,10 +220,12 @@ def _evaluate_fold_models(
     n_test = int(len(y_te))
     n_feat = len(cols)
     k_cap = min(n_feat, max(1, int(features_frac * n_train)))
+    names = _test_row_names(test_df, n_test)
     out: dict[str, dict] = {}
     ev_hp = eval_hp_by_model or {}
+    oof_rows: list[dict] = []
 
-    for m in eval_models:
+    for m in models:
         try:
             idx = _top_k_column_indices_for_eval(
                 m,
@@ -216,13 +242,13 @@ def _evaluate_fold_models(
 
             mkw: dict = {
                 "random_state": random_state,
-                "n_jobs": -1,
+                "n_jobs": _EVAL_FIT_N_JOBS.get(m, n_jobs),
                 "n_samples_fit": n_train,
             }
             mkw.update(ev_hp.get(m, {}))
             model = make_regressor(m, **mkw)
             fit_regressor(model, X_tr_u, y_tr)
-            y_pred = model.predict(X_te_u)
+            y_pred = np.asarray(model.predict(X_te_u), dtype=np.float64).ravel()
             r2 = r2_score(y_te, y_pred)
             mse = mean_squared_error(y_te, y_pred)
             rho_f, rho_p = _spearman_stat_p(y_te, y_pred)
@@ -245,6 +271,15 @@ def _evaluate_fold_models(
                 if m == "knn":
                     entry["knn_ranking_probe"] = "elasticnet"
             out[m] = entry
+            for nm, yt, yh in zip(names, y_te.tolist(), y_pred.tolist()):
+                oof_rows.append(
+                    {
+                        "name": str(nm),
+                        "y": float(yt),
+                        "yhat": float(yh),
+                        "eval_model": str(m),
+                    }
+                )
         except Exception as e:
             out[m] = {
                 "error": str(e),
@@ -253,7 +288,23 @@ def _evaluate_fold_models(
                 "n_features_after_selection": n_feat,
                 "n_features_allowed_by_frac": k_cap,
             }
-    return out
+    oof_df = pd.DataFrame(oof_rows, columns=["name", "y", "yhat", "eval_model"])
+    return out, oof_df
+
+
+def oof_sidecar_path(result_json: Path) -> Path:
+    p = Path(result_json)
+    return p.with_name(p.stem + ".oof.parquet")
+
+
+def write_oof_parquet(path: Path, oof_df: pd.DataFrame, extra: dict | None = None) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df = oof_df.copy()
+    if extra:
+        for k, v in extra.items():
+            df[k] = v
+    df.to_parquet(path, index=False)
 
 
 def main() -> None:
@@ -510,6 +561,13 @@ def main() -> None:
 
     n_train = len(train_df)
     selection_max_features = max(1, int(features_frac * n_train))
+    if not args.quiet:
+        print(
+            f"[fold] {fold_dir.name} fold={k} n_train={n_train} "
+            f"features_frac={features_frac} effective_cap={selection_max_features} "
+            f"n_candidates={len(candidate_features)}",
+            file=sys.stderr,
+        )
 
     hp_json = str(args.selector_hyperparameters).strip()
     if not hp_json or hp_json.lower() in ("none",):
@@ -565,8 +623,9 @@ def main() -> None:
         sys.exit(1)
 
     evaluation: dict[str, dict] | None = None
+    oof_df = pd.DataFrame(columns=["name", "y", "yhat", "eval_model"])
     if eval_models is not None:
-        evaluation = _evaluate_fold_models(
+        evaluation, oof_df = _evaluate_fold_models(
             train_df_k,
             test_df_k,
             target_col=target_col,
@@ -621,6 +680,23 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
         json.dump(out_payload, f, indent=2)
+
+    if eval_models is not None and len(oof_df) > 0:
+        write_oof_parquet(
+            oof_sidecar_path(out_path),
+            oof_df,
+            extra={
+                "fold_index": k,
+                "dataset_yaml_key": str(args.dataset_yaml_key or ""),
+                "dataset_stem": str(args.dataset_stem or ""),
+                "target_col": target_col,
+                "selector_name": str(args.selector_name),
+                "model_type": str(result.get("model_type", args.model_to_use)),
+                "eval_features_frac": float(features_frac),
+                "pipeline_track_name": pipeline_track,
+                "source_json": str(out_path),
+            },
+        )
 
     print(f"Wrote {out_path}")
 

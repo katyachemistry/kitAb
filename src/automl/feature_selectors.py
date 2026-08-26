@@ -899,6 +899,8 @@ def sequential_forward_selector(
             improvement = best_score - prev_best_score
             if improvement < min_imp_eff:
                 break
+        elif not np.isfinite(best_score):
+            break
 
         prev_best_score = best_score
         selected.append(best_feat)
@@ -1531,6 +1533,7 @@ def run_feature_selection_on_one_fold(
         mn_cr = int(correlation_reduction_min_n_features)
         if mn_cr < 1:
             raise ValueError("correlation_reduction_min_n_features must be >= 1")
+        mn_cr = min(mn_cr, max(1, len(train_df_k)), max(1, len(current_features)))
         n_pref_cr = len(current_features)
         if n_pref_cr <= 1:
             correlation_reduction_summary = {
@@ -1783,6 +1786,7 @@ def run_feature_selection_on_one_fold(
                             raise ValueError(
                                 "stability_reduction_min_n_features must be >= 1"
                             )
+                        mn_i = min(mn_i, max(1, len(train_df_k)), max(1, n_pref))
                         k_keep = max(mn_i, elbow_n)
                     else:
                         mn_i = None
@@ -1899,6 +1903,7 @@ def run_feature_selection_on_one_fold(
             except ValueError as e:
                 if verbose:
                     print(f"Stability selection cannot be run for target={tcol!r}: {e}")
+                after_step["stability_error"] = str(e)
 
             after_step["stability"] = list(current_features)
 
@@ -2032,6 +2037,7 @@ def run_feature_selection_on_one_fold(
             except Exception as e:
                 if verbose:
                     print(f"SFS cannot be run for target={tcol!r}: {e}")
+                after_step["sfs_error"] = str(e)
             after_step["sfs"] = list(current_features)
 
         elif step == "rfe":
@@ -2085,6 +2091,7 @@ def run_feature_selection_on_one_fold(
             except Exception as e:
                 if verbose:
                     print(f"RFE cannot be run for target={tcol!r}: {e}")
+                after_step["rfe_error"] = str(e)
             after_step["rfe"] = list(current_features)
 
     prefilter_list = list(prefilter_k) if not isinstance(prefilter_k, list) else list(prefilter_k)

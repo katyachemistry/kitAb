@@ -301,6 +301,63 @@ def build_random_baseline_rows(
     return rows
 
 
+def selection_matched_from_oof(
+    oof_root: Path,
+    *,
+    seed: int,
+) -> list[dict[str, Any]]:
+    """Max-over-configurations null: shuffle y vs ŷ within each config's pooled OOF."""
+    from analysis.oof_predictions import config_key_from_row, pooled_metrics_from_oof
+
+    grouped: dict[tuple, list[pd.DataFrame]] = defaultdict(list)
+    for p in Path(oof_root).rglob("*.oof.parquet"):
+        try:
+            df = pd.read_parquet(p)
+        except Exception:
+            continue
+        if df is None or len(df) == 0 or "eval_model" not in df.columns:
+            continue
+        for _, sub in df.groupby("eval_model", sort=False):
+            grouped[config_key_from_row(sub.iloc[0])].append(sub)
+
+    by_dst: dict[tuple[str, str], list[float]] = defaultdict(list)
+    meta: dict[tuple[str, str], tuple[str, str]] = {}
+    rng = np.random.default_rng(int(seed))
+    for key, parts in grouped.items():
+        cat = pd.concat(parts, ignore_index=True)
+        if len(cat) < 2:
+            continue
+        y = cat["y"].to_numpy(dtype=np.float64, copy=True)
+        yhat = cat["yhat"].to_numpy(dtype=np.float64, copy=True)
+        rng.shuffle(y)
+        shuf = pd.DataFrame({"y": y, "yhat": yhat})
+        sp = pooled_metrics_from_oof(shuf)["Spearman_pooled_oof"]
+        if sp is None:
+            continue
+        stem = str(cat["dataset_stem"].iloc[0]) if "dataset_stem" in cat.columns else key[0]
+        tgt = str(key[2])
+        dst = (stem, tgt)
+        by_dst[dst].append(float(sp))
+        meta[dst] = (stem, str(cat["dataset_yaml_key"].iloc[0]) if "dataset_yaml_key" in cat.columns else key[0])
+
+    rows: list[dict[str, Any]] = []
+    for stem, tgt in sorted(by_dst):
+        vals = by_dst[(stem, tgt)]
+        rows.append(
+            {
+                "Dataset_stem": stem,
+                "Variant": meta[(stem, tgt)][1],
+                "Target_col": tgt,
+                "Spearman": max(vals) if vals else None,
+                "Jaccard_norm": None,
+                "best_Target-Selector-Model": f"{tgt}-random_baseline-selection_matched",
+                "best_selector_model_frac": "random_baseline-selection_matched-frac000",
+                "feature_usage": json.dumps({"n_configs": len(vals)}),
+            }
+        )
+    return rows
+
+
 def write_results_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     fieldnames = [
         "Dataset_stem",
@@ -333,7 +390,7 @@ def main() -> None:
     parser.add_argument(
         "--batch-root",
         type=Path,
-        required=True,
+        default=None,
         help="AutoML batch root containing batch_manifest.json and parallel_jobs_master.tsv.",
     )
     parser.add_argument(
@@ -344,14 +401,32 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--repo-root", type=Path, default=_REPO_ROOT)
+    parser.add_argument(
+        "--oof-dir",
+        type=Path,
+        default=None,
+        help="Directory of *.oof.parquet files for a selection-matched max-over-config null.",
+    )
+    parser.add_argument(
+        "--selection-matched",
+        action="store_true",
+        help="Take the max shuffled Spearman over configurations (requires --oof-dir).",
+    )
     args = parser.parse_args()
 
-    batch_root = _resolve_existing_path(args.batch_root, args.repo_root)
-    rows = build_random_baseline_rows(
-        batch_root,
-        repo_root=args.repo_root.resolve(),
-        seed=int(args.seed),
-    )
+    if args.selection_matched:
+        if args.oof_dir is None:
+            raise SystemExit("--selection-matched requires --oof-dir")
+        rows = selection_matched_from_oof(Path(args.oof_dir), seed=int(args.seed))
+    else:
+        if args.batch_root is None:
+            raise SystemExit("--batch-root is required unless --selection-matched is set")
+        batch_root = _resolve_existing_path(args.batch_root, args.repo_root)
+        rows = build_random_baseline_rows(
+            batch_root,
+            repo_root=args.repo_root.resolve(),
+            seed=int(args.seed),
+        )
     write_results_csv(args.out, rows)
     print(f"Wrote {len(rows)} random baseline rows to {args.out}")
 

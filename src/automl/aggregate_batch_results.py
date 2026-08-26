@@ -19,6 +19,7 @@ if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
 from automl.pipeline_defaults import DEFAULT_FEATURES_FRAC
+from automl.run_fold_pipeline_config import oof_sidecar_path
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -39,6 +40,11 @@ AGG_BASE_CSV_COLS: tuple[str, ...] = (
     "Spearman",
     "Pearson",
     "R2",
+    "Spearman_pooled_oof",
+    "Pearson_pooled_oof",
+    "R2_pooled_oof",
+    "n_oof",
+    "n_folds_present",
     "Prediction_std_mean",
     "Spearman_relative_error_across_folds",
     "Pearson_relative_error_across_folds",
@@ -598,6 +604,43 @@ def _remap_json_paths_batch_root(
     return out
 
 
+def _ingest_oof_frame(
+    acc: dict,
+    df: pd.DataFrame,
+    *,
+    ds_key: str,
+    track: str,
+    target: str,
+    sel: str,
+    mod: str,
+    eval_frac: float,
+    fold_index: int | None,
+) -> None:
+    if df is None or len(df) == 0 or "eval_model" not in df.columns:
+        return
+    for em, sub in df.groupby("eval_model", sort=False):
+        if str(em).strip().lower() == "gpr":
+            continue
+        key = (ds_key, track, target, sel, mod, str(em), float(eval_frac))
+        acc[key]["oof_y"].extend(pd.to_numeric(sub["y"], errors="coerce").tolist())
+        acc[key]["oof_yhat"].extend(pd.to_numeric(sub["yhat"], errors="coerce").tolist())
+        if fold_index is not None:
+            acc[key]["oof_folds"].add(int(fold_index))
+        elif "fold_index" in sub.columns:
+            acc[key]["oof_folds"].update(
+                int(x) for x in sub["fold_index"].dropna().unique().tolist()
+            )
+
+
+def _pooled_from_acc_lists(y_list: list, yhat_list: list, n_folds: int) -> dict:
+    from analysis.oof_predictions import pooled_metrics_from_oof
+
+    df = pd.DataFrame({"y": y_list, "yhat": yhat_list})
+    out = pooled_metrics_from_oof(df)
+    out["n_folds_present"] = int(n_folds)
+    return out
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         description="Aggregate batch fold JSONs into one CSV per YAML dataset block.",
@@ -647,6 +690,16 @@ def main() -> None:
         help=(
             "Only aggregate JSONs under this dataset's subdirectory of the batch root "
             "(same slug as prepare_parallel_from_config). Omit for the full batch."
+        ),
+    )
+    p.add_argument(
+        "--oof-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional directory of retro *.oof.parquet files. When set, pooled OOF "
+            "Spearman/Pearson/R2 are computed from these; otherwise sidecars next "
+            "to each result JSON are used if present."
         ),
     )
     args = p.parse_args()
@@ -760,6 +813,9 @@ def main() -> None:
             "fold_metrics": {},  # fold_key -> spearman, pearson, r2, prediction_std_mean (float|None)
             "features_by_fold": {},
             "pipeline_times_by_fold": {},  # fold_key -> pipeline_time_seconds (float)
+            "oof_y": [],
+            "oof_yhat": [],
+            "oof_folds": set(),
         }
     )
 
@@ -821,7 +877,7 @@ def main() -> None:
             dataset_target_pipeline_s[(ds_key, target)] += pt_val
 
         for eval_model in eval_models:
-            if eval_model == "none":
+            if eval_model == "none" or str(eval_model).strip().lower() == "gpr":
                 continue
             ev = evaluation if isinstance(evaluation, dict) else {}
             sp, pe, r2, ps = _fold_eval_one_model(ev, eval_model)
@@ -839,6 +895,57 @@ def main() -> None:
 
             if pt_val is not None:
                 acc[key]["pipeline_times_by_fold"][fk] = pt_val
+
+        sidecar = oof_sidecar_path(jp)
+        if sidecar.is_file():
+            try:
+                oof_df = pd.read_parquet(sidecar)
+            except Exception:
+                oof_df = None
+            if oof_df is not None and len(oof_df):
+                _ingest_oof_frame(
+                    acc,
+                    oof_df,
+                    ds_key=ds_key,
+                    track=track,
+                    target=target,
+                    sel=sel,
+                    mod=mod,
+                    eval_frac=eval_frac,
+                    fold_index=data.get("fold_index"),
+                )
+
+    oof_dir = getattr(args, "oof_dir", None)
+    if oof_dir is not None:
+        oof_root = Path(oof_dir)
+        if oof_root.is_dir():
+            for pq in oof_root.rglob("*.oof.parquet"):
+                try:
+                    oof_df = pd.read_parquet(pq)
+                except Exception:
+                    continue
+                if oof_df is None or len(oof_df) == 0:
+                    continue
+                ds_k = str(oof_df["dataset_yaml_key"].iloc[0]) if "dataset_yaml_key" in oof_df.columns else "unknown"
+                tr_k = str(oof_df["pipeline_track_name"].iloc[0]) if "pipeline_track_name" in oof_df.columns else ""
+                tgt_k = str(oof_df["target_col"].iloc[0]) if "target_col" in oof_df.columns else "unknown"
+                sel_k = str(oof_df["selector_name"].iloc[0]) if "selector_name" in oof_df.columns else "unknown"
+                mod_k = str(oof_df["model_type"].iloc[0]) if "model_type" in oof_df.columns else "unknown"
+                try:
+                    frac_k = float(oof_df["eval_features_frac"].iloc[0])
+                except (TypeError, ValueError, KeyError, IndexError):
+                    frac_k = float(DEFAULT_FEATURES_FRAC)
+                _ingest_oof_frame(
+                    acc,
+                    oof_df,
+                    ds_key=ds_k,
+                    track=tr_k,
+                    target=tgt_k,
+                    sel=sel_k,
+                    mod=mod_k,
+                    eval_frac=frac_k,
+                    fold_index=None,
+                )
 
     by_ds: dict[str, list[dict]] = defaultdict(list)
     fold_keys_by_ds: dict[str, set[str]] = defaultdict(set)
@@ -867,6 +974,11 @@ def main() -> None:
         pt_std: float | None = (
             float(np.std(pt_fold_vals, ddof=1)) if len(pt_fold_vals) >= 2 else None
         )
+        pooled = _pooled_from_acc_lists(
+            bucket.get("oof_y") or [],
+            bucket.get("oof_yhat") or [],
+            len(bucket.get("oof_folds") or set()),
+        )
         by_ds[ds_key].append(
             {
                 "Track": track,
@@ -877,6 +989,11 @@ def main() -> None:
                 "Spearman": sp_mean,
                 "Pearson": pe_mean,
                 "R2": r2_mean,
+                "Spearman_pooled_oof": pooled["Spearman_pooled_oof"],
+                "Pearson_pooled_oof": pooled["Pearson_pooled_oof"],
+                "R2_pooled_oof": pooled["R2_pooled_oof"],
+                "n_oof": pooled["n_oof"],
+                "n_folds_present": pooled["n_folds_present"],
                 "Prediction_std_mean": _nanmean(sd_list),
                 "Spearman_relative_error_across_folds": (
                     _relative_error_across_folds(sp_list) if sp_mean is not None else None

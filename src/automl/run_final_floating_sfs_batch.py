@@ -314,7 +314,7 @@ def _run_one_final_floating_sfs(
         payload["final_floating_sfs_summary"]["n_selected_features"] = len(selected_features)
 
         if eval_models is not None:
-            payload["evaluation"] = _evaluate_fold_models(
+            evaluation, _oof = _evaluate_fold_models(
                 train_scaled,
                 test_scaled,
                 target_col=str(target_col),
@@ -324,6 +324,7 @@ def _run_one_final_floating_sfs(
                 features_frac=max_feature_fraction,
                 eval_hp_by_model=eval_hp_by_model,
             )
+            payload["evaluation"] = evaluation
     except Exception as e:
         payload["final_floating_sfs_summary"]["error"] = str(e)
         if eval_models is not None:

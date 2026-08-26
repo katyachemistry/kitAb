@@ -17,16 +17,25 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, Iterable, Mapping, Sequence
 
+_SRC_DIR = Path(__file__).resolve().parents[1]
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
 import numpy as np
 
 from analysis.aggregated_csv import (
     COL_DATASET,
     COL_FEATURES,
+    COL_N_FOLDS_PRESENT as AGG_COL_N_FOLDS_PRESENT,
+    COL_N_OOF as AGG_COL_N_OOF,
     COL_PEAR as AGG_COL_PEAR,
+    COL_PEAR_POOLED as AGG_COL_PEAR_POOLED,
     COL_R2 as AGG_COL_R2,
+    COL_R2_POOLED as AGG_COL_R2_POOLED,
     COL_RUN_ID,
     COL_SOURCE,
     COL_SPEAR as AGG_COL_SPEAR,
+    COL_SPEAR_POOLED as AGG_COL_SPEAR_POOLED,
     COL_TARGET,
     COL_TRACK,
     eval_model_slug as _eval_model_slug,
@@ -284,12 +293,15 @@ GROUP_KEYS = (COL_DATASET, COL_SOURCE, COL_TARGET, COL_TRACK)
 
 COL_VARIANT = "Variant"
 COL_RESULT_SPEARMAN = "Spearman"
+COL_RESULT_SPEARMAN_STD = "Spearman_std"
 COL_RESULT_PEARSON = "Pearson"
 COL_RESULT_R2 = "R2"
 COL_RESULT_JACCARD_NORM = "Jaccard_norm"
 COL_RESULT_BEST_RUN = "best_Target-Selector-Model"
 COL_RESULT_BEST_FRAC = "best_selector_model_frac"
 COL_RESULT_FEATURE_USAGE = "feature_usage"
+COL_RESULT_N_OOF = AGG_COL_N_OOF
+COL_RESULT_N_FOLDS_PRESENT = AGG_COL_N_FOLDS_PRESENT
 
 _AGGREGATED_FNAME = re.compile(r"^aggregated_(.+)\.csv$", re.IGNORECASE)
 _RANDOM_SEED_SUFFIX = re.compile(r"__rs\d+$")
@@ -440,13 +452,89 @@ def _group_key_best_across_tracks(row: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
+def _pooled_or_mean(
+    row: dict[str, Any], pooled_col: str, mean_col: str
+) -> float | None:
+    v = _parse_float(row.get(pooled_col, ""))
+    if v is not None:
+        return v
+    return _parse_float(row.get(mean_col, ""))
+
+
+def _spearman_rank_value(row: dict[str, Any]) -> float | None:
+    return _pooled_or_mean(row, AGG_COL_SPEAR_POOLED, AGG_COL_SPEAR)
+
+
+def _pearson_report_value(row: dict[str, Any]) -> float | None:
+    return _pooled_or_mean(row, AGG_COL_PEAR_POOLED, AGG_COL_PEAR)
+
+
+def _r2_report_value(row: dict[str, Any]) -> float | None:
+    return _pooled_or_mean(row, AGG_COL_R2_POOLED, AGG_COL_R2)
+
+
+def _parse_int(value: Any) -> int | None:
+    v = _parse_float(value)
+    return None if v is None else int(v)
+
+
+def _expected_folds_by_dataset_target(
+    rows: list[dict[str, Any]],
+) -> dict[tuple[str, str], int]:
+    out: dict[tuple[str, str], int] = {}
+    for r in rows:
+        n = _parse_int(r.get(AGG_COL_N_FOLDS_PRESENT, ""))
+        if n is None or n <= 0:
+            continue
+        key = (str(r.get(COL_DATASET, "")), str(r.get(COL_TARGET, "")))
+        if n > out.get(key, 0):
+            out[key] = n
+    return out
+
+
+def _rows_with_complete_folds(
+    group_rows: list[dict[str, Any]],
+    expected: dict[tuple[str, str], int],
+) -> tuple[list[dict[str, Any]], int]:
+    """Pooled OOF rho is only comparable between runs covering the same folds.
+
+    A run that crashed on some folds pools fewer samples, which neither penalises
+    nor caps its rho, so it can outrank runs that completed every fold.
+    """
+    if not expected:
+        return group_rows, 0
+    keep: list[dict[str, Any]] = []
+    dropped = 0
+    for r in group_rows:
+        exp = expected.get(
+            (str(r.get(COL_DATASET, "")), str(r.get(COL_TARGET, "")))
+        )
+        n = _parse_int(r.get(AGG_COL_N_FOLDS_PRESENT, ""))
+        if exp is None or n is None or n >= exp:
+            keep.append(r)
+        else:
+            dropped += 1
+    if not keep:
+        return group_rows, 0
+    return keep, dropped
+
+
 def _best_in_group(
     group_rows: list[dict[str, Any]], metric: str
 ) -> dict[str, Any] | None:
     best: dict[str, Any] | None = None
     best_val: float | None = None
+    pooled_getters = {
+        AGG_COL_SPEAR: _spearman_rank_value,
+        AGG_COL_SPEAR_POOLED: _spearman_rank_value,
+        AGG_COL_PEAR: _pearson_report_value,
+        AGG_COL_PEAR_POOLED: _pearson_report_value,
+        AGG_COL_R2: _r2_report_value,
+        AGG_COL_R2_POOLED: _r2_report_value,
+    }
+    getter = pooled_getters.get(metric, lambda r: _parse_float(r.get(metric, "")))
     for r in group_rows:
-        v = _parse_float(r.get(metric, ""))
+        v = getter(r)
         if v is None:
             continue
         if best_val is None or v > best_val:
@@ -490,7 +578,7 @@ def _spearman_stability_rank_key(
     mode: str,
     stability_weight: float,
 ) -> tuple[Any, ...] | None:
-    spe = _parse_float(r.get(AGG_COL_SPEAR, ""))
+    spe = _spearman_rank_value(r)
     if spe is None:
         return None
     cell = str(r.get(COL_FEATURES, "") or "")
@@ -565,8 +653,10 @@ def build_summary(
             continue
         by_g[gkey(r)].append(r)
 
+    expected_folds = _expected_folds_by_dataset_target(rows)
     out: list[dict[str, Any]] = []
     filter_fallback_groups = 0
+    incomplete_rows_dropped = 0
     for key in sorted(by_g.keys()):
         g = by_g[key]
         if not g:
@@ -584,6 +674,9 @@ def build_summary(
         )
         if fb_s or fb_p:
             filter_fallback_groups += 1
+        g_spear, n_dropped = _rows_with_complete_folds(g_spear, expected_folds)
+        incomplete_rows_dropped += n_dropped
+        g_pear, _ = _rows_with_complete_folds(g_pear, expected_folds)
         univ = _universe_for_source(
             src,
             universe_single=universe_single,
@@ -608,7 +701,7 @@ def build_summary(
             COL_TRACK: trk_out,
         }
         if rs:
-            spe = _parse_float(rs[AGG_COL_SPEAR])
+            spe = _spearman_rank_value(rs)
             row["best_spearman"] = spe
             row["best_spearman_Target-Selector-Model"] = rs[COL_RUN_ID]
             row["best_spearman_selector_model_frac"] = _selector_model_frac(
@@ -632,10 +725,14 @@ def build_summary(
                 row[COL_STAB_EXPECTED] = me
                 row[COL_STAB_NORM] = mn
             row["Pipeline_time_sum_s"] = _pipeline_time_s_from_aggregate_row(rs)
-            row["spearman_winner_pearson"] = _parse_float(rs.get(AGG_COL_PEAR, ""))
-            row["spearman_winner_r2"] = _parse_float(rs.get(AGG_COL_R2, ""))
+            row["spearman_winner_pearson"] = _pearson_report_value(rs)
+            row["spearman_winner_r2"] = _r2_report_value(rs)
+            row[AGG_COL_N_OOF] = _parse_int(rs.get(AGG_COL_N_OOF, ""))
+            row[AGG_COL_N_FOLDS_PRESENT] = _parse_int(
+                rs.get(AGG_COL_N_FOLDS_PRESENT, "")
+            )
         if rp:
-            pea = _parse_float(rp[AGG_COL_PEAR])
+            pea = _pearson_report_value(rp)
             row["best_pearson"] = pea
             row["best_pearson_Target-Selector-Model"] = rp[COL_RUN_ID]
             row["best_pearson_selector_model_frac"] = _selector_model_frac(
@@ -645,6 +742,12 @@ def build_summary(
                 rp.get(COL_FEATURES, "")
             )
         out.append(row)
+    if incomplete_rows_dropped:
+        print(
+            f"Note: {incomplete_rows_dropped} run(s) excluded from ranking for "
+            "covering fewer folds than the best run on the same dataset/target.",
+            file=sys.stderr,
+        )
     return out, filter_fallback_groups
 
 
@@ -820,20 +923,14 @@ def build_results_per_target(
     for key in sorted(by_key.keys()):
         ds, variant, tgt = key
         group = by_key[key]
-        spears: list[float] = []
+        scored: list[tuple[float, dict[str, Any]]] = []
         pears: list[float] = []
         r2s: list[float] = []
         jaccs: list[float] = []
-        best_row: dict[str, Any] | None = None
-        best_spear: float | None = None
         for r in group:
             spe = r.get("best_spearman")
             if isinstance(spe, (int, float)):
-                v = float(spe)
-                spears.append(v)
-                if best_spear is None or v > best_spear:
-                    best_spear = v
-                    best_row = r
+                scored.append((float(spe), r))
             pea = r.get("spearman_winner_pearson")
             if isinstance(pea, (int, float)):
                 pears.append(float(pea))
@@ -843,14 +940,33 @@ def build_results_per_target(
             jac = _stab_normalized_from_summary_row(r)
             if jac is not None:
                 jaccs.append(jac)
-        if best_row is None and group:
+        spears = [v for v, _ in scored]
+        best_row: dict[str, Any] | None = None
+        if scored:
+            scored.sort(key=lambda t: t[0])
+            best_row = scored[len(scored) // 2][1]
+        elif group:
             best_row = group[0]
+        n_folds_row = n_folds
+        if best_row is not None:
+            nf_raw = best_row.get("best_spearman_n_folds")
+            if isinstance(nf_raw, (int, float)) and int(nf_raw) > 0:
+                n_folds_row = int(nf_raw)
+            else:
+                nf = _n_folds_from_features_cell(
+                    str(best_row.get("best_spearman_features") or "")
+                )
+                if nf > 0:
+                    n_folds_row = nf
         out.append(
             {
                 COL_DATASET: ds,
                 COL_VARIANT: variant,
                 COL_TARGET: tgt,
                 COL_RESULT_SPEARMAN: statistics.mean(spears) if spears else None,
+                COL_RESULT_SPEARMAN_STD: (
+                    statistics.stdev(spears) if len(spears) >= 2 else None
+                ),
                 COL_RESULT_PEARSON: statistics.mean(pears) if pears else None,
                 COL_RESULT_R2: statistics.mean(r2s) if r2s else None,
                 COL_RESULT_JACCARD_NORM: statistics.mean(jaccs) if jaccs else None,
@@ -864,7 +980,13 @@ def build_results_per_target(
                 else "",
                 COL_RESULT_FEATURE_USAGE: _aggregate_feature_usage_from_summary_rows(
                     group,
-                    n_folds_default=n_folds,
+                    n_folds_default=n_folds_row,
+                ),
+                COL_RESULT_N_OOF: (
+                    best_row.get(AGG_COL_N_OOF) if best_row else None
+                ),
+                COL_RESULT_N_FOLDS_PRESENT: (
+                    best_row.get(AGG_COL_N_FOLDS_PRESENT) if best_row else None
                 ),
             }
         )
@@ -883,18 +1005,30 @@ def _fmt_float_cell(v: float | None) -> str:
     return f"{float(v):.17g}"
 
 
+def _fmt_int_cell(v: Any) -> str:
+    if v is None or isinstance(v, bool):
+        return ""
+    try:
+        return str(int(v))
+    except (TypeError, ValueError):
+        return ""
+
+
 def write_results_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     fieldnames = [
         COL_DATASET,
         COL_VARIANT,
         COL_TARGET,
         COL_RESULT_SPEARMAN,
+        COL_RESULT_SPEARMAN_STD,
         COL_RESULT_PEARSON,
         COL_RESULT_R2,
         COL_RESULT_JACCARD_NORM,
         COL_RESULT_BEST_RUN,
         COL_RESULT_BEST_FRAC,
         COL_RESULT_FEATURE_USAGE,
+        COL_RESULT_N_OOF,
+        COL_RESULT_N_FOLDS_PRESENT,
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -909,6 +1043,9 @@ def write_results_csv(path: Path, rows: list[dict[str, Any]]) -> None:
                     COL_RESULT_SPEARMAN: _fmt_spearman_cell(
                         r.get(COL_RESULT_SPEARMAN)  # type: ignore[arg-type]
                     ),
+                    COL_RESULT_SPEARMAN_STD: _fmt_float_cell(
+                        r.get(COL_RESULT_SPEARMAN_STD)  # type: ignore[arg-type]
+                    ),
                     COL_RESULT_PEARSON: _fmt_spearman_cell(
                         r.get(COL_RESULT_PEARSON)  # type: ignore[arg-type]
                     ),
@@ -921,6 +1058,10 @@ def write_results_csv(path: Path, rows: list[dict[str, Any]]) -> None:
                     COL_RESULT_BEST_RUN: r.get(COL_RESULT_BEST_RUN, ""),
                     COL_RESULT_BEST_FRAC: r.get(COL_RESULT_BEST_FRAC, ""),
                     COL_RESULT_FEATURE_USAGE: r.get(COL_RESULT_FEATURE_USAGE, "{}"),
+                    COL_RESULT_N_OOF: _fmt_int_cell(r.get(COL_RESULT_N_OOF)),
+                    COL_RESULT_N_FOLDS_PRESENT: _fmt_int_cell(
+                        r.get(COL_RESULT_N_FOLDS_PRESENT)
+                    ),
                 }
             )
 
@@ -1024,6 +1165,8 @@ def run_best_metrics_from_aggregated(
         "best_pearson_features",
         "spearman_winner_pearson",
         "spearman_winner_r2",
+        AGG_COL_N_OOF,
+        AGG_COL_N_FOLDS_PRESENT,
         "Pipeline_time_sum_s",
         "Pipeline_time_std_s",
     ]
