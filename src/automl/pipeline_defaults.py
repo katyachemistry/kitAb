@@ -23,6 +23,14 @@ DEFAULT_N_SPLITS: int = 5
 # records this in fold meta.json as ``features_frac``.
 DEFAULT_FEATURES_FRAC: float = 0.15
 
+DEFAULT_EVAL_MODELS: str = "all"
+
+# Fixed eval-model settings; the pipeline does not search hyperparameters.
+DEFAULT_EVAL_HYPERPARAMETERS_RAW: dict[str, dict] = {
+    "elasticnet": {"alpha": 0.01},
+    "knn": {"weights": "distance"},
+}
+
 DEFAULT_EVAL_MODEL_ORDER: tuple[str, ...] = (
     "linear",
     "elasticnet",
@@ -30,12 +38,6 @@ DEFAULT_EVAL_MODEL_ORDER: tuple[str, ...] = (
     "svm",
     "knn",
 )
-
-# Fixed eval-model settings; the pipeline does not search hyperparameters.
-DEFAULT_EVAL_HYPERPARAMETERS_RAW: dict[str, dict] = {
-    "elasticnet": {"alpha": 0.01},
-    "knn": {"weights": "distance"},
-}
 
 DEFAULT_LOW_VARIANCE_RELATIVE_STD_THRESHOLD: float = 0.01
 DEFAULT_LOW_VARIANCE_EPSILON: float = 1e-8

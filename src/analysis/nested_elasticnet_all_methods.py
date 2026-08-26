@@ -69,7 +69,13 @@ METHOD_SLUGS = {
 }
 # Match the publication Spearman figure exclusion policy.
 EXCLUDED_TARGETS = frozenset({"target_Fab_pI"})
-CONFIG_COMPARE_KEYS = ("alphas", "l1_ratios", "excluded_targets")
+CONFIG_COMPARE_KEYS = (
+    "alphas",
+    "l1_ratios",
+    "excluded_targets",
+    "include_stems",
+    "exclude_hc_lc_subtypes",
+)
 _SEED_RE = re.compile(r"__rs(\d+)$")
 _DATASETS_DIR = REPO / "datasets"
 _HAS_FOLD_COL_CACHE: dict[str, bool] = {}
@@ -193,6 +199,7 @@ def _features(
     target_col: str,
     *,
     feature_mode: str,
+    exclude_hc_lc_subtypes: bool = False,
 ) -> list[str]:
     meta = json.loads((fold_dir / "meta.json").read_text())
     sample = pd.read_parquet(fold_dir / "fold_0_train.parquet")
@@ -205,21 +212,25 @@ def _features(
         features = _feature_columns(sample, target_col)
 
     if feature_mode == "sequence":
+        seq_feats = [
+            feature for feature in SEQUENCE_FEATURES if feature in sample.columns
+        ]
+        missing = [
+            feature for feature in SEQUENCE_FEATURES if feature not in seq_feats
+        ]
+        if missing:
+            raise ValueError(
+                f"{fold_dir}: missing sequence-baseline features {missing}"
+            )
+        if exclude_hc_lc_subtypes:
+            return seq_feats
         subtype = [
             feature
             for feature in features
             if feature.startswith("hc_subtype__")
             or feature.startswith("lc_subtype__")
         ]
-        selected = subtype + [
-            feature for feature in SEQUENCE_FEATURES if feature in sample.columns
-        ]
-        missing = [feature for feature in SEQUENCE_FEATURES if feature not in selected]
-        if missing:
-            raise ValueError(
-                f"{fold_dir}: missing sequence-baseline features {missing}"
-            )
-        return selected
+        return subtype + seq_feats
 
     non_subtype = [
         feature
@@ -463,6 +474,8 @@ def _build_tasks(
     out_dir: Path,
     alphas: list[float],
     l1_ratios: list[float],
+    include_stems: frozenset[str] | None = None,
+    exclude_hc_lc_subtypes: bool = False,
 ) -> tuple[list[dict[str, Any]], pd.DataFrame]:
     kitab = _discover_kitab()
     propermab = _discover_propermab()
@@ -532,6 +545,8 @@ def _build_tasks(
     tasks: list[dict[str, Any]] = []
     manifest_rows: list[dict[str, Any]] = []
     for config in configs:
+        if include_stems is not None and config["Dataset_stem"] not in include_stems:
+            continue
         targets = _target_dirs(config["root"])
         if not targets:
             raise FileNotFoundError(f"No target folds under {config['root']}")
@@ -544,6 +559,7 @@ def _build_tasks(
                 fold_dir,
                 target_col,
                 feature_mode=config["feature_mode"],
+                exclude_hc_lc_subtypes=exclude_hc_lc_subtypes,
             )
             manifest_rows.append(
                 {
@@ -611,6 +627,16 @@ def main() -> None:
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--include-stems",
+        default="",
+        help="Comma-separated dataset stems to run (default: all discovered).",
+    )
+    parser.add_argument(
+        "--exclude-hc-lc-subtypes",
+        action="store_true",
+        help="Drop hc_subtype__/lc_subtype__ from sequence baseline feature set.",
+    )
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be >= 1")
@@ -621,17 +647,26 @@ def main() -> None:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     config_path = args.out_dir / "run_config.json"
+    include_stems = (
+        frozenset(s.strip() for s in args.include_stems.split(",") if s.strip())
+        if args.include_stems.strip()
+        else None
+    )
     run_config = {
         "alphas": list(args.alphas),
         "l1_ratios": list(args.l1_ratios),
         "jobs": args.jobs,
         "excluded_targets": sorted(EXCLUDED_TARGETS),
+        "include_stems": sorted(include_stems) if include_stems else [],
+        "exclude_hc_lc_subtypes": bool(args.exclude_hc_lc_subtypes),
     }
 
     tasks, manifest = _build_tasks(
         out_dir=args.out_dir,
         alphas=list(args.alphas),
         l1_ratios=list(args.l1_ratios),
+        include_stems=include_stems,
+        exclude_hc_lc_subtypes=bool(args.exclude_hc_lc_subtypes),
     )
     run_config["manifest_sha1"] = _manifest_fingerprint(manifest)
 

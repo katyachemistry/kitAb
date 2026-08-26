@@ -54,7 +54,7 @@ dependencies:
   - pyyaml=6.0.3        # kitAb manifests and run configs
   - pyarrow=23.0.1      # parquet fold I/O in AutoML
 
-  # --- Optional plotting (soft imports in aggregate_batch_results.py, automl/utils.py) ---
+  # --- Optional plotting (soft imports in automl/utils.py) ---
   - matplotlib=3.10.8
 
   # scikit-learn runtime deps (also pulled transitively; explicit for reproducibility)
