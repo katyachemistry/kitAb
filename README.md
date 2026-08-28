@@ -8,6 +8,8 @@
 
 kitAb combines structure-based developability descriptors with automated machine learning for antibody developability prediction.
 
+The physicochemical representation and distance enrichment is available through the web server https://kitab-atlas.com/ to support exploration and comparison of antibody profiles.
+
 ## Installation
 
 From the repo root (requires **mamba** or **conda**, **git**, **wget** or **curl**):
