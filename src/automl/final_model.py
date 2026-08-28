@@ -34,9 +34,19 @@ from automl.select_best import TechniqueScore
 from automl.techniques import PipelineSettings, Technique
 
 SELECTION_RULE = (
-    "Refit on all rows. The eval model (SFS techniques) and the "
-    "(alpha, l1_ratio) pair (ElasticNet) are re-chosen by pooled-Spearman "
-    "cross-validation over the same folds, exactly as inside nested CV."
+    "Refit on all labelled rows. The technique is the highest mean inner "
+    "Spearman from nested CV. ElasticNet (alpha, l1_ratio) and the SFS eval "
+    "model are the mode of that technique's per-fold inner-CV choices."
+)
+NESTED_PROCEDURE_METRIC_NOTE = (
+    "cv_* metrics are the nested AutoML procedure: each outer fold uses the "
+    "technique with the best inner-CV Spearman. They are not the CV score of "
+    "the finally deployed technique alone, and they are not computed on the "
+    "rows this model was finally fitted on."
+)
+HP_SELECTION_RULE = (
+    "Hyperparameters come from nested inner CV (mode across outer-train "
+    "splits of the deployed technique). They are not re-tuned on outer-test."
 )
 
 
@@ -61,24 +71,40 @@ def fit_final_model(
     features: list[str],
     technique: Technique,
     settings: PipelineSettings,
+    nested_hp: dict[str, Any] | None = None,
 ) -> FinalModel:
-    """Fit the technique on every labelled row under ``fold_dir``."""
+    """Fit the technique on every labelled row under ``fold_dir``.
+
+    ``nested_hp`` supplies inner-CV ``eval_model`` / ``alpha`` / ``l1_ratio``
+    from the nested run so the final fit does not re-tune on outer-test.
+    """
     full = full_dataset_frame(fold_dir)
     eval_hp_by_model = eval_hyperparameters_by_model(settings)
+    hp = dict(nested_hp or {})
 
     if technique.kind == "elasticnet":
-        best, _grid, _n_folds = choose_elasticnet_grid_point_over_folds(
-            fold_dir,
-            target_col=target_col,
-            features=features,
-            technique=technique,
-            settings=settings,
-        )
+        alpha = hp.get("alpha")
+        l1_ratio = hp.get("l1_ratio")
+        if alpha is None or l1_ratio is None:
+            best, _grid, _n_folds = choose_elasticnet_grid_point_over_folds(
+                fold_dir,
+                target_col=target_col,
+                features=features,
+                technique=technique,
+                settings=settings,
+            )
+            alpha = best["alpha"]
+            l1_ratio = best["l1_ratio"]
+            selection_spearman = best["pooled_inner_spearman"]
+        else:
+            alpha = float(alpha)
+            l1_ratio = float(l1_ratio)
+            selection_spearman = hp.get("selection_spearman")
         x_all, y_all, _ = xy(full, target_col, features)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", ConvergenceWarning)
             estimator = make_elasticnet_pipeline(
-                best["alpha"], best["l1_ratio"], random_state=settings.random_state
+                alpha, l1_ratio, random_state=settings.random_state
             )
             estimator.fit(x_all, y_all)
         attributions = extract_attributions(
@@ -95,24 +121,31 @@ def fit_final_model(
             target_col=target_col,
             feature_cols=list(features),
             eval_model="elasticnet",
-            alpha=float(best["alpha"]),
-            l1_ratio=float(best["l1_ratio"]),
+            alpha=float(alpha),
+            l1_ratio=float(l1_ratio),
             n_train=int(len(y_all)),
-            selection_spearman=best["pooled_inner_spearman"],
+            selection_spearman=selection_spearman,
             attributions=attributions,
         )
 
     if technique.searches_eval_model:
-        eval_model, selection_spearman, _scores, _rows = choose_eval_model_over_folds(
-            fold_dir,
-            target_col=target_col,
-            candidate_features=features,
-            technique=technique,
-            settings=settings,
-            eval_hp_by_model=eval_hp_by_model,
-        )
+        eval_model = hp.get("eval_model")
+        selection_spearman = hp.get("selection_spearman")
+        if eval_model is None:
+            eval_model, selection_spearman, _scores, _rows = choose_eval_model_over_folds(
+                fold_dir,
+                target_col=target_col,
+                candidate_features=features,
+                technique=technique,
+                settings=settings,
+                eval_hp_by_model=eval_hp_by_model,
+            )
+        else:
+            eval_model = str(eval_model)
     else:
-        eval_model, selection_spearman = technique.eval_models[0], None
+        eval_model, selection_spearman = technique.eval_models[0], hp.get(
+            "selection_spearman"
+        )
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ConstantInputWarning)
@@ -176,6 +209,10 @@ def build_meta(
     dataset_yaml_key: str,
     descriptor_source: str,
     competing_scores: list[TechniqueScore],
+    fold_winners: list[dict[str, Any]] | None = None,
+    technique_selection: str = "inner",
+    selection_rule: str | None = None,
+    deployed_outer_spearman: float | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": 2,
@@ -197,18 +234,19 @@ def build_meta(
         "training_row_count": final.n_train,
         "random_state": settings.random_state,
         "cv_mode": score.cv_mode,
+        "technique_selection": technique_selection,
         "n_outer_folds": score.n_outer_folds,
+        "n_folds_won": score.n_folds_won,
         "cv_spearman_pooled_oof": score.spearman_pooled_oof,
         "cv_pearson_pooled_oof": score.pearson_pooled_oof,
         "cv_r2_pooled_oof": score.r2_pooled_oof,
         "cv_feature_jaccard": score.feature_jaccard,
-        "cv_metric_note": (
-            "cv_* metrics come from the held-out outer folds of the "
-            f"{score.cv_mode} cross-validation, not from the rows this model was "
-            "finally fitted on."
-        ),
+        "deployed_outer_spearman": deployed_outer_spearman,
+        "fold_winners": list(fold_winners or []),
+        "cv_metric_note": NESTED_PROCEDURE_METRIC_NOTE,
         "final_selection_spearman": final.selection_spearman,
-        "selection_rule": SELECTION_RULE,
+        "selection_rule": selection_rule or SELECTION_RULE,
+        "hp_selection_rule": HP_SELECTION_RULE,
         "technique_comparison": [s.as_row() for s in competing_scores],
         "scaling": "included_in_estimator_pipeline",
         "inference_note": (

@@ -18,6 +18,7 @@ Options are passed through to src/automl/run_automl.py, notably:
   --models-root PATH     where to write estimator.joblib
   --resume               reuse outer-fold checkpoints
   --force-preprocess     rebuild fold parquets
+  --cv-mode MODE        nested or flat (default: from automl.yaml)
   --no-final-model       compare techniques without fitting the final model
   --dry-run              print the work plan and exit
 EOF

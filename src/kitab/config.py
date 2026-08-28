@@ -217,6 +217,7 @@ class AutomlConfig:
     enabled: bool = True
     techniques: list[str] = field(default_factory=lambda: list(SUPPORTED_TECHNIQUES))
     cv_mode: str = "nested"
+    technique_selection: str = "inner"
     save_final_model: bool = True
 
 
@@ -296,6 +297,7 @@ class Manifest:
                 "enabled": self.automl.enabled,
                 "techniques": list(self.automl.techniques),
                 "cv_mode": self.automl.cv_mode,
+                "technique_selection": self.automl.technique_selection,
                 "save_final_model": self.automl.save_final_model,
             },
         }
@@ -422,6 +424,10 @@ def parse_manifest_dict(
     _cli_owned_automl = (
         ("techniques", "automl.techniques is ignored; pass --techniques on the CLI."),
         ("cv_mode", "automl.cv_mode is ignored; pass --cv-mode on the CLI."),
+        (
+            "technique_selection",
+            "automl.technique_selection is ignored; nested inner-CV selection is always used.",
+        ),
         ("save_final_model", "automl.save_final_model is ignored; pass --no-final-model on the CLI."),
     )
     for key, msg in _cli_owned_automl:

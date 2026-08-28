@@ -5,10 +5,11 @@ For every dataset/target in the run config this script
 
 1. builds cross-validation folds (``prepare_run.py``),
 2. evaluates ``elasticnet``, ``intercorr_svm``, ``sfs_svm`` and ``sfs_knn`` on
-   every outer fold, in parallel across folds and targets,
-3. ranks the techniques by Spearman correlation over the pooled out-of-fold
-   predictions, and
-4. refits the winner on the whole dataset and writes ``estimator.joblib``.
+   every outer fold, in parallel across *technique × fold × target*,
+3. chooses the technique *inside* nested CV (highest inner-fold Spearman per
+   outer fold), pools those mixed out-of-fold predictions, and
+4. refits the inner-chosen technique (highest mean inner Spearman) on the
+   whole dataset and writes ``estimator.joblib``.
 
 Outer folds are checkpointed, so ``--resume`` picks up where a run stopped.
 """
@@ -68,7 +69,10 @@ from automl.run_config import (  # noqa: E402
     resolve_path,
     slug,
 )
-from automl.select_best import TechniqueScore, score_techniques, select_best  # noqa: E402
+from automl.select_best import (  # noqa: E402
+    nested_hyperparameters_for_technique,
+    resolve_target_selection,
+)
 from automl.techniques import (  # noqa: E402
     CV_MODES,
     PipelineSettings,
@@ -302,6 +306,10 @@ def build_tasks(
     techniques = settings.build_techniques()
     tasks: list[dict[str, Any]] = []
     manifest_rows: list[dict[str, Any]] = []
+    # One task per (technique × outer fold × target). Nested technique
+    # selection aggregates inner_pooled_spearman afterwards; do not fold the
+    # four techniques into a single serial task or the worker pool cannot
+    # evaluate them in parallel.
     for record in records:
         fold_dirs = discover_target_fold_dirs(record.run_dir)
         if not fold_dirs:
@@ -420,15 +428,20 @@ def _fit_and_save(job: dict[str, Any]) -> dict[str, Any]:
         features=job["features"],
         technique=job["technique"],
         settings=job["settings"],
+        nested_hp=job.get("nested_hp"),
     )
     meta = build_meta(
         final,
-        score=job["score"],
+        score=job["procedure_score"],
         settings=job["settings"],
         dataset_stem=job["dataset_stem"],
         dataset_yaml_key=job["yaml_key"],
         descriptor_source=job["descriptor_source"],
         competing_scores=job["competing_scores"],
+        fold_winners=job["fold_winners"],
+        technique_selection=job["technique_selection"],
+        selection_rule=job["selection_rule"],
+        deployed_outer_spearman=job["deployed_score"].spearman_pooled_oof,
     )
     save_final_model(job["model_dir"], final, meta)
     print(
@@ -447,8 +460,10 @@ def _fit_and_save(job: dict[str, Any]) -> dict[str, Any]:
         "l1_ratio": final.l1_ratio,
         "n_features": len(final.feature_cols),
         "training_row_count": final.n_train,
-        "cv_spearman_pooled_oof": job["score"].spearman_pooled_oof,
-        "cv_r2_pooled_oof": job["score"].r2_pooled_oof,
+        "cv_spearman_pooled_oof": job["procedure_score"].spearman_pooled_oof,
+        "cv_r2_pooled_oof": job["procedure_score"].r2_pooled_oof,
+        "technique_selection": job["technique_selection"],
+        "deployed_outer_spearman": job["deployed_score"].spearman_pooled_oof,
         "model_dir": str(job["model_dir"]),
     }
 
@@ -458,8 +473,12 @@ def build_final_model_jobs(
     *,
     settings: PipelineSettings,
     models_root: Path,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Score techniques per target and describe the refit job for each winner."""
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Score the nested procedure per target and describe the refit job.
+
+    Technique × outer-fold evaluation already ran in parallel. This step only
+    aggregates inner scores and does not fit models.
+    """
     techniques: dict[str, Technique] = {t.key: t for t in settings.build_techniques()}
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for result in results:
@@ -468,28 +487,27 @@ def build_final_model_jobs(
     jobs: list[dict[str, Any]] = []
     comparison_rows: list[dict[str, Any]] = []
     winner_rows: list[dict[str, Any]] = []
+    fold_winner_rows: list[dict[str, Any]] = []
+    identity_keys = ("yaml_key", "dataset_stem", "descriptor_source", "target_col")
     for (yaml_key, target_col), group in sorted(grouped.items()):
-        scores = score_techniques(group, technique_order=list(settings.techniques))
-        best = select_best(scores)
+        selection = resolve_target_selection(
+            group,
+            technique_order=list(settings.techniques),
+        )
         head = group[0]
-        for score in scores:
+        identity = {key: head[key] for key in identity_keys}
+        for score in selection.competing:
             comparison_rows.append(
                 {
-                    "yaml_key": yaml_key,
-                    "dataset_stem": head["dataset_stem"],
-                    "descriptor_source": head["descriptor_source"],
+                    **identity,
                     **score.as_row(),
-                    "is_best": score.technique == best.technique,
+                    "technique_selection": selection.technique_selection,
+                    "selection_rule": selection.selection_rule,
                 }
             )
-        winner_rows.append(
-            {
-                "yaml_key": yaml_key,
-                "dataset_stem": head["dataset_stem"],
-                "descriptor_source": head["descriptor_source"],
-                **best.as_row(),
-            }
-        )
+        winner_rows.append({**identity, **selection.as_winner_row()})
+        for row in selection.fold_winners:
+            fold_winner_rows.append({**identity, **row})
         fold_dir = Path(head["fold_root"])
         jobs.append(
             {
@@ -499,16 +517,23 @@ def build_final_model_jobs(
                 "target_col": target_col,
                 "fold_dir": fold_dir,
                 "features": feature_columns(fold_dir),
-                "technique": techniques[best.technique],
+                "technique": techniques[selection.deployed.technique],
                 "settings": settings,
-                "score": best,
-                "competing_scores": scores,
+                "procedure_score": selection.procedure,
+                "deployed_score": selection.deployed,
+                "competing_scores": selection.competing,
+                "fold_winners": selection.fold_winners,
+                "technique_selection": selection.technique_selection,
+                "selection_rule": selection.selection_rule,
+                "nested_hp": nested_hyperparameters_for_technique(
+                    group, selection.deployed.technique
+                ),
                 "model_dir": models_root
                 / slug(f"{head['dataset_stem']}__{head['descriptor_source']}")
                 / slug(target_col),
             }
         )
-    return jobs, comparison_rows, winner_rows
+    return jobs, comparison_rows, winner_rows, fold_winner_rows
 
 
 def run_final_models(jobs: list[dict[str, Any]], *, jobs_parallel: int) -> pd.DataFrame:
@@ -538,6 +563,7 @@ def write_artifacts(
     batch_root: Path,
     comparison_rows: list[dict[str, Any]],
     winner_rows: list[dict[str, Any]],
+    fold_winner_rows: list[dict[str, Any]],
 ) -> None:
     predictions_dir = batch_root / "predictions"
     metrics_dir = batch_root / "metrics"
@@ -631,6 +657,7 @@ def write_artifacts(
     comparison.to_csv(metrics_dir / "technique_comparison.csv", index=False)
     comparison.to_csv(batch_root / "technique_comparison.csv", index=False)
     pd.DataFrame(winner_rows).to_csv(metrics_dir / "best_technique.csv", index=False)
+    pd.DataFrame(fold_winner_rows).to_csv(metrics_dir / "fold_winners.csv", index=False)
 
     if feature_rows:
         pd.DataFrame(feature_rows).to_parquet(
@@ -756,7 +783,8 @@ def main() -> None:
 
     print(
         f"[automl] {len(records)} dataset run(s); techniques="
-        f"{','.join(settings.techniques)}; cv={settings.cv.mode}; jobs={jobs}",
+        f"{','.join(settings.techniques)}; cv={settings.cv.mode}; "
+        f"technique_selection={settings.cv.technique_selection}; jobs={jobs}",
         file=sys.stderr,
         flush=True,
     )
@@ -778,7 +806,8 @@ def main() -> None:
     )
     print(
         f"[automl] {len(manifest)} dataset/target/technique combination(s); "
-        f"{len(tasks)} outer-fold task(s)",
+        f"{len(tasks)} outer-fold task(s) "
+        f"(parallel over technique × outer fold × target, jobs={jobs})",
         file=sys.stderr,
         flush=True,
     )
@@ -789,7 +818,7 @@ def main() -> None:
     if len(results) != len(tasks):
         raise SystemExit(f"Expected {len(tasks)} fold results, got {len(results)}")
 
-    final_jobs, comparison_rows, winner_rows = build_final_model_jobs(
+    final_jobs, comparison_rows, winner_rows, fold_winner_rows = build_final_model_jobs(
         results, settings=settings, models_root=models_root
     )
     write_artifacts(
@@ -797,6 +826,7 @@ def main() -> None:
         batch_root=batch_root,
         comparison_rows=comparison_rows,
         winner_rows=winner_rows,
+        fold_winner_rows=fold_winner_rows,
     )
 
     if args.no_final_model or not settings.save_final_model:

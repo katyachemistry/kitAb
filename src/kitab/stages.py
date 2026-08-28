@@ -850,7 +850,7 @@ def filter_run_config_for_complete(
 
 
 def run_automl(manifest: Manifest, logger: RunLogger, run_config: Path) -> Path:
-    """Compare the four techniques, then fit and save the winner per target."""
+    """Compare the four techniques under nested CV, then fit and save the winner."""
     script = manifest.repo_root / "src" / "run_automl.sh"
     models_root = manifest.run.output_dir / "models"
     cmd = [

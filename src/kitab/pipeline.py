@@ -20,6 +20,7 @@ def plan_text(manifest: Manifest) -> str:
         f"automl: {manifest.automl.enabled}",
         f"techniques: {', '.join(manifest.automl.techniques)}",
         f"cv_mode: {manifest.automl.cv_mode}",
+        f"technique_selection: {manifest.automl.technique_selection}",
         f"save_final_model: {manifest.automl.save_final_model}",
         f"structure_prediction.runs: {manifest.structure_prediction.runs}",
         f"structure_prediction.batch_size: {manifest.structure_prediction.batch_size}",
@@ -145,6 +146,7 @@ def run_pipeline(manifest: Manifest) -> int:
         "output_dir": str(out),
         "techniques": list(manifest.automl.techniques),
         "cv_mode": manifest.automl.cv_mode,
+        "technique_selection": manifest.automl.technique_selection,
         "models_dir": str(out / "models") if batch_root is not None else None,
     }
     logger.write_summary(summary)

@@ -18,6 +18,9 @@ DEFAULT_TECHNIQUES: tuple[str, ...] = (
 
 DEFAULT_CV_MODE: str = "nested"
 DEFAULT_N_SPLITS: int = 5
+# Technique choice is always nested: inner-CV Spearman, never outer-test.
+DEFAULT_TECHNIQUE_SELECTION: str = "inner"
+TECHNIQUE_SELECTION_MODES: tuple[str, ...] = ("inner",)
 
 # Fraction of training rows used as the SFS feature budget. prepare_run.py also
 # records this in fold meta.json as ``features_frac``.

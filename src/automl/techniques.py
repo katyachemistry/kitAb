@@ -1,10 +1,12 @@
 """The four kitAb AutoML techniques and the settings that parameterise them.
 
-The pipeline runs every technique in :data:`DEFAULT_TECHNIQUES` order for each
-target, scores them by pooled out-of-fold Spearman, keeps the best one and
-refits it on the whole dataset. There is no hyperparameter search: the only
-choices made inside cross-validation are which eval model the SFS techniques
-use and which ``(alpha, l1_ratio)`` the ElasticNet technique uses.
+Every technique in :data:`DEFAULT_TECHNIQUES` is evaluated in parallel
+(technique × outer fold × target). Nested CV then chooses the technique from
+inner-fold Spearman, pools those mixed out-of-fold predictions as the
+procedure score, and refits that inner-chosen technique on all labelled rows.
+ElasticNet ``(alpha, l1_ratio)`` and the SFS eval model are taken from the
+nested run (mode of the per-fold inner choices); there is no outer-test
+selection and no separate hyperparameter-tuning stage.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from automl.pipeline_defaults import (
     DEFAULT_PERMUTATION_REPEATS,
     DEFAULT_RANDOM_STATE,
     DEFAULT_SFS_EVAL_MODELS,
+    DEFAULT_TECHNIQUE_SELECTION,
     DEFAULT_SFS_INNER_CV,
     DEFAULT_SFS_MIN_IMPROVEMENT,
     DEFAULT_TECHNIQUES,
@@ -92,6 +95,7 @@ class ElasticNetSettings:
 class CvSettings:
     mode: str = DEFAULT_CV_MODE
     n_splits: int = DEFAULT_N_SPLITS
+    technique_selection: str = DEFAULT_TECHNIQUE_SELECTION
 
 
 @dataclass(frozen=True)
@@ -126,7 +130,11 @@ class PipelineSettings:
         return {
             "techniques": list(self.techniques),
             "random_state": self.random_state,
-            "cv": {"mode": self.cv.mode, "n_splits": self.cv.n_splits},
+            "cv": {
+                "mode": self.cv.mode,
+                "n_splits": self.cv.n_splits,
+                "technique_selection": self.cv.technique_selection,
+            },
             "sfs": {
                 "features_frac": self.sfs.features_frac,
                 "min_improvement": self.sfs.min_improvement,
@@ -294,7 +302,7 @@ _KNOWN_PIPELINE_KEYS = frozenset(
         "save_final_model",
     }
 )
-_KNOWN_CV_KEYS = frozenset({"mode", "n_splits"})
+_KNOWN_CV_KEYS = frozenset({"mode", "n_splits", "technique_selection"})
 _KNOWN_SFS_KEYS = frozenset({"features_frac", "min_improvement", "inner_cv", "eval_models"})
 _KNOWN_ELASTICNET_KEYS = frozenset({"alphas", "l1_ratios"})
 
@@ -327,6 +335,14 @@ def pipeline_settings_from_block(block: dict[str, Any] | None) -> PipelineSettin
     if cv_mode not in CV_MODES:
         raise TechniqueConfigError(
             f"pipeline.cv.mode must be one of {', '.join(CV_MODES)}, got {cv_mode!r}"
+        )
+    technique_selection = str(
+        cv_raw.get("technique_selection") or DEFAULT_TECHNIQUE_SELECTION
+    ).strip().lower()
+    if technique_selection != "inner":
+        raise TechniqueConfigError(
+            "pipeline.cv.technique_selection is always nested inner-CV "
+            f"(got {technique_selection!r}); outer/best-of-four selection is not supported"
         )
 
     sfs_raw = _as_mapping(raw.get("sfs"), field_name="pipeline.sfs")
@@ -382,6 +398,7 @@ def pipeline_settings_from_block(block: dict[str, Any] | None) -> PipelineSettin
                 field_name="pipeline.cv.n_splits",
                 minimum=2,
             ),
+            technique_selection=technique_selection,
         ),
         sfs=SfsSettings(
             features_frac=features_frac,
@@ -494,6 +511,7 @@ def apply_pipeline_cli_overrides(
     *,
     techniques: str | list[str] | None = None,
     cv_mode: str | None = None,
+    technique_selection: str | None = None,
     no_final_model: bool = False,
 ) -> PipelineSettings:
     """Apply ``run_automl.py`` / kitAb CLI overrides on top of ``automl.yaml``."""
@@ -512,6 +530,13 @@ def apply_pipeline_cli_overrides(
                 f"cv_mode must be one of {', '.join(CV_MODES)}, got {mode!r}"
             )
         updated = replace(updated, cv=replace(updated.cv, mode=mode))
+    if technique_selection is not None:
+        selection = str(technique_selection).strip().lower()
+        if selection != "inner":
+            raise TechniqueConfigError(
+                "technique_selection is always nested inner-CV; "
+                f"got {selection!r}"
+            )
     if no_final_model:
         updated = replace(updated, save_final_model=False)
     return updated

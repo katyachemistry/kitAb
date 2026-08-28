@@ -1,11 +1,12 @@
 # kitAb AutoML pipeline settings (internal defaults — not a user config).
 #
 # The four techniques run in parallel (technique × outer fold × target) via a
-# worker pool. Each technique is ranked by Spearman correlation over pooled
-# out-of-fold predictions; the winner is refit on the whole dataset.
+# worker pool. Nested CV then picks the technique from inner-fold Spearman
+# (never from outer-test), pools those mixed out-of-fold predictions, and
+# refits the inner-chosen technique on the whole dataset.
 #
 # ElasticNet (alpha, l1_ratio) and SFS eval-model choice are resolved inside
-# cross-validation — there is no separate hyperparameter-tuning stage.
+# nested CV — there is no separate hyperparameter-tuning stage.
 #
 # Override for development: run_automl.sh --automl-config PATH
 
@@ -22,8 +23,11 @@ pipeline:
   techniques: [elasticnet, intercorr_svm, sfs_svm, sfs_knn]
 
   cv:
-    # nested: inner folds choose the eval model and ElasticNet grid point.
-    # flat:   selection on outer-train only (cheaper; small variant series).
+    # nested: inner folds choose the eval model, ElasticNet grid point, and
+    #         which of the four techniques is used for that outer fold's test
+    #         predictions (never from outer-test).
+    # flat:   no inner scores, so it cannot choose among techniques. Use a
+    #         single technique, or nested CV.
     mode: nested
     # Outer folds for datasets without a fold column; per-dataset n_splits and
     # random_seeds in the generated run config take precedence.

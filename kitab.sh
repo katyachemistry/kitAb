@@ -100,6 +100,9 @@ while [[ $# -gt 0 ]]; do
             CV_MODE="${2:?}"
             shift 2
             ;;
+        --technique-selection)
+            _die "--technique-selection was removed; nested inner-CV selection is always used"
+            ;;
         --no-final-model)
             NO_FINAL_MODEL=1
             shift

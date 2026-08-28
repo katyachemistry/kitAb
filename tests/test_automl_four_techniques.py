@@ -22,7 +22,7 @@ pipeline:
   random_state: 42
   techniques: [elasticnet, intercorr_svm, sfs_svm, sfs_knn]
   cv:
-    mode: flat
+    mode: nested
     n_splits: 3
   sfs:
     features_frac: 0.2
@@ -67,7 +67,7 @@ def test_build_tasks_includes_all_four_techniques(
     _write_fast_automl_config(automl_cfg)
     settings = apply_pipeline_cli_overrides(
         load_pipeline_settings(automl_cfg),
-        cv_mode="flat",
+        cv_mode="nested",
     )
     run_cfg = tmp_path / "run_config.yaml"
     batch_root = tmp_path / "batch"
@@ -108,7 +108,7 @@ def test_four_technique_automl_writes_estimator(
         "--jobs",
         "2",
         "--cv-mode",
-        "flat",
+        "nested",
         "--models-root",
         str(models_root),
         "--py",
@@ -125,6 +125,15 @@ def test_four_technique_automl_writes_estimator(
     assert estimators, f"expected estimator.joblib under {models_root}"
     assert (batch_root / "technique_comparison.csv").is_file()
     assert (batch_root / "metrics" / "best_technique.csv").is_file()
+    assert (batch_root / "metrics" / "fold_winners.csv").is_file()
+    import pandas as pd
+
+    best = pd.read_csv(batch_root / "metrics" / "best_technique.csv")
+    assert not best.empty
+    assert str(best.iloc[0]["technique_selection"]) == "inner"
+    assert "inner" in str(best.iloc[0]["selection_rule"]).lower()
+    winners = pd.read_csv(batch_root / "metrics" / "fold_winners.csv")
+    assert not winners.empty
 
 
 def test_no_final_model_skips_estimator(
@@ -148,7 +157,7 @@ def test_no_final_model_skips_estimator(
         "--jobs",
         "2",
         "--cv-mode",
-        "flat",
+        "nested",
         "--no-final-model",
         "--models-root",
         str(models_root),

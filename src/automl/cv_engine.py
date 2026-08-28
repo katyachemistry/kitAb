@@ -1,11 +1,14 @@
 """Cross-validation engine for the four kitAb AutoML techniques.
 
 One call to :func:`run_outer_fold` evaluates a single technique on a single
-outer fold. In ``nested`` mode the inner folds (built from the remaining outer
-folds, with outer-test samples removed) choose the eval model for the SFS
-techniques and the ``(alpha, l1_ratio)`` pair for ElasticNet; the choice is then
-refit on the whole outer-train split. In ``flat`` mode selection happens on
-outer-train only, which is what small variant series need.
+outer fold. Tasks are (technique × outer fold × target) and run in a worker
+pool; nested technique selection happens afterwards by aggregating
+``inner_pooled_spearman``. In ``nested`` mode the inner folds (built from the
+remaining outer folds, with outer-test samples removed) choose the eval model
+for the SFS techniques and the ``(alpha, l1_ratio)`` pair for ElasticNet; the
+choice is then refit on the whole outer-train split. In ``flat`` mode
+selection happens on outer-train only, which is what small variant series
+need.
 """
 
 from __future__ import annotations

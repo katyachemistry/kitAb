@@ -31,6 +31,7 @@ automl:
     assert m.automl.enabled is True
     assert m.automl.techniques == list(SUPPORTED_TECHNIQUES)
     assert m.automl.cv_mode == "nested"
+    assert m.automl.technique_selection == "inner"
     assert m.automl.save_final_model is True
     assert m.stage_graph()[-1] == "automl"
 
@@ -265,6 +266,7 @@ def test_cli_owned_automl_yaml_keys_warn(repo_root: Path):
                 "enabled": True,
                 "techniques": ["elasticnet"],
                 "cv_mode": "flat",
+                "technique_selection": "outer",
             },
         },
         source_path=Path("t.yaml"),
@@ -272,8 +274,10 @@ def test_cli_owned_automl_yaml_keys_warn(repo_root: Path):
     )
     assert m.automl.techniques == list(SUPPORTED_TECHNIQUES)
     assert m.automl.cv_mode == "nested"
+    assert m.automl.technique_selection == "inner"
     assert any("techniques" in w for w in m.warnings)
     assert any("cv_mode" in w for w in m.warnings)
+    assert any("technique_selection" in w for w in m.warnings)
 
 
 def test_removed_automl_yaml_keys_rejected(repo_root: Path):
@@ -319,6 +323,7 @@ automl:
     )
     assert m.automl.techniques == ["elasticnet", "sfs_svm"]
     assert m.automl.cv_mode == "flat"
+    assert m.automl.technique_selection == "inner"
     assert m.automl.save_final_model is False
 
 

@@ -154,7 +154,7 @@ kitAb/
 
 By default, balanced CV folds are derived with MMseqs2 sequence-identity clustering (0.50–0.80 cascade). If a CSV already has a `fold` column it is used. Force random 5-fold CV (seeds 42, 43, 44) with `inputs.split_randomly`.
 
-AutoML compares four techniques in parallel (`elasticnet`, intercorrelation+SVM, SFS+SVM, SFS+KNN), ranks them by pooled out-of-fold Spearman correlation, and refits the winner on all labelled rows. Inner choices (ElasticNet `(alpha, l1_ratio)` grid; SFS eval model among `svm`, `knn`, `linear`, `randomforest`) happen inside cross-validation; there is no separate hyperparameter-tuning stage.
+AutoML evaluates four techniques in parallel (`elasticnet`, intercorrelation+SVM, SFS+SVM, SFS+KNN). Nested CV chooses the technique from **inner-fold** Spearman (never from outer-test) and pools those mixed out-of-fold predictions as the procedure score. The saved model is that inner-chosen technique refit on **all labelled rows**, using the mode of its per-fold inner-CV hyperparameters (ElasticNet `(alpha, l1_ratio)`; SFS eval model among `svm`, `knn`, `linear`, `randomforest`). Flat CV cannot choose among techniques; use nested CV or a single `--techniques` value.
 
 ## Failure policy
 
@@ -165,12 +165,14 @@ AutoML compares four techniques in parallel (`elasticnet`, intercorrelation+SVM,
 
 ## Saved models
 
-After AutoML the winning technique per dataset/source/target is refit on all labelled rows and written under `models/` (`estimator.joblib`, `meta.json`) plus `models/model_index.json`. Pass `--no-final-model` to compare techniques without saving fitted models.
+After AutoML the deployed technique per dataset/source/target is refit on all labelled rows and written under `models/` (`estimator.joblib`, `meta.json`) plus `models/model_index.json`. The technique is the highest **mean inner** Spearman from nested CV. `meta.json` `cv_spearman_pooled_oof` is the nested-procedure score (mixed techniques across outer folds), not the CV score of the fitted model. Pass `--no-final-model` to compare techniques without saving fitted models.
 
 ```text
 runs/my_kitab_run/
   descriptors/ab21_abb2_1/results/mAb1.json
   automl/metrics/technique_comparison.csv
+  automl/metrics/best_technique.csv
+  automl/metrics/fold_winners.csv
   models/
     model_index.json
     ab21__ab21_abb2_1/
