@@ -1,14 +1,30 @@
-input_csvs_folder: datasets
-# Use datasets_example for a quick test; switch to datasets for the full run.
+# Sequences -> FlashABB structures -> descriptors -> AutoML.
+# Use datasets_example for a quick test; datasets is the full run.
+inputs:
+  datasets_dir: datasets
+  split_randomly:
+    - ab21
+    - hutchinson2023enhancement_top200tm1_igg
+    - jetha2019homology_RT
+    - pdgf38
 
-split_randomly: ab21.csv,hutchinson2023enhancement_top200tm1_igg.csv,jetha2019homology_RT.csv,pdgf38.csv
-
-result_folder: flashabb
+run:
+  output_dir: flashabb
 
 structure_prediction:
+  enabled: true
   model: flashabb
-  device: 1 # GPU index (0, 1, …) or cuda:0 / cpu
-  skip_existing: true # skip antibodies whose .pdb already exists (safe for pipeline restarts)
-  # batch_size: 50 # FlashABB default batch size is 50; increase if VRAM allows
+  device: cuda:1
+  skip_existing: true
 
-# n_cpu: 4 # number of CPUs to use for descriptors calculation and AutoML, default all available
+structure_processing:
+  enabled: false
+  renumber_imgt: false
+  minimize: false
+  minimize_attempts: 5
+
+descriptors:
+  enabled: true
+
+automl:
+  enabled: true

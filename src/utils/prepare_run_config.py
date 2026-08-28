@@ -58,30 +58,6 @@ def _parse_structure_models(raw: Any) -> list[str]:
     return seen
 
 
-def _parse_include_features(raw: Any) -> list[str]:
-    if raw is None:
-        return []
-    if isinstance(raw, str):
-        text = raw.strip()
-        if not text:
-            return []
-        return [part.strip() for part in text.split(",") if part.strip()]
-    if isinstance(raw, (list, tuple)):
-        return [str(part).strip() for part in raw if str(part).strip()]
-    raise SystemExit("include_features must be empty, a comma-separated string, or a list")
-
-
-def _ensure_result_folder_absent(
-    repo_root: Path, result_folder: str, *, config_path: Path
-) -> None:
-    root = (repo_root / str(result_folder).strip()).resolve()
-    if root.is_dir():
-        raise SystemExit(
-            f"result_folder already exists: {root}\n"
-            f"(remove or rename it before re-running; config {config_path})"
-        )
-
-
 def _resolve_path(repo_root: Path, raw: str) -> Path:
     path = Path(raw)
     if not path.is_absolute():
@@ -94,17 +70,6 @@ def _rel(repo_root: Path, path: Path) -> str:
         return str(path.relative_to(repo_root))
     except ValueError:
         return str(path)
-
-
-def _parse_dataset_stem_set(raw: Any, *, field_name: str) -> set[str]:
-    """Parse comma-separated or YAML list of dataset file names to stem set."""
-    if not raw:
-        return set()
-    if isinstance(raw, list):
-        items = [str(s).strip() for s in raw if str(s).strip()]
-    else:
-        items = [s.strip() for s in str(raw).split(",") if s.strip()]
-    return {Path(x).stem for x in items}
 
 
 def _filter_csv_files(
@@ -335,31 +300,12 @@ _DEFAULT_FEATURES_CSV_NAME = "features.csv"
 _RESULTS_SUBDIR_NAME = "results"
 
 
-def _predefined_descriptors_config_block(raw: dict[str, Any]) -> dict[str, Any] | None:
-    block = raw.get("predefined_descriptors")
-    legacy = raw.get("csv_features")
-    if block is not None and legacy is not None:
+def _ensure_output_dir_absent(output_dir: Path, *, config_path: Path) -> None:
+    if output_dir.is_dir():
         raise SystemExit(
-            "Use only predefined_descriptors in the generic config "
-            "(csv_features is a deprecated alias for the same block)."
+            f"run.output_dir already exists: {output_dir}\n"
+            f"(remove or rename it before re-running; config {config_path})"
         )
-    if block is None and legacy is not None:
-        print(
-            "Note: csv_features is deprecated; use predefined_descriptors for the same options.",
-            file=sys.stderr,
-        )
-        block = legacy
-    if block is None:
-        return None
-    if not isinstance(block, dict):
-        raise SystemExit("predefined_descriptors must be a mapping")
-    if block.get("allowed_suffixes"):
-        print(
-            "Note: predefined_descriptors.allowed_suffixes is ignored; "
-            "every folder named {dataset} or {dataset}_... under the directory is used.",
-            file=sys.stderr,
-        )
-    return block
 
 
 def _has_matching_run_subfolders(
@@ -442,7 +388,6 @@ def _load_predefined_descriptor_runs(
     *,
     input_csvs_path: Path,
     input_csvs: str,
-    result_folder: str,
     splits_dir: Path,
     repo_root: Path,
     is_scenario3: bool,
@@ -544,54 +489,18 @@ def _load_predefined_descriptor_runs(
     return folder_path, runs
 
 
-def load_generic_config(config_path: Path, repo_root: Path, *, resume: bool = False) -> dict[str, Any]:
-    yaml = _require_yaml()
-    cfg_path = config_path.resolve()
-    if not cfg_path.is_file():
-        raise SystemExit(f"Config not found: {cfg_path}")
+def prepare_from_manifest(manifest: Any, *, resume: bool = False) -> dict[str, Any]:
+    """Expand a kitAb Manifest into the internal run-config plan."""
+    repo_root = Path(manifest.repo_root).resolve()
+    cfg_path = Path(manifest.source_path).resolve()
+    output_dir = Path(manifest.run.output_dir).resolve()
+    extra_root_keys: dict[str, Any] = {}
 
-    raw = yaml.safe_load(cfg_path.read_text())
-    if not isinstance(raw, dict):
-        raise SystemExit(f"Config root must be a mapping: {cfg_path}")
-
-    if raw.pop("structures_layout", None) is not None:
-        print(
-            "Note: structures_layout is ignored; structure folders are discovered "
-            "automatically (subdirectories if present, otherwise the root folder).",
-            file=sys.stderr,
-        )
-
-    extra_root_keys = {}
-    known_keys = {
-        "input_csvs_folder",
-        "result_folder",
-        "structure_prediction",
-        "input_structures_folder",
-        "calculate_descriptors",
-        "predefined_descriptors",
-        "csv_features",
-        "exclude_datasets",
-        "split_randomly",
-        "automl",
-        "structures_processing",
-        "n_cpu",
-        "cleanup",
-        "descriptor_batch_size",
-        "include_features",
-    }
-    for k, v in raw.items():
-        if k not in known_keys:
-            extra_root_keys[k] = v
-
-    calc_desc = raw.get("calculate_descriptors", True)
-    is_scenario3 = (raw.get("automl") is False)
-    split_randomly = _parse_dataset_stem_set(
-        raw.get("split_randomly"), field_name="split_randomly"
-    )
-    exclude_stems = _parse_dataset_stem_set(
-        raw.get("exclude_datasets"), field_name="exclude_datasets"
-    )
-    include_features = _parse_include_features(raw.get("include_features"))
+    calc_desc = bool(manifest.descriptors.enabled)
+    is_scenario3 = not bool(manifest.automl.enabled)
+    split_randomly = {Path(s).stem for s in manifest.inputs.split_randomly}
+    exclude_stems = {Path(s).stem for s in manifest.inputs.exclude_datasets}
+    include_features = list(manifest.descriptors.include_features)
     if exclude_stems & split_randomly:
         print(
             "Warning: exclude_datasets and split_randomly overlap on "
@@ -599,40 +508,31 @@ def load_generic_config(config_path: Path, repo_root: Path, *, resume: bool = Fa
             file=sys.stderr,
         )
 
-    for _dep_key in ("stability_targets", "stability_features"):
-        if _dep_key in raw:
-            print(
-                f"Warning: {_dep_key} in {cfg_path.name} is ignored "
-                "(all developability groups are used for every target).",
-                file=sys.stderr,
-            )
-
-    input_csvs = raw.get("input_csvs_folder")
-    input_structures = raw.get("input_structures_folder")
-    result_folder = raw.get("result_folder")
-    if not result_folder:
-        raise SystemExit("result_folder is required")
-    if not input_csvs and not input_structures:
+    datasets_dir = manifest.inputs.datasets_dir
+    structures_dir = manifest.inputs.structures_dir
+    predefined_dir = manifest.inputs.predefined_descriptors_dir
+    if datasets_dir is None and structures_dir is None:
         raise SystemExit(
-            "config must set input_csvs_folder and/or input_structures_folder"
+            "config must set inputs.datasets_dir and/or inputs.structures_dir"
         )
 
     if not resume:
-        _ensure_result_folder_absent(repo_root, str(result_folder), config_path=cfg_path)
+        _ensure_output_dir_absent(output_dir, config_path=cfg_path)
 
-    if not input_csvs:
+    splits_dir = output_dir / "splits"
+    source_config = _rel(repo_root, cfg_path)
+    output_dir_s = str(output_dir)
+    result_name = _rel(repo_root, output_dir)
+
+    if datasets_dir is None:
         if not calc_desc:
             raise SystemExit(
-                "structures-only config requires calculate_descriptors "
-                "(use predefined_descriptors with input_csvs_folder for AutoML-only runs)"
+                "structures-only config requires descriptors.enabled "
+                "(use inputs.predefined_descriptors_dir with datasets for AutoML-only runs)"
             )
-        if not input_structures:
-            raise SystemExit(
-                "input_structures_folder is required when input_csvs_folder is omitted"
-            )
-        structures_path = _resolve_path(repo_root, str(input_structures))
+        structures_path = Path(structures_dir).resolve()
         if not structures_path.is_dir():
-            raise SystemExit(f"input_structures_folder not found: {structures_path}")
+            raise SystemExit(f"inputs.structures_dir not found: {structures_path}")
 
         structure_runs = [
             {
@@ -641,15 +541,16 @@ def load_generic_config(config_path: Path, repo_root: Path, *, resume: bool = Fa
             }
             for folder in _discover_structure_only_jobs(structures_path)
         ]
-        if raw.get("automl") is True:
+        if manifest.automl.enabled:
             print(
                 "Warning: structures-only config cannot run AutoML without CSV datasets; "
                 "skipping AutoML.",
                 file=sys.stderr,
             )
         return {
-            "source_config": _rel(repo_root, cfg_path),
-            "result_name": str(result_folder).strip(),
+            "source_config": source_config,
+            "output_dir": output_dir_s,
+            "result_name": result_name,
             "calculate_descriptors": True,
             "structures_only": True,
             "uses_existing_structures": True,
@@ -662,18 +563,17 @@ def load_generic_config(config_path: Path, repo_root: Path, *, resume: bool = Fa
             "include_features": include_features,
         }
 
-    input_csvs_path = _resolve_path(repo_root, str(input_csvs))
+    input_csvs_path = Path(datasets_dir).resolve()
     if not input_csvs_path.is_dir():
-        raise SystemExit(f"input_csvs_folder not found: {input_csvs_path}")
+        raise SystemExit(f"inputs.datasets_dir not found: {input_csvs_path}")
+    input_csvs_rel = _rel(repo_root, input_csvs_path)
 
-    splits_dir = repo_root / str(result_folder).strip() / "splits"
-    pred_desc = _predefined_descriptors_config_block(raw)
-    if pred_desc is not None:
+    if predefined_dir is not None:
+        pred_desc = {"folder": _rel(repo_root, Path(predefined_dir).resolve())}
         _, predefined_runs = _load_predefined_descriptor_runs(
             pred_desc,
             input_csvs_path=input_csvs_path,
-            input_csvs=str(input_csvs),
-            result_folder=str(result_folder).strip(),
+            input_csvs=input_csvs_rel,
             splits_dir=splits_dir,
             repo_root=repo_root,
             is_scenario3=is_scenario3,
@@ -681,9 +581,10 @@ def load_generic_config(config_path: Path, repo_root: Path, *, resume: bool = Fa
             exclude_stems=exclude_stems,
         )
         return {
-            "source_config": _rel(repo_root, cfg_path),
-            "input_csvs_folder": _rel(repo_root, input_csvs_path),
-            "result_name": str(result_folder).strip(),
+            "source_config": source_config,
+            "input_csvs_folder": input_csvs_rel,
+            "output_dir": output_dir_s,
+            "result_name": result_name,
             "calculate_descriptors": False,
             "uses_predefined_descriptors": True,
             "extra_root_keys": extra_root_keys,
@@ -694,157 +595,141 @@ def load_generic_config(config_path: Path, repo_root: Path, *, resume: bool = Fa
             "include_features": include_features,
         }
 
-    if calc_desc:
-        csv_files = _filter_csv_files(
-            sorted(input_csvs_path.glob("*.csv")),
-            exclude_stems,
+    if not calc_desc:
+        raise SystemExit(
+            "descriptors.enabled is false; set inputs.predefined_descriptors_dir "
+            "for AutoML-only runs (subfolders with features.csv or results/*.json, "
+            "or flat {dataset}{suffix}.csv)."
         )
-        if not csv_files:
-            raise SystemExit(
-                f"No *.csv files to process in {input_csvs_path} "
-                f"(all datasets excluded or folder empty)"
-            )
 
-        _validate_input_csvs(csv_files)
+    csv_files = _filter_csv_files(
+        sorted(input_csvs_path.glob("*.csv")),
+        exclude_stems,
+    )
+    if not csv_files:
+        raise SystemExit(
+            f"No *.csv files to process in {input_csvs_path} "
+            f"(all datasets excluded or folder empty)"
+        )
 
-        if input_structures:
-            structures_path = _resolve_path(repo_root, str(input_structures))
-            if not structures_path.is_dir():
-                raise SystemExit(f"input_structures_folder not found: {structures_path}")
+    _validate_input_csvs(csv_files)
 
-            splits_dir = repo_root / str(result_folder).strip() / "splits"
-            structure_runs = []
-            for csv_file in csv_files:
-                stem = csv_file.stem
-                matched_folders = _discover_structure_folders(structures_path, stem)
-                if not matched_folders:
-                    raise SystemExit(
-                        f"No structure folders for dataset {stem} under {structures_path} "
-                        f"(expected a folder named {stem} or {stem}_<suffix>)"
-                    )
+    if structures_dir is not None:
+        structures_path = Path(structures_dir).resolve()
+        if not structures_path.is_dir():
+            raise SystemExit(f"inputs.structures_dir not found: {structures_path}")
 
-                names = _read_csv_names(csv_file)
-                info = _parse_csv_info(csv_file)
-                split_info = _resolve_cv_split(
-                    csv_file,
-                    stem,
-                    splits_dir,
-                    str(input_csvs),
-                    repo_root,
-                    is_scenario3=is_scenario3,
-                    split_randomly=split_randomly,
-                    info=info,
-                )
-                for folder in matched_folders:
-                    _validate_structure_folder(folder, names, csv_file)
-                    structure_runs.append(
-                        {
-                            "stem": stem,
-                            "folder_name": folder.name,
-                            "structure_dir": _rel(repo_root, folder),
-                            **split_info,
-                        }
-                    )
-
-            return {
-                "source_config": _rel(repo_root, cfg_path),
-                "input_csvs_folder": _rel(repo_root, input_csvs_path),
-                "result_name": str(result_folder).strip(),
-                "calculate_descriptors": True,
-                "uses_existing_structures": True,
-                "input_structures_folder": _rel(repo_root, structures_path),
-                "extra_root_keys": extra_root_keys,
-                "structure_runs": structure_runs,
-                "is_scenario3": is_scenario3,
-                "split_randomly": split_randomly,
-                "exclude_stems": exclude_stems,
-                "include_features": include_features,
-            }
-
-        sp = raw.get("structure_prediction") or {}
-        if sp is not None and not isinstance(sp, dict):
-            raise SystemExit("structure_prediction must be a mapping")
-
-        models = _parse_structure_models(sp.get("model"))
-
-        if sp.get("runs") not in (None, "", 1, "1"):
-            print(
-                "Note: structure_prediction.runs is ignored; "
-                "each sequence is predicted once. "
-                "Use structures_processing.minimize_attempts for minimization retries.",
-                file=sys.stderr,
-            )
-
-        # FlashABB is efficient at larger batches; use 50 as default vs 4 for ABB2/ABB3.
-        _batch_size_default = 50 if models == ["flashabb"] else 4
-        batch_size = int(sp.get("batch_size") or _batch_size_default)
-        if batch_size < 1:
-            raise SystemExit("structure_prediction.batch_size must be >= 1")
-
-        _device_raw = sp.get("device")
-        if _device_raw is None:
-            device = "cuda:0"
-        elif isinstance(_device_raw, int):
-            device = f"cuda:{_device_raw}"
-        else:
-            _device_text = str(_device_raw).strip()
-            if not _device_text:
-                device = "cuda:0"
-            elif _device_text.startswith("cuda:") or _device_text == "cpu":
-                device = _device_text
-            elif _device_text.isdigit():
-                device = f"cuda:{_device_text}"
-            else:
-                device = _device_text
-
-        splits_dir = repo_root / str(result_folder).strip() / "splits"
-        dataset_runs = []
+        structure_runs = []
         for csv_file in csv_files:
+            stem = csv_file.stem
+            matched_folders = _discover_structure_folders(structures_path, stem)
+            if not matched_folders:
+                raise SystemExit(
+                    f"No structure folders for dataset {stem} under {structures_path} "
+                    f"(expected a folder named {stem} or {stem}_<suffix>)"
+                )
+
+            names = _read_csv_names(csv_file)
             info = _parse_csv_info(csv_file)
             split_info = _resolve_cv_split(
                 csv_file,
-                csv_file.stem,
+                stem,
                 splits_dir,
-                str(input_csvs),
+                input_csvs_rel,
                 repo_root,
                 is_scenario3=is_scenario3,
                 split_randomly=split_randomly,
                 info=info,
             )
-            dataset_runs.append({"stem": csv_file.stem, **split_info})
+            for folder in matched_folders:
+                _validate_structure_folder(folder, names, csv_file)
+                structure_runs.append(
+                    {
+                        "stem": stem,
+                        "folder_name": folder.name,
+                        "structure_dir": _rel(repo_root, folder),
+                        **split_info,
+                    }
+                )
 
         return {
-            "source_config": _rel(repo_root, cfg_path),
-            "input_csvs_folder": _rel(repo_root, input_csvs_path),
-            "result_name": str(result_folder).strip(),
+            "source_config": source_config,
+            "input_csvs_folder": input_csvs_rel,
+            "output_dir": output_dir_s,
+            "result_name": result_name,
             "calculate_descriptors": True,
-            "uses_existing_structures": False,
+            "uses_existing_structures": True,
+            "input_structures_folder": _rel(repo_root, structures_path),
             "extra_root_keys": extra_root_keys,
-            "dataset_runs": dataset_runs,
+            "structure_runs": structure_runs,
             "is_scenario3": is_scenario3,
             "split_randomly": split_randomly,
             "exclude_stems": exclude_stems,
             "include_features": include_features,
-            "structure_prediction": {
-                "model": models,
-                "device": device,
-                "batch_size": batch_size,
-            },
         }
-    else:
-        raise SystemExit(
-            "calculate_descriptors is False; set predefined_descriptors for AutoML-only runs "
-            "(subfolders with features.csv or results/*.json, or flat {dataset}{suffix}.csv)."
+
+    models = list(manifest.structure_prediction.model) or ["abb2"]
+    batch_size = manifest.structure_prediction.batch_size
+    if batch_size is None:
+        batch_size = 50 if models == ["flashabb"] else 4
+    if int(batch_size) < 1:
+        raise SystemExit("structure_prediction.batch_size must be >= 1")
+    device = str(manifest.structure_prediction.device or "cuda:0")
+
+    dataset_runs = []
+    for csv_file in csv_files:
+        info = _parse_csv_info(csv_file)
+        split_info = _resolve_cv_split(
+            csv_file,
+            csv_file.stem,
+            splits_dir,
+            input_csvs_rel,
+            repo_root,
+            is_scenario3=is_scenario3,
+            split_randomly=split_randomly,
+            info=info,
         )
+        dataset_runs.append({"stem": csv_file.stem, **split_info})
+
+    return {
+        "source_config": source_config,
+        "input_csvs_folder": input_csvs_rel,
+        "output_dir": output_dir_s,
+        "result_name": result_name,
+        "calculate_descriptors": True,
+        "uses_existing_structures": False,
+        "extra_root_keys": extra_root_keys,
+        "dataset_runs": dataset_runs,
+        "is_scenario3": is_scenario3,
+        "split_randomly": split_randomly,
+        "exclude_stems": exclude_stems,
+        "include_features": include_features,
+        "structure_prediction": {
+            "model": models,
+            "device": device,
+            "batch_size": int(batch_size),
+            "runs": int(manifest.structure_prediction.runs),
+        },
+    }
 
 
-def build_run_config(generic: dict[str, Any], repo_root: Path) -> dict[str, dict[str, str]]:
-    run_config = {}
+def load_generic_config(config_path: Path, repo_root: Path, *, resume: bool = False) -> dict[str, Any]:
+    from kitab.config import load_manifest
+
+    return prepare_from_manifest(
+        load_manifest(config_path, repo_root=repo_root),
+        resume=resume,
+    )
+
+
+def build_run_config(generic: dict[str, Any], repo_root: Path) -> dict[str, Any]:
+    run_config: dict[str, Any] = {}
 
     for k, v in generic.get("extra_root_keys", {}).items():
         run_config[k] = v
 
     is_scenario3 = generic.get("is_scenario3", False)
+    output_dir = Path(generic["output_dir"])
 
     def _apply_automl_fields(block: dict, run_info: dict) -> None:
         block["name_col"] = "name"
@@ -861,8 +746,11 @@ def build_run_config(generic: dict[str, Any], repo_root: Path) -> dict[str, dict
             block["n_splits"] = 5
             block["random_seeds"] = run_info["random_seeds"]
 
+    def _automl_root() -> str:
+        return _rel(repo_root, output_dir / "automl")
+
     if not generic.get("calculate_descriptors", True):
-        run_config["batch_result_root"] = f"{generic['result_name']}/automl"
+        run_config["batch_result_root"] = _automl_root()
         for run in generic["predefined_runs"]:
             block: dict[str, Any] = {
                 "path": run["csv_path"],
@@ -873,7 +761,7 @@ def build_run_config(generic: dict[str, Any], repo_root: Path) -> dict[str, dict
             run_config[run["key"]] = block
         return run_config
 
-    descriptors_root = repo_root / generic["result_name"] / "descriptors"
+    descriptors_root = output_dir / "descriptors"
 
     if generic.get("structures_only"):
         for run_info in generic["structure_runs"]:
@@ -886,7 +774,7 @@ def build_run_config(generic: dict[str, Any], repo_root: Path) -> dict[str, dict
             }
         return run_config
 
-    run_config["batch_result_root"] = f"{generic['result_name']}/automl"
+    run_config["batch_result_root"] = _automl_root()
 
     if generic.get("uses_existing_structures"):
         for run_info in generic["structure_runs"]:
@@ -904,35 +792,37 @@ def build_run_config(generic: dict[str, Any], repo_root: Path) -> dict[str, dict
         return run_config
 
     models = _parse_structure_models(generic["structure_prediction"]["model"])
-    structures_root = repo_root / generic["result_name"] / "structures"
+    structures_root = output_dir / "structures"
+    n_runs = int(generic["structure_prediction"].get("runs") or 1)
+    if n_runs < 1:
+        raise SystemExit("structure_prediction.runs must be >= 1")
 
     for run_info in generic["dataset_runs"]:
         stem = run_info["stem"]
         for model in models:
-            key = f"{stem}_{model}_1"
-            block = {
-                "path": run_info["csv_path"],
-                "structure_dir": _rel(repo_root, structures_root / key),
-                "developability_results_path": _rel(
-                    repo_root, descriptors_root / key / "results"
-                ),
-            }
-            if not is_scenario3:
-                _apply_automl_fields(block, run_info)
-            run_config[key] = block
+            for run_i in range(1, n_runs + 1):
+                key = f"{stem}_{model}_{run_i}"
+                block = {
+                    "path": run_info["csv_path"],
+                    "structure_dir": _rel(repo_root, structures_root / key),
+                    "developability_results_path": _rel(
+                        repo_root, descriptors_root / key / "results"
+                    ),
+                }
+                if not is_scenario3:
+                    _apply_automl_fields(block, run_info)
+                run_config[key] = block
     return run_config
 
 
 def write_run_config(
-    run_config: dict[str, dict[str, str]],
-    repo_root: Path,
-    result_name: str,
+    run_config: dict[str, Any],
+    out_path: Path,
     source_config: str,
 ) -> Path:
     yaml = _require_yaml()
-    out_dir = repo_root / "run_configs"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{result_name}.yaml"
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(
         f"# Generated by kitab.sh from {source_config}\n"
         + yaml.safe_dump(run_config, sort_keys=False, default_flow_style=False)
@@ -942,24 +832,24 @@ def write_run_config(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="expand a generic kitAb config into a run-specific config"
+        description="expand a kitAb manifest into a run-specific config"
     )
-    parser.add_argument("config", type=Path, help="Generic config (e.g. configs/scenario1.yaml)")
+    parser.add_argument("config", type=Path, help="kitAb YAML (e.g. configs/scenario1.yaml)")
     parser.add_argument("--repo-root", type=Path, required=True)
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Skip the result_folder-already-exists guard (for resuming interrupted runs)",
+        help="Skip the output_dir-already-exists guard (for resuming interrupted runs)",
     )
     args = parser.parse_args()
 
     repo_root = args.repo_root.resolve()
     generic = load_generic_config(args.config, repo_root, resume=args.resume)
     run_config = build_run_config(generic, repo_root)
+    slug = Path(generic["output_dir"]).name
     out_path = write_run_config(
         run_config,
-        repo_root,
-        generic["result_name"],
+        repo_root / "run_configs" / f"{slug}.yaml",
         generic["source_config"],
     )
     print(out_path)

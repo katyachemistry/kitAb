@@ -49,11 +49,9 @@ Options for CONFIG.yaml mode:
   --techniques LIST     Comma-separated: elasticnet,intercorr_svm,sfs_svm,sfs_knn
   --cv-mode MODE        nested (default) or flat
   --no-final-model      Compare techniques without saving estimator.joblib
-  --output-dir DIR      Override run.output_dir / result_folder
+  --output-dir DIR      Override run.output_dir
   --cpus N              Override CPU count (AutoML worker pool)
   --device DEV          Override structure_prediction.device
-  --no-clean-batch      Kept for compatibility (no longer required)
-  --clean-external-outputs  Kept for compatibility (use descriptors.cleanup)
   -h, --help
 EOF
 }
@@ -117,14 +115,6 @@ while [[ $# -gt 0 ]]; do
         --device)
             DEVICE="${2:?}"
             shift 2
-            ;;
-        --no-clean-batch|--clean-external-outputs)
-            echo "[kitab] note: $1 is accepted for compatibility; prefer manifest fields." >&2
-            shift
-            ;;
-        --enable-tuning)
-            echo "[kitab] warning: --enable-tuning is no longer used; the winning technique is always refit unless --no-final-model is set." >&2
-            shift
             ;;
         --)
             shift

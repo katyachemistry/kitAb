@@ -11,7 +11,7 @@ import sys
 import tempfile
 from collections import OrderedDict
 from collections.abc import Iterable
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -647,6 +647,33 @@ def write_report(report_path: Path, rows: List[dict]) -> None:
             writer.writerow(row)
 
 
+def _renumber_one(task: tuple) -> dict:
+    structure_path, out_path, selected_chains, allow_partial, overwrite = task
+    try:
+        _old_to_new, chain_rows = renumber_structure_file(
+            structure_path,
+            out_path,
+            selected_chains=selected_chains,
+            allow_partial=allow_partial,
+            overwrite=overwrite,
+        )
+        return {
+            "ok": True,
+            "structure_path": structure_path,
+            "out_path": out_path,
+            "chain_rows": chain_rows,
+            "message": "",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "structure_path": structure_path,
+            "out_path": out_path,
+            "chain_rows": [],
+            "message": str(exc),
+        }
+
+
 def main_renumber(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Renumber antibody PDB/mmCIF structures to IMGT numbering with ANARCI."
@@ -707,6 +734,13 @@ def main_renumber(argv: Optional[List[str]] = None) -> int:
         default=None,
         help="Optional TSV report path.",
     )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        metavar="J",
+        help="Parallel workers (default: 1).",
+    )
 
     args = parser.parse_args(argv)
 
@@ -722,10 +756,9 @@ def main_renumber(argv: Optional[List[str]] = None) -> int:
         print("No PDB/mmCIF files found.", file=sys.stderr)
         return 2
 
-    all_report_rows: List[dict] = []
-    n_ok = 0
-    n_fail = 0
-
+    n_jobs = max(1, int(args.jobs))
+    n_jobs = min(n_jobs, len(structures))
+    tasks = []
     for structure_path in structures:
         out_path = choose_output_path(
             input_structure=structure_path,
@@ -733,40 +766,54 @@ def main_renumber(argv: Optional[List[str]] = None) -> int:
             out_dir=args.out_dir.resolve() if args.out_dir is not None else None,
             suffix=args.suffix,
         )
-
-        try:
-            _old_to_new, chain_rows = renumber_structure_file(
+        tasks.append(
+            (
                 structure_path,
                 out_path,
-                selected_chains=args.chains,
-                allow_partial=args.allow_partial_domain,
-                overwrite=args.overwrite,
+                args.chains,
+                args.allow_partial_domain,
+                args.overwrite,
             )
-            n_ok += 1
-            print(f"OK\t{structure_path}\t->\t{out_path}")
+        )
 
-            for row in chain_rows:
+    all_report_rows: List[dict] = []
+    n_ok = 0
+    n_fail = 0
+
+    def _consume(result: dict) -> None:
+        nonlocal n_ok, n_fail
+        if result["ok"]:
+            n_ok += 1
+            print(f"OK\t{result['structure_path']}\t->\t{result['out_path']}")
+            for row in result["chain_rows"]:
                 row.update(
                     {
                         "status": "ok",
-                        "output_pdb": str(out_path),
+                        "output_pdb": str(result["out_path"]),
                         "message": "",
                     }
                 )
                 all_report_rows.append(row)
+            return
+        n_fail += 1
+        print(f"FAIL\t{result['structure_path']}\t{result['message']}", file=sys.stderr)
+        all_report_rows.append(
+            {
+                "status": "fail",
+                "pdb": str(result["structure_path"]),
+                "output_pdb": str(result["out_path"]),
+                "message": result["message"],
+            }
+        )
 
-        except Exception as exc:
-            n_fail += 1
-            msg = str(exc)
-            print(f"FAIL\t{structure_path}\t{msg}", file=sys.stderr)
-            all_report_rows.append(
-                {
-                    "status": "fail",
-                    "pdb": str(structure_path),
-                    "output_pdb": str(out_path),
-                    "message": msg,
-                }
-            )
+    if n_jobs == 1:
+        for task in tasks:
+            _consume(_renumber_one(task))
+    else:
+        with ThreadPoolExecutor(max_workers=n_jobs) as pool:
+            futures = [pool.submit(_renumber_one, task) for task in tasks]
+            for fut in as_completed(futures):
+                _consume(fut.result())
 
     if args.report is not None:
         write_report(args.report, all_report_rows)
@@ -1274,6 +1321,8 @@ def _run_minimize_cli(rest: list[str]) -> None:
     if staging.is_dir():
         shutil.rmtree(staging)
         print(f"Removed minimization staging: {staging}", flush=True)
+    if n_fail:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

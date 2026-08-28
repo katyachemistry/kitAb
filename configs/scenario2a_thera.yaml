@@ -1,24 +1,24 @@
-# Scenario 2a: descriptors only on existing structures (no CSV datasets, no AutoML).
-# input_structures_folder: /storage/antibody_data/PairedStructures/structures
-input_structures_folder: /storage/antibody_data/PairedStructures/structures_thera
+# Descriptors only on existing TheraSAbDab structures (no CSVs, no AutoML).
+inputs:
+  structures_dir: /storage/antibody_data/PairedStructures/structures_thera
 
-result_folder: thera_sabdab_742_structures
+run:
+  output_dir: thera_sabdab_742_structures
+  n_cpu: 56
 
-n_cpu: 56
+structure_prediction:
+  enabled: false
 
-structures_processing:
-  renumber_imgt: False
-  minimize: False
+structure_processing:
+  enabled: false
+  renumber_imgt: false
+  minimize: false
+  minimize_attempts: 5
 
-# Delete per-structure intermediate files (dssp/, propka/, sasa/) immediately
-# after each structure's descriptor JSON is successfully written.
-# Strongly recommended for large batches to avoid excessive disk usage.
-cleanup: true
+descriptors:
+  enabled: true
+  cleanup: true
+  # omit batch_size to process all structures in one pass (~700)
 
-# Split the flat structures folder into chunks of this size for descriptor
-# calculation.  Each chunk is processed through all four pipeline stages
-# (DSSP → PropKa → FreeSASA → descriptors) before moving to the next one.
-# This bounds peak memory use and keeps intermediate file counts manageable.
-# Set to 0 (or omit) to process everything in a single pass.
-# Recommended for > 500 000 structures: 50000–100000.
-descriptor_batch_size: 0
+automl:
+  enabled: false

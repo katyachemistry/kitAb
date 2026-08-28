@@ -29,10 +29,29 @@ from automl.feature_selectors import (
 )
 from utils.assign_sequence_folds import BALANCE_RATIO
 from automl.pipeline_defaults import DEFAULT_FEATURES_FRAC, DEFAULT_RANDOM_STATE
-from analysis.features import normalize_feature_name
 from utils.load_results_to_dataframe import load_json_results
 
 FEATURES_CSV_FILENAME = "features.csv"
+
+# Strip these prefixes so descriptor JSON keys and CSV `feature_*` columns
+# share one name in fold parquets. `core_` is a JSON group but is not stripped.
+_FEATURE_NAME_PREFIX = "feature_"
+_FEATURE_JSON_GROUP_PREFIXES: tuple[str, ...] = (
+    "surface",
+    "general",
+    "sequence_motives",
+)
+
+
+def normalize_feature_name(name: str) -> str:
+    n = str(name).strip()
+    if n.startswith(_FEATURE_NAME_PREFIX):
+        n = n[len(_FEATURE_NAME_PREFIX) :]
+    for group in _FEATURE_JSON_GROUP_PREFIXES:
+        prefix = f"{group}_"
+        if n.startswith(prefix):
+            return n[len(prefix) :]
+    return n
 
 
 def drop_invalid_target_rows(

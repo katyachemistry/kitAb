@@ -2,7 +2,7 @@
 # Predict structures from CSVs (name, heavy, light); output structures/<stem>_abb3_<n>, _abb2_<n>, or _flashabb_<n>.
 # Usage: predict_structure.sh [--abb3|--abb2|--flashabb] [--data-dir DIR] [--output-root DIR] [--runs N]
 #   [--skip-existing] [--no-renumber] [--no-minimize] [--minimize-jobs N]
-#   [--renumber-only|--minimization-only] [--structures-dir DIR] [--allow-partial-domain]
+#   [--renumber-jobs N] [--renumber-only|--minimization-only] [--structures-dir DIR] [--allow-partial-domain]
 #
 # Prediction uses only the selected backend conda env. IMGT numbering and OpenMM
 # minimization always use the core kitab env (openmm 8.4 / pdbfixer 1.12 / anarci).
@@ -55,6 +55,7 @@ RENUMBER_ONLY=0
 STRUCTURES_DIRS=()
 ALLOW_PARTIAL_DOMAIN=0
 MINIMIZE_JOBS=8
+RENUMBER_JOBS=8
 IN_PLACE=0
 
 while [[ $# -gt 0 ]]; do
@@ -146,6 +147,14 @@ while [[ $# -gt 0 ]]; do
             MINIMIZE_JOBS="$2"
             shift 2
             ;;
+        --renumber-jobs)
+            if [[ $# -lt 2 ]]; then
+                echo "missing value for --renumber-jobs" >&2
+                exit 1
+            fi
+            RENUMBER_JOBS="$2"
+            shift 2
+            ;;
         --in-place)
             IN_PLACE=1
             shift
@@ -173,6 +182,11 @@ fi
 
 if ! [[ "$MINIMIZE_JOBS" =~ ^[1-9][0-9]*$ ]]; then
     echo "--minimize-jobs must be a positive integer (got: $MINIMIZE_JOBS)" >&2
+    exit 1
+fi
+
+if ! [[ "$RENUMBER_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "--renumber-jobs must be a positive integer (got: $RENUMBER_JOBS)" >&2
     exit 1
 fi
 
@@ -273,7 +287,7 @@ run_renumber() {
     else
         echo "IMGT renumber: $input_dir -> $out_dir"
     fi
-    local extra=(--out-dir "$out_dir" --overwrite)
+    local extra=(--out-dir "$out_dir" --overwrite --jobs "$RENUMBER_JOBS")
     if [[ "$ALLOW_PARTIAL_DOMAIN" -eq 1 ]]; then
         extra+=(--allow-partial-domain)
     fi

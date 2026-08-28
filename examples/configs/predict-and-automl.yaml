@@ -1,4 +1,4 @@
-# Sequences -> structure prediction -> descriptors -> AutoML (no tuning by default)
+# Sequences -> structure prediction -> descriptors -> AutoML
 inputs:
   datasets_dir: datasets                 # CSVs with name, heavy, light, target_*
   split_randomly: [ab21]                 # random 5-fold CV for these stems (skip MMseqs2)
@@ -6,12 +6,15 @@ inputs:
 run:
   output_dir: runs/example_predict_automl  # all generated files go here
   resume: false                            # false aborts if output_dir has files; true continues it and skips finished descriptor JSONs
+  n_cpu: 8                                 # descriptors, IMGT, OpenMM, AutoML (override with --cpus)
 
 structure_prediction:
   enabled: true                          # predict structures from sequences
   model: abb2                            # one or more of abb2, abb3, flashabb — e.g. [abb2, abb3]
   device: cuda:0
-  skip_existing: true                    # skip PDBs already in this run (output_dir/structures/{dataset}_{model}_1/{name}.pdb); does not use structures_dir
+  # batch_size: 4                        # GPU sequences per forward (default: 50 flashabb, 4 abb2/abb3)
+  skip_existing: true                    # skip PDBs already in this run (output_dir/structures/{dataset}_{model}_{run}/{name}.pdb); does not use structures_dir
+  runs: 1                                # independent predictions per sequence (paper used 3; folders _1, _2, _3)
 
 structure_processing:
   enabled: false                         # IMGT renumber / OpenMM minimize

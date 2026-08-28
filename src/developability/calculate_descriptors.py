@@ -333,17 +333,6 @@ def main():
         )
         number_of_salt_bridges = len(salt_bridges)
 
-        # avg_salt_cdr_vicinity_over_cdr_vicinity = calculate_salt_bridge_density_average(
-        #     args.pdb_file,
-        #     args.sasa_file,
-        #     args.pka_file,
-        #     pH=args.pH,
-        #     residues_for_density=cdr_vicinity_keys,
-        #     residues_for_average=cdr_vicinity_keys,
-        #     salt_bridges=salt_bridges,
-        #     allowed_chains=allowed_chains,
-        # )
-
         avg_hbond_energy = calculate_hbond_energy_density_dssp_backbone_only_average(
             args.pdb_file,
             args.sasa_file,
@@ -636,16 +625,12 @@ def main():
                     "neg_patch_cdr": neg_patch_area_cdr,
                     "nonpolar_patch_cdr": hyd_patch_area_cdr,
                     **total_side_abs_sums,
-                    # "freesasa_nonpolar_asa_total": hyd_asa_total,
-                    # "freesasa_polar_asa_total": hph_asa_total,
                     "aro_exposure_cdr": sum_aromatic_weighted_rel_side_asa_cdr_vicinity,
                     "nonpolar_exposure_cdr": sum_hydrophobic_weighted_rel_side_asa_cdr_vicinity,
                     "neg_exposure_cdr": sum_negative_weighted_rel_side_asa_cdr_vicinity,
                     "pos_exposure_cdr": sum_positive_weighted_rel_side_asa_cdr_vicinity,
                     "exposure_weighted_hyd_score_cdr": avg_kd_times_total_side_rel_cdr_vicinity_over_cdr_vicinity,
-                    # "exposure_weighted_salt_bridge_score_cdr": avg_salt_cdr_vicinity_over_cdr_vicinity,
                     "hbond_density_cdr": avg_hbond_cdr_vicinity,
-                    # "weighted_scm": weighted_scm_score_by_pH,
                     "scm_neg_ff19sb": scm_neg_ff19sb,
                     "scm_pos_ff19sb": scm_pos_ff19sb,
                     **{k: _scalar_or_dict_sum(v) for k, v in sap_scores.items()},
@@ -654,7 +639,6 @@ def main():
                     "hbond_energy_density": avg_hbond_energy_dssp_weighted,
                     "inter_chain_buried_sasa": inter_chain_buried_sasa,
                     "dipole_moment_ff19sb": dipole_moment_magnitude,
-                    # "net_charge_ff19sb": net_charge_ff19sb,
                     "net_charge_by_pH": net_charge_by_pH,
                     "protein_pi": protein_pi,
                     "cdr3_length": cdr3_length,
@@ -667,7 +651,6 @@ def main():
                     "fraction_pos_in_cdr": fraction_positive_in_cdr,
                     "fraction_neg_in_cdr": fraction_negative_in_cdr,
                     "fraction_gln_asn_in_cdr": fraction_gln_asn_in_cdr,
-                    # "fraction_tyr_in_cdr": fraction_tyr_in_cdr,
                 },
             }
         )
@@ -747,37 +730,6 @@ def main():
             sequence_motives["count_TyrTyr_cdr"] = count_motif_overlapping(
                 cdr_vicinity_frags_flat, "YY"
             )
-
-        #         sasa_residue = ctx.sasa_residue
-        #         if sasa_residue:
-        #             chain_side_sasa: Dict[str, List[float]] = {}
-        #             for ch, seq_ch, map_ch in chain_seqs_and_maps:
-        #                 inv_map = {idx: k for k, idx in map_ch.items()}
-        #                 arr = [0.0] * len(seq_ch)
-        #                 for i in range(len(seq_ch)):
-        #                     key4 = inv_map.get(i)
-        #                     if key4 is not None:
-        #                         arr[i] = float(residue_side_sasa(key4, sasa_residue))
-        #                 chain_side_sasa[ch] = arr
-        #
-        #             def _motif_side_asa_sum(motif: str) -> float:
-        #                 if not motif or len(motif) != 2:
-        #                     return 0.0
-        #                 a, b = motif[0], motif[1]
-        #                 total = 0.0
-        #                 for ch, seq_ch, _map_ch in chain_seqs_and_maps:
-        #                     if len(seq_ch) < 2:
-        #                         continue
-        #                     asa = chain_side_sasa.get(ch)
-        #                     if asa is None or len(asa) != len(seq_ch):
-        #                         continue
-        #                     for i in range(len(seq_ch) - 1):
-        #                         if seq_ch[i] == a and seq_ch[i + 1] == b:
-        #                             total += float(asa[i] + asa[i + 1])
-        #                 return float(total)
-        #
-        #             for motif, key in [("DD", "AspAsp"), ("DE", "AspGlu")]:
-        #                 sequence_motives[f"{key}_all_sasa"] = _motif_side_asa_sum(motif)
 
         def _sanitize_for_json(obj: Any) -> Any:
             if isinstance(obj, dict):

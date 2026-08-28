@@ -1,8 +1,8 @@
 # Reproduce paper results from existing ABB3 structures (descriptors → AutoML).
-# Requires datasets/ and structures_abb3_minimized/ under the repo root.
+# Requires datasets/ and structures_abb3/ under the repo root.
 inputs:
   datasets_dir: datasets
-  structures_dir: structures_abb3_minimized
+  structures_dir: structures_abb3
   split_randomly:
     - ab21
     - hutchinson2023enhancement_top200tm1_igg

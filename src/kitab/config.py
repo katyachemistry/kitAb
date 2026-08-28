@@ -22,8 +22,6 @@ KNOWN_TOP_KEYS = frozenset(
         "automl",
     }
 )
-# Accepted but unused (older YAMLs). workflow is mapped to section enabled flags.
-_IGNORED_TOP_KEYS = frozenset({"schema_version", "workflow", "tuning"})
 KNOWN_INPUT_KEYS = frozenset(
     {
         "datasets_dir",
@@ -34,10 +32,10 @@ KNOWN_INPUT_KEYS = frozenset(
     }
 )
 KNOWN_RUN_KEYS = frozenset(
-    {"output_dir", "resume", "n_cpu", "skip_existing_results", "result_folder"}
+    {"output_dir", "resume", "n_cpu", "skip_existing_results"}
 )
 KNOWN_PRED_KEYS = frozenset(
-    {"enabled", "model", "device", "batch_size", "skip_existing"}
+    {"enabled", "model", "device", "batch_size", "skip_existing", "runs"}
 )
 KNOWN_PROC_KEYS = frozenset(
     {"enabled", "renumber_imgt", "minimize", "minimize_attempts"}
@@ -192,6 +190,7 @@ class StructurePredictionConfig:
     device: str = "cuda:0"
     batch_size: int | None = None
     skip_existing: bool = True
+    runs: int = 1
 
 
 @dataclass
@@ -224,7 +223,6 @@ class AutomlConfig:
 @dataclass
 class Manifest:
     source_path: Path
-    legacy: bool
     repo_root: Path
     inputs: InputsConfig
     run: RunConfig
@@ -267,7 +265,6 @@ class Manifest:
 
         return {
             "source_path": str(self.source_path),
-            "legacy": self.legacy,
             "repo_root": str(self.repo_root),
             "warnings": list(self.warnings),
             "stage_graph": self.stage_graph(),
@@ -308,49 +305,6 @@ class Manifest:
             self.to_resolved_dict(), sort_keys=True, ensure_ascii=False
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _apply_deprecated_workflow(
-    workflow_raw: dict[str, Any],
-    pred_raw: dict[str, Any],
-    desc_raw: dict[str, Any],
-    automl_raw: dict[str, Any],
-    warnings: list[str],
-) -> None:
-    """Map old workflow.mode / enable_automl onto section enabled flags."""
-    if not workflow_raw:
-        return
-    warnings.append(
-        "The workflow: section is no longer used. Set enabled: true/false under "
-        "structure_prediction, descriptors, and automl instead."
-    )
-    mode = str(workflow_raw.get("mode") or "").strip().lower()
-    enable_automl = workflow_raw.get("enable_automl")
-    if enable_automl is None:
-        automl_default: bool | None = None
-    else:
-        automl_default = bool(enable_automl)
-    if mode == "predict":
-        pred_raw.setdefault("enabled", True)
-        desc_raw.setdefault("enabled", True)
-        automl_raw.setdefault("enabled", True if automl_default is None else automl_default)
-    elif mode == "structures":
-        pred_raw.setdefault("enabled", False)
-        desc_raw.setdefault("enabled", True)
-        automl_raw.setdefault("enabled", True if automl_default is None else automl_default)
-    elif mode == "descriptors":
-        pred_raw.setdefault("enabled", False)
-        desc_raw.setdefault("enabled", True)
-        automl_raw.setdefault("enabled", False)
-    elif mode == "automl":
-        pred_raw.setdefault("enabled", False)
-        desc_raw.setdefault("enabled", False)
-        automl_raw.setdefault("enabled", True)
-    elif mode:
-        warnings.append(
-            f"ignored unknown workflow.mode {mode!r}; "
-            "use structure_prediction.enabled / descriptors.enabled / automl.enabled"
-        )
 
 
 def _validate_techniques(raw: Any) -> list[str]:
@@ -421,7 +375,6 @@ def parse_manifest_dict(
     *,
     source_path: Path,
     repo_root: Path,
-    legacy: bool = False,
     warnings: list[str] | None = None,
     cli_overrides: dict[str, Any] | None = None,
 ) -> Manifest:
@@ -441,23 +394,13 @@ def parse_manifest_dict(
             issues.extend(exc.issues)
             return default
 
-    if not legacy:
-        note(
-            _unknown_keys(
-                raw,
-                KNOWN_TOP_KEYS | {"_legacy_raw"} | _IGNORED_TOP_KEYS,
-                "top-level",
-            )
-        )
+    note(_unknown_keys(raw, KNOWN_TOP_KEYS, "top-level"))
 
     warnings = list(warnings or [])
     overrides = dict(cli_overrides or {})
 
     inputs_raw = collect(lambda: _as_mapping(raw.get("inputs"), field_name="inputs"), {})
     run_raw = collect(lambda: _as_mapping(raw.get("run"), field_name="run"), {})
-    workflow_raw = collect(
-        lambda: _as_mapping(raw.get("workflow"), field_name="workflow"), {}
-    )
     pred_raw = collect(
         lambda: _as_mapping(
             raw.get("structure_prediction"), field_name="structure_prediction"
@@ -476,53 +419,21 @@ def parse_manifest_dict(
     automl_raw = collect(
         lambda: _as_mapping(raw.get("automl"), field_name="automl"), {}
     )
-    if raw.get("tuning") is not None:
-        warnings.append(
-            "The tuning: section is no longer used. kitAb fits the winning "
-            "technique on all data at the end of the automl stage and does not "
-            "search hyperparameters."
-        )
-    _ignored_automl_yaml = (
-        ("config_path", "automl.config_path is ignored; use src/automl.yaml (internal defaults)."),
+    _cli_owned_automl = (
         ("techniques", "automl.techniques is ignored; pass --techniques on the CLI."),
         ("cv_mode", "automl.cv_mode is ignored; pass --cv-mode on the CLI."),
         ("save_final_model", "automl.save_final_model is ignored; pass --no-final-model on the CLI."),
-        ("eval_models", "automl.eval_models is no longer used."),
     )
-    for key, msg in _ignored_automl_yaml:
+    for key, msg in _cli_owned_automl:
         if automl_raw.pop(key, None) is not None:
             warnings.append(msg)
 
-    _apply_deprecated_workflow(
-        workflow_raw, pred_raw, desc_raw, automl_raw, warnings
-    )
-
-    if pred_raw.pop("runs", None) is not None:
-        warnings.append(
-            "structure_prediction.runs is no longer used; each sequence is predicted once. "
-            "Use structure_processing.minimize_attempts for minimization retries."
-        )
-    if "allowed_suffixes" in inputs_raw:
-        warnings.append(
-            "inputs.allowed_suffixes is no longer used. Point "
-            "predefined_descriptors_dir at the descriptor folder; every subfolder "
-            "named {dataset} or {dataset}_... is used."
-        )
-        inputs_raw.pop("allowed_suffixes")
-    if desc_raw.pop("structures_layout", None) is not None:
-        warnings.append(
-            "descriptors.structures_layout is no longer used; "
-            "structure folders are discovered automatically "
-            "(subdirectories if present, otherwise the root folder)."
-        )
-
-    if not legacy:
-        note(_unknown_keys(inputs_raw, KNOWN_INPUT_KEYS, "inputs"))
-        note(_unknown_keys(run_raw, KNOWN_RUN_KEYS, "run"))
-        note(_unknown_keys(pred_raw, KNOWN_PRED_KEYS, "structure_prediction"))
-        note(_unknown_keys(proc_raw, KNOWN_PROC_KEYS, "structure_processing"))
-        note(_unknown_keys(desc_raw, KNOWN_DESC_KEYS, "descriptors"))
-        note(_unknown_keys(automl_raw, KNOWN_AUTOML_KEYS, "automl"))
+    note(_unknown_keys(inputs_raw, KNOWN_INPUT_KEYS, "inputs"))
+    note(_unknown_keys(run_raw, KNOWN_RUN_KEYS, "run"))
+    note(_unknown_keys(pred_raw, KNOWN_PRED_KEYS, "structure_prediction"))
+    note(_unknown_keys(proc_raw, KNOWN_PROC_KEYS, "structure_processing"))
+    note(_unknown_keys(desc_raw, KNOWN_DESC_KEYS, "descriptors"))
+    note(_unknown_keys(automl_raw, KNOWN_AUTOML_KEYS, "automl"))
 
     if overrides.get("output_dir") is not None:
         run_raw["output_dir"] = overrides["output_dir"]
@@ -553,13 +464,13 @@ def parse_manifest_dict(
 
     stages_override = collect(
         lambda: _as_str_list(
-            overrides.get("stages", workflow_raw.get("stages")),
+            overrides.get("stages"),
             field_name="stages",
         ),
         [],
     )
 
-    output_raw = run_raw.get("output_dir") or run_raw.get("result_folder")
+    output_raw = run_raw.get("output_dir")
     output_dir = _resolve_path(repo_root, str(output_raw) if output_raw else None)
     if output_dir is None:
         note("run.output_dir is required")
@@ -684,6 +595,15 @@ def parse_manifest_dict(
         ),
         True,
     )
+    pred_runs = collect(
+        lambda: _as_int(
+            pred_raw.get("runs"),
+            field_name="structure_prediction.runs",
+            default=1,
+            min_value=1,
+        ),
+        1,
+    )
 
     renumber_imgt = collect(
         lambda: _as_bool(
@@ -750,7 +670,6 @@ def parse_manifest_dict(
 
     manifest = Manifest(
         source_path=source_path.resolve(),
-        legacy=legacy,
         repo_root=repo_root.resolve(),
         inputs=InputsConfig(
             datasets_dir=datasets_dir,
@@ -771,6 +690,7 @@ def parse_manifest_dict(
             device=device,
             batch_size=pred_batch,
             skip_existing=skip_existing,
+            runs=pred_runs,
         ),
         structure_processing=StructureProcessingConfig(
             enabled=proc_enabled,
@@ -819,49 +739,18 @@ def load_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
-def is_legacy_config(raw: dict[str, Any]) -> bool:
-    legacy_keys = {
-        "input_csvs_folder",
-        "input_structures_folder",
-        "result_folder",
-        "predefined_descriptors",
-        "csv_features",
-        "structures_processing",
-        "calculate_descriptors",
-    }
-    modern = {"inputs", "run"}
-    if any(k in raw for k in modern) and "inputs" in raw:
-        return False
-    return any(k in raw for k in legacy_keys)
-
-
 def load_manifest(
     path: Path,
     *,
     repo_root: Path,
     cli_overrides: dict[str, Any] | None = None,
 ) -> Manifest:
-    from kitab.legacy import translate_legacy_config
-
     path = path.resolve()
     raw = load_yaml(path)
-    if is_legacy_config(raw):
-        translated, warnings = translate_legacy_config(
-            raw, source_path=path, repo_root=repo_root
-        )
-        return parse_manifest_dict(
-            translated,
-            source_path=path,
-            repo_root=repo_root,
-            legacy=True,
-            warnings=warnings,
-            cli_overrides=cli_overrides,
-        )
     return parse_manifest_dict(
         raw,
         source_path=path,
         repo_root=repo_root,
-        legacy=False,
         cli_overrides=cli_overrides,
     )
 
@@ -879,60 +768,3 @@ def write_resolved_manifest(manifest: Manifest, out_path: Path) -> Path:
     return out_path
 
 
-def _rel_or_abs(repo_root: Path, path: Path) -> str:
-    try:
-        return str(path.relative_to(repo_root))
-    except ValueError:
-        return str(path)
-
-
-def manifest_to_legacy_generic(manifest: Manifest) -> dict[str, Any]:
-    """Convert canonical manifest to legacy generic YAML for prepare_run_config."""
-    out: dict[str, Any] = {
-        "result_folder": _rel_or_abs(manifest.repo_root, manifest.run.output_dir),
-    }
-    if manifest.inputs.datasets_dir is not None:
-        out["input_csvs_folder"] = _rel_or_abs(
-            manifest.repo_root, manifest.inputs.datasets_dir
-        )
-    if manifest.inputs.structures_dir is not None:
-        out["input_structures_folder"] = _rel_or_abs(
-            manifest.repo_root, manifest.inputs.structures_dir
-        )
-    if manifest.inputs.predefined_descriptors_dir is not None:
-        out["predefined_descriptors"] = {
-            "folder": _rel_or_abs(
-                manifest.repo_root, manifest.inputs.predefined_descriptors_dir
-            ),
-        }
-        out["calculate_descriptors"] = False
-    if manifest.inputs.split_randomly:
-        out["split_randomly"] = list(manifest.inputs.split_randomly)
-    if manifest.inputs.exclude_datasets:
-        out["exclude_datasets"] = list(manifest.inputs.exclude_datasets)
-    if not manifest.automl.enabled:
-        out["automl"] = False
-    if manifest.run.n_cpu is not None:
-        out["n_cpu"] = manifest.run.n_cpu
-    if manifest.run.skip_existing_results:
-        out["skip_existing_results"] = True
-    if manifest.descriptors.include_features:
-        out["include_features"] = list(manifest.descriptors.include_features)
-    if manifest.descriptors.cleanup:
-        out["cleanup"] = True
-    if manifest.descriptors.batch_size is not None:
-        out["descriptor_batch_size"] = manifest.descriptors.batch_size
-    out["structures_processing"] = {
-        "renumber_imgt": manifest.structure_processing.renumber_imgt,
-        "minimize": manifest.structure_processing.minimize,
-    }
-    if manifest.structure_prediction.enabled:
-        sp: dict[str, Any] = {
-            "model": manifest.structure_prediction.model,
-            "device": manifest.structure_prediction.device,
-            "skip_existing": manifest.structure_prediction.skip_existing,
-        }
-        if manifest.structure_prediction.batch_size is not None:
-            sp["batch_size"] = manifest.structure_prediction.batch_size
-        out["structure_prediction"] = sp
-    return out

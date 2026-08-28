@@ -14,7 +14,6 @@ from kitab import stages
 def plan_text(manifest: Manifest) -> str:
     lines = [
         f"source: {manifest.source_path}",
-        f"legacy: {manifest.legacy}",
         f"mode: {manifest.mode}",
         f"output: {manifest.run.output_dir}",
         f"stages: {' -> '.join(manifest.stage_graph())}",
@@ -22,6 +21,9 @@ def plan_text(manifest: Manifest) -> str:
         f"techniques: {', '.join(manifest.automl.techniques)}",
         f"cv_mode: {manifest.automl.cv_mode}",
         f"save_final_model: {manifest.automl.save_final_model}",
+        f"structure_prediction.runs: {manifest.structure_prediction.runs}",
+        f"structure_prediction.batch_size: {manifest.structure_prediction.batch_size}",
+        f"run.n_cpu: {manifest.run.n_cpu}",
         f"minimize_attempts: {manifest.structure_processing.minimize_attempts}",
         f"propka_minimize_retries: {manifest.descriptors.propka_minimize_retries}",
     ]
@@ -74,7 +76,7 @@ def run_pipeline(manifest: Manifest) -> int:
     completeness: dict[str, bool] = {}
 
     try:
-        run_config, _generic = stages.prepare_internal_configs(manifest, logger)
+        run_config = stages.prepare_internal_configs(manifest, logger)
         graph = manifest.stage_graph()
 
         if "predict" in graph:
@@ -144,7 +146,6 @@ def run_pipeline(manifest: Manifest) -> int:
         "techniques": list(manifest.automl.techniques),
         "cv_mode": manifest.automl.cv_mode,
         "models_dir": str(out / "models") if batch_root is not None else None,
-        "legacy_config": manifest.legacy,
     }
     logger.write_summary(summary)
     logger.info(f"Done (exit_code={exit_code}). Logs: {logger.run_log}")

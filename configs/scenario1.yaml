@@ -1,13 +1,25 @@
-input_csvs_folder: datasets_example
+# Sequences -> structure prediction (ABB2) -> descriptors -> AutoML.
+inputs:
+  datasets_dir: datasets_example
+  split_randomly: [ab21]
 
-split_randomly: ab21.csv
-
-result_folder: scenario1_abb2
+run:
+  output_dir: scenario1_abb2
 
 structure_prediction:
-  model: abb2 # abb2
-  device: 1 # GPU index (0, 1, …) or cuda:0 / cpu
-  skip_existing: true # skip antibodies whose .pdb already exists (safe for pipeline restarts)
-  # batch_size: 4 # ABB3 mini-batch size (antibodies per forward pass); default 4; ignored by ABB2
+  enabled: true
+  model: abb2
+  device: cuda:1
+  skip_existing: true
 
-# n_cpu: 4 # number of CPUs to use for descriptors calculation and AutoML, default all available
+structure_processing:
+  enabled: false
+  renumber_imgt: false
+  minimize: false
+  minimize_attempts: 5
+
+descriptors:
+  enabled: true
+
+automl:
+  enabled: true

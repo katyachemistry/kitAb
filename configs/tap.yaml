@@ -1,10 +1,21 @@
-input_csvs_folder: datasets
-# exclude_datasets: ab21.csv
-split_randomly: ab21.csv,hutchinson2023enhancement_top200tm1_igg.csv,jetha2019homology_RT.csv,pdgf38.csv
+# AutoML on precomputed TAP descriptors.
+inputs:
+  datasets_dir: datasets
+  predefined_descriptors_dir: /storage/antibody_data/PairedStructures/kitAb/descriptors_tap
+  split_randomly:
+    - ab21
+    - hutchinson2023enhancement_top200tm1_igg
+    - jetha2019homology_RT
+    - pdgf38
 
-result_folder: tap_again
+run:
+  output_dir: tap_again
 
-# n_cpu: 4 # number of CPUs to use for descriptors calculation and AutoML, default all available
+structure_prediction:
+  enabled: false
 
-predefined_descriptors:
-  folder: /storage/antibody_data/PairedStructures/kitAb/descriptors_tap
+descriptors:
+  enabled: false
+
+automl:
+  enabled: true

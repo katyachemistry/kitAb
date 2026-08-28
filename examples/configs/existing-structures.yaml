@@ -1,12 +1,13 @@
 # Existing structures + assay CSVs -> descriptors -> AutoML
 inputs:
   datasets_dir: datasets                 # CSVs with name, heavy, light, target_*
-  structures_dir: structures_abb2        # existing PDB/mmCIF folders
+  structures_dir: structures_abb2        # existing PDB folders
   split_randomly: [ab21]                 # random 5-fold CV for these stems (skip MMseqs2)
 
 run:
   output_dir: runs/example_existing_structures  # all generated files go here
   resume: false                                 # false aborts if output_dir has files; true continues it and skips finished descriptor JSONs
+  n_cpu: 8                                      # descriptors, IMGT, OpenMM, AutoML (override with --cpus)
 
 structure_prediction:
   enabled: false                         # sequences already have structures

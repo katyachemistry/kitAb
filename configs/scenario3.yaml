@@ -1,15 +1,24 @@
-# Scenario 3: structure prediction + descriptors, no AutoML.
-# Equivalent to scenario1.yaml with automl: false (see also scenario1_no_automl.yaml).
-input_csvs_folder: datasets
+# Sequences -> ABB3 structures -> descriptors (no AutoML).
+inputs:
+  datasets_dir: datasets
 
-result_folder: scenario3
+run:
+  output_dir: scenario3
 
 structure_prediction:
-  model: abb3 # abb2 | abb3 | flashabb
-  device: 0 # GPU index (0, 1, …) or cuda:0 / cpu
+  enabled: true
+  model: abb3
+  device: cuda:0
   skip_existing: true
-  # batch_size: 4 # default 4 for abb2/abb3; default 50 for flashabb
 
-automl: false
+structure_processing:
+  enabled: false
+  renumber_imgt: false
+  minimize: false
+  minimize_attempts: 5
 
-# n_cpu: 4 # number of CPUs to use for descriptors calculation, default all available
+descriptors:
+  enabled: true
+
+automl:
+  enabled: false

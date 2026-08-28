@@ -1,16 +1,19 @@
-input_csvs_folder: datasets_ginkgo_no_hc_lc
-
-input_structures_folder: structures_abb2
-
-result_folder: our_abb2_ginkgo_no_hc_lc_final_set_of_features
-
-# n_cpu: 4 # number of CPUs to use for descriptors calculation and AutoML, default all available
-
-structures_processing:
-  renumber_imgt: False
-  minimize: False
-
-include_features:
+# Ginkgo CSVs (no HC/LC) + existing ABB2 structures -> descriptors (paper feature set) -> AutoML.
+inputs:
+  datasets_dir: datasets_ginkgo_no_hc_lc
+  structures_dir: structures_abb2
+run:
+  output_dir: our_abb2_ginkgo_no_hc_lc_final_set_of_features
+structure_prediction:
+  enabled: false
+structure_processing:
+  enabled: false
+  renumber_imgt: false
+  minimize: false
+  minimize_attempts: 5
+descriptors:
+  enabled: true
+  include_features:
   - pcf_neg_4w3A
   - pcf_neg_7w3A
   - pcf_pos_4w3A
@@ -70,3 +73,5 @@ include_features:
   - count_AspAsp_cdr
   - count_AspGlu_cdr
   - count_TyrTyr_cdr
+automl:
+  enabled: true

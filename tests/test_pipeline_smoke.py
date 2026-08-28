@@ -33,7 +33,6 @@ def test_validate_descriptors_only(tmp_path: Path, repo_root: Path, fixtures_dir
             "run": {"output_dir": str(tmp_path / "out_desc")},
             "descriptors": {"enabled": True},
             "automl": {"enabled": False},
-            "tuning": {"enabled": False},
         },
     )
     from kitab.cli import main
@@ -121,7 +120,6 @@ def test_input_immutability_and_mocked_pipeline(
             "descriptors": {"enabled": True},
             "automl": {"enabled": False},
             "structure_processing": {"minimize": False, "renumber_imgt": False},
-            "tuning": {"enabled": False},
         },
     )
     m = load_manifest(cfg, repo_root=repo_root)
@@ -144,7 +142,7 @@ def test_input_immutability_and_mocked_pipeline(
                 sort_keys=False,
             )
         )
-        return run_cfg, internal / "generic.yaml"
+        return run_cfg
 
     def fake_descriptors(manifest, logger, run_config):
         # Simulate writing descriptor JSONs without touching engines.
@@ -223,32 +221,11 @@ def test_matrix_manifest_modes(repo_root: Path, tmp_path: Path, fixtures_dir: Pa
             },
             ["automl"],
         ),
-        (
-            "automl_with_tuning_yaml_ignored",
-            {
-                "inputs": {
-                    "datasets_dir": str(fixtures_dir / "csv"),
-                    "structures_dir": str(fixtures_dir / "structures"),
-                },
-                "descriptors": {"enabled": True},
-                "automl": {"enabled": True},
-                "tuning": {"enabled": True},
-            },
-            [
-                "process_structures",
-                "descriptors",
-                "completeness",
-                "automl",
-            ],
-        ),
     ]
     for name, extra, expected in cases:
         payload = {
             "run": {"output_dir": str(tmp_path / name)},
-            "tuning": {"enabled": False},
         }
         payload.update(extra)
-        if "tuning" in extra:
-            payload["tuning"] = extra["tuning"]
         m = load_manifest(_write_manifest(tmp_path / f"{name}.yaml", payload), repo_root=repo_root)
         assert m.stage_graph() == expected, name

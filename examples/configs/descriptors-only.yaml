@@ -1,6 +1,6 @@
 # Developability descriptors only (no AutoML)
 inputs:
-  structures_dir: structures_abb2        # existing PDB/mmCIF folders
+  structures_dir: structures_abb2        # existing PDB folders
 
 run:
   output_dir: runs/example_descriptors_only  # all generated files go here

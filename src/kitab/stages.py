@@ -8,12 +8,17 @@ import json
 import os
 import shutil
 import subprocess
-import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
 
-from kitab.config import Manifest, manifest_to_legacy_generic, write_resolved_manifest
+from kitab.config import Manifest, write_resolved_manifest
 from kitab.logging_state import RunLogger
+
+
+def processing_n_cpu(manifest: Manifest) -> int:
+    """CPU workers for IMGT renumber, OpenMM minimize, descriptors, AutoML."""
+    return max(1, int(manifest.run.n_cpu or os.cpu_count() or 8))
 
 
 def _repo_root(manifest: Manifest) -> Path:
@@ -79,70 +84,37 @@ def assert_inputs_unchanged(before: dict[str, str]) -> None:
             )
 
 
-def prepare_internal_configs(
-    manifest: Manifest, logger: RunLogger
-) -> tuple[Path, Path]:
-    """Write resolved manifest + legacy generic YAML + generated run config."""
+def prepare_internal_configs(manifest: Manifest, logger: RunLogger) -> Path:
+    """Write resolved manifest + generated run config from the canonical Manifest."""
     out = manifest.run.output_dir
     internal = out / "internal"
     internal.mkdir(parents=True, exist_ok=True)
     resolved = write_resolved_manifest(manifest, out / "resolved_manifest.yaml")
     logger.info(f"Resolved manifest: {resolved}")
 
-    import yaml
-
-    legacy = manifest_to_legacy_generic(manifest)
-    # prepare_run_config expects result_folder relative/name under repo.
-    # When output_dir is absolute outside repo, use a relative alias under runs/.
-    result_name = legacy["result_folder"]
-    if Path(result_name).is_absolute():
-        # Point prepare_run_config at the actual output via symlink under repo.
-        alias = f"runs/_kitab_{out.name}"
-        alias_path = manifest.repo_root / alias
-        alias_path.parent.mkdir(parents=True, exist_ok=True)
-        if alias_path.exists() or alias_path.is_symlink():
-            if alias_path.is_symlink() or alias_path.is_file():
-                alias_path.unlink()
-            else:
-                shutil.rmtree(alias_path)
-        alias_path.symlink_to(out, target_is_directory=True)
-        legacy["result_folder"] = alias
-        result_name = alias
-
-    generic_path = internal / "generic_config.yaml"
-    generic_path.write_text(
-        yaml.safe_dump(legacy, sort_keys=False, default_flow_style=False),
-        encoding="utf-8",
+    from utils.prepare_run_config import (
+        build_run_config,
+        prepare_from_manifest,
+        write_run_config,
     )
 
-    src = manifest.repo_root / "src"
-    cmd = _py_cmd() + [
-        str(src / "utils" / "prepare_run_config.py"),
-        str(generic_path),
-        "--repo-root",
-        str(manifest.repo_root),
-        # Pipeline owns the output-dir existence guard; always allow prepare to write
-        # splits under the already-created run directory.
-        "--resume",
-    ]
-    logger.event(stage="prepare", status="started", command=" ".join(cmd))
-    # Capture stdout = run config path
-    proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
-    if proc.returncode != 0:
-        sys.stderr.write(proc.stderr or "")
-        sys.stderr.write(proc.stdout or "")
-        raise RuntimeError(f"prepare_run_config failed (exit {proc.returncode})")
-    run_config_path = Path((proc.stdout or "").strip().splitlines()[-1]).resolve()
-    # Copy into internal for user visibility.
     dest = internal / "run_config.yaml"
-    shutil.copy2(run_config_path, dest)
+    logger.event(stage="prepare", status="started", command="prepare_from_manifest")
+    try:
+        # Pipeline owns the output-dir existence guard; always allow prepare to
+        # write splits under the already-created run directory.
+        plan = prepare_from_manifest(manifest, resume=True)
+        run_config = build_run_config(plan, manifest.repo_root)
+        write_run_config(run_config, dest, plan["source_config"])
+    except SystemExit as exc:
+        raise RuntimeError(str(exc) or "prepare_from_manifest failed") from exc
     logger.event(
         stage="prepare",
         status="ok",
         message=f"run_config={dest}",
         extra={"run_config": str(dest)},
     )
-    return dest, generic_path
+    return dest
 
 
 def run_structure_prediction(manifest: Manifest, logger: RunLogger, run_config: Path) -> None:
@@ -199,7 +171,7 @@ def run_structure_prediction(manifest: Manifest, logger: RunLogger, run_config: 
             "--output-root",
             str(structures_root),
             "--runs",
-            "1",
+            str(manifest.structure_prediction.runs),
             "--no-renumber",
             "--no-minimize",
         ]
@@ -299,6 +271,7 @@ def process_structures(manifest: Manifest, logger: RunLogger, run_config: Path) 
                 shutil.copytree(struct_dir, dest)
             work = dest
 
+        n_jobs = processing_n_cpu(manifest)
         if manifest.structure_processing.enabled and manifest.structure_processing.minimize:
             ok = minimize_directory_with_retries(
                 work,
@@ -306,6 +279,7 @@ def process_structures(manifest: Manifest, logger: RunLogger, run_config: Path) 
                 logger=logger,
                 dataset=key,
                 repo_root=manifest.repo_root,
+                jobs=n_jobs,
             )
             if not ok:
                 logger.event(
@@ -323,6 +297,8 @@ def process_structures(manifest: Manifest, logger: RunLogger, run_config: Path) 
                 "--in-place",
                 "--structures-dir",
                 str(work),
+                "--renumber-jobs",
+                str(n_jobs),
             ]
             logger.event(stage="renumber", status="started", dataset=key, command=" ".join(cmd))
             try:
@@ -366,6 +342,8 @@ def minimize_pdb_with_retries(
             "--in-place",
             "--structures-dir",
             str(tmp_dir),
+            "--minimize-jobs",
+            "1",
         ]
         logger.event(
             stage="minimize",
@@ -376,7 +354,17 @@ def minimize_pdb_with_retries(
             command=" ".join(cmd),
         )
         try:
-            _run(cmd, cwd=repo_root, check=True)
+            # OpenMM in the kitab env can load a CUDA plugin that fails
+            # (PTX version mismatch) even when the CPU platform is requested.
+            _run(
+                cmd,
+                cwd=repo_root,
+                check=True,
+                env={
+                    "CUDA_VISIBLE_DEVICES": "",
+                    "OPENMM_DEFAULT_PLATFORM": "CPU",
+                },
+            )
             promoted = tmp_dir / pdb.name
             if not promoted.is_file():
                 raise RuntimeError("minimizer did not write output PDB")
@@ -422,22 +410,53 @@ def minimize_directory_with_retries(
     logger: RunLogger,
     dataset: str,
     repo_root: Path,
+    jobs: int | None = None,
 ) -> bool:
-    """Minimize each PDB independently with up to `attempts` retries into temp then promote."""
+    """Minimize each PDB independently with up to `attempts` retries into temp then promote.
+
+    PDBs in the same folder run concurrently (``jobs`` workers). Each worker is a
+    one-structure ``predict_structure.sh`` subprocess so retries stay isolated.
+    """
     pdbs = sorted(structure_dir.glob("*.pdb")) + sorted(structure_dir.glob("*.cif"))
     if not pdbs:
         logger.info(f"No PDB/CIF files to minimize in {structure_dir}")
         return True
+    n_jobs = max(1, int(jobs or 1))
+    n_jobs = min(n_jobs, len(pdbs))
+    logger.event(
+        stage="minimize",
+        status="started",
+        dataset=dataset,
+        message=f"{len(pdbs)} structure(s), {n_jobs} parallel worker(s)",
+    )
     all_ok = True
-    for pdb in pdbs:
-        if not minimize_pdb_with_retries(
-            pdb,
-            attempts=attempts,
-            logger=logger,
-            dataset=dataset,
-            repo_root=repo_root,
-        ):
-            all_ok = False
+    if n_jobs == 1:
+        for pdb in pdbs:
+            if not minimize_pdb_with_retries(
+                pdb,
+                attempts=attempts,
+                logger=logger,
+                dataset=dataset,
+                repo_root=repo_root,
+            ):
+                all_ok = False
+        return all_ok
+
+    with ThreadPoolExecutor(max_workers=n_jobs) as pool:
+        futures = [
+            pool.submit(
+                minimize_pdb_with_retries,
+                pdb,
+                attempts=attempts,
+                logger=logger,
+                dataset=dataset,
+                repo_root=repo_root,
+            )
+            for pdb in pdbs
+        ]
+        for fut in as_completed(futures):
+            if not fut.result():
+                all_ok = False
     return all_ok
 
 
@@ -578,6 +597,8 @@ def _retry_propka_coverage_with_minimize(
                 )
                 continue
             desc_ds = desc_root / key
+            retry_jobs = max(1, min(processing_n_cpu(manifest), len(names)))
+            to_min: list[Path] = []
             for name in names:
                 pdb = work / f"{name}.pdb"
                 if not pdb.is_file():
@@ -588,14 +609,23 @@ def _retry_propka_coverage_with_minimize(
                         reason=f"PDB missing for PropKa retry: {pdb}",
                     )
                     continue
-                minimize_pdb_with_retries(
-                    pdb,
-                    attempts=1,
-                    logger=logger,
-                    dataset=key,
-                    repo_root=manifest.repo_root,
-                )
+                to_min.append(pdb)
                 _clear_descriptor_artifacts(desc_ds, name)
+            if to_min:
+                with ThreadPoolExecutor(max_workers=retry_jobs) as pool:
+                    futs = [
+                        pool.submit(
+                            minimize_pdb_with_retries,
+                            pdb,
+                            attempts=1,
+                            logger=logger,
+                            dataset=key,
+                            repo_root=manifest.repo_root,
+                        )
+                        for pdb in to_min
+                    ]
+                    for fut in as_completed(futs):
+                        fut.result()
 
         # Drop PropKa rows while retrying; successes stay off the TSV, new failures re-append.
         _write_failed_structure_rows(failed_tsv, other_rows)

@@ -1,0 +1,31 @@
+# Isolated end-to-end test: ab21 only, FlashABB, two prediction runs,
+# IMGT + minimize, descriptors, AutoML. Does not use paper structure trees.
+inputs:
+  datasets_dir: tests/e2e/data
+  split_randomly:
+    - ab21
+
+run:
+  output_dir: runs/test_e2e_ab21_flashabb_full
+  resume: false
+  n_cpu: 50
+
+structure_prediction:
+  enabled: true
+  model: flashabb
+  device: cuda:0
+  skip_existing: true
+  runs: 2
+
+structure_processing:
+  enabled: true
+  renumber_imgt: true
+  minimize: true
+  minimize_attempts: 5
+
+descriptors:
+  enabled: true
+  cleanup: false
+
+automl:
+  enabled: true

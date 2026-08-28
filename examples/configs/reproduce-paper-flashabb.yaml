@@ -27,7 +27,3 @@ descriptors:
 
 automl:
   enabled: true
-  eval_models: all
-
-tuning:
-  enabled: false

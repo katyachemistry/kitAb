@@ -125,7 +125,6 @@ def test_predict_stage_disables_inline_postprocess(
                 "descriptors": {"enabled": True},
                 "automl": {"enabled": False},
                 "structure_processing": {"enabled": True, "minimize": True, "renumber_imgt": True},
-                "tuning": {"enabled": False},
             },
             sort_keys=False,
         ),
@@ -153,6 +152,7 @@ def test_predict_stage_disables_inline_postprocess(
     assert "--abb2" in cmd
     assert "--no-renumber" in cmd
     assert "--no-minimize" in cmd
+    assert cmd[cmd.index("--runs") + 1] == "1"
 
 
 def test_predict_stage_runs_each_model(
@@ -167,10 +167,10 @@ def test_predict_stage_runs_each_model(
                 "structure_prediction": {
                     "enabled": True,
                     "model": ["abb2", "abb3"],
+                    "runs": 3,
                 },
                 "descriptors": {"enabled": False},
                 "automl": {"enabled": False},
-                "tuning": {"enabled": False},
             },
             sort_keys=False,
         ),
@@ -199,6 +199,7 @@ def test_predict_stage_runs_each_model(
     assert "--abb2" in cmds[0]
     assert "--abb3" in cmds[1]
     assert all("--no-renumber" in cmd and "--no-minimize" in cmd for cmd in cmds)
+    assert all(cmd[cmd.index("--runs") + 1] == "3" for cmd in cmds)
 
 
 def test_abb2_writes_unrefined_pdb(tmp_path: Path):

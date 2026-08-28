@@ -47,7 +47,6 @@ cases = {
         "run": {"output_dir": str(out / "S_descriptors_only")},
         "descriptors": {"enabled": True},
         "automl": {"enabled": False},
-        "tuning": {"enabled": False},
     },
     "S_structures_automl": {
         "inputs": {
@@ -58,7 +57,6 @@ cases = {
         "run": {"output_dir": str(out / "S_structures_automl")},
         "descriptors": {"enabled": True},
         "automl": {"enabled": True},
-        "tuning": {"enabled": False},
     },
     "S_automl_only": {
         "inputs": {
@@ -68,18 +66,6 @@ cases = {
         },
         "run": {"output_dir": str(out / "S_automl_only")},
         "automl": {"enabled": True},
-        "tuning": {"enabled": False},
-    },
-    "S_full_tuning": {
-        "inputs": {
-            "datasets_dir": str(fix / "csv"),
-            "structures_dir": str(fix / "structures"),
-            "split_randomly": ["ab21_mini"],
-        },
-        "run": {"output_dir": str(out / "S_full_tuning")},
-        "descriptors": {"enabled": True},
-        "automl": {"enabled": True},
-        "tuning": {"enabled": True},
     },
     "S_predict": {
         "inputs": {
@@ -90,7 +76,6 @@ cases = {
         "structure_prediction": {"enabled": True, "model": "abb2", "device": "cpu"},
         "descriptors": {"enabled": True},
         "automl": {"enabled": True},
-        "tuning": {"enabled": False},
     },
 }
 
