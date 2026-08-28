@@ -20,6 +20,7 @@ from .pipeline_defaults import (
     DEFAULT_RANDOM_STATE,
     DEFAULT_SFS_MIN_IMPROVEMENT,
 )
+from .folds import encode_categoricals_train_only, shuffled_row_folds
 from .utils import (
     CorrelationBundle,
     DEFAULT_CORRELATION_SCREENING_EXCLUDE_COLS,
@@ -722,6 +723,143 @@ def stability_selector(
     return freq, selected
 
 
+def minmax_scale_train_val(
+    x_train: np.ndarray | pd.DataFrame,
+    x_val: np.ndarray | pd.DataFrame,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit MinMaxScaler on train rows only; transform the validation fold with it."""
+    scaler = MinMaxScaler()
+    x_tr = np.asarray(x_train, dtype=np.float64)
+    x_va = np.asarray(x_val, dtype=np.float64)
+    if x_tr.ndim == 1:
+        x_tr = x_tr.reshape(-1, 1)
+    if x_va.ndim == 1:
+        x_va = x_va.reshape(-1, 1)
+    scaler.fit(x_tr)
+    return scaler.transform(x_tr), scaler.transform(x_va)
+
+
+def resolve_sfs_cv_folds(
+    n_samples: int,
+    *,
+    cv: int,
+    random_state: int,
+    cv_folds: list[tuple[np.ndarray, np.ndarray]] | None = None,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Prefer predefined/group folds; otherwise shuffle rows."""
+    if cv_folds:
+        cleaned: list[tuple[np.ndarray, np.ndarray]] = []
+        for train_idx, val_idx in cv_folds:
+            train_arr = np.asarray(train_idx, dtype=int)
+            val_arr = np.asarray(val_idx, dtype=int)
+            train_arr = train_arr[(train_arr >= 0) & (train_arr < n_samples)]
+            val_arr = val_arr[(val_arr >= 0) & (val_arr < n_samples)]
+            if len(train_arr) >= 2 and len(val_arr) >= 1:
+                cleaned.append((train_arr, val_arr))
+        if cleaned:
+            return cleaned
+    effective_cv = min(int(cv), int(n_samples))
+    if effective_cv < 2:
+        return []
+    return shuffled_row_folds(n_samples, effective_cv, random_state)
+
+
+def _sfs_metric(y_true, y_pred, metric: str) -> float:
+    if metric == "neg_mean_squared_error":
+        return -mean_squared_error(y_true, y_pred)
+    if metric == "r2":
+        return r2_score(y_true, y_pred)
+    if metric == "spearman":
+        corr, _ = spearmanr(y_true, y_pred)
+        return float(corr) if not np.isnan(corr) else -np.inf
+    raise ValueError(
+        "Unsupported scoring for forward selection. "
+        "Use 'neg_mean_squared_error', 'r2', or 'spearman'."
+    )
+
+
+def _sfs_model_overrides(
+    *,
+    enet_alpha=None,
+    enet_l1_ratio=None,
+    svm_C=None,
+    svm_epsilon=None,
+    rf_n_estimators=None,
+    rf_max_depth=None,
+    rf_min_samples_leaf=None,
+    rf_max_features=None,
+    knn_n_neighbors=None,
+    knn_weights=None,
+    knn_algorithm=None,
+    knn_leaf_size=None,
+    knn_p=None,
+    knn_metric=None,
+    knn_metric_params=None,
+) -> dict:
+    mr: dict = {}
+    if enet_alpha is not None:
+        mr["enet_alpha"] = enet_alpha
+    if enet_l1_ratio is not None:
+        mr["enet_l1_ratio"] = enet_l1_ratio
+    if rf_n_estimators is not None:
+        mr["rf_n_estimators"] = rf_n_estimators
+    if rf_max_depth is not None:
+        mr["rf_max_depth"] = rf_max_depth
+    if rf_min_samples_leaf is not None:
+        mr["rf_min_samples_leaf"] = rf_min_samples_leaf
+    if rf_max_features is not None:
+        mr["rf_max_features"] = rf_max_features
+    if svm_C is not None:
+        mr["svm_C"] = svm_C
+    if svm_epsilon is not None:
+        mr["svm_epsilon"] = svm_epsilon
+    if knn_n_neighbors is not None:
+        mr["knn_n_neighbors"] = knn_n_neighbors
+    if knn_weights is not None:
+        mr["knn_weights"] = knn_weights
+    if knn_algorithm is not None:
+        mr["knn_algorithm"] = knn_algorithm
+    if knn_leaf_size is not None:
+        mr["knn_leaf_size"] = knn_leaf_size
+    if knn_p is not None:
+        mr["knn_p"] = knn_p
+    if knn_metric is not None:
+        mr["knn_metric"] = knn_metric
+    if knn_metric_params is not None:
+        mr["knn_metric_params"] = knn_metric_params
+    return mr
+
+
+def _score_sfs_fold(
+    x_train,
+    y_train,
+    x_val,
+    y_val,
+    *,
+    model_type: str,
+    random_state: int,
+    n_jobs: int,
+    scoring: str,
+    model_overrides: dict,
+) -> float | None:
+    if len(x_train) < 2 or len(x_val) < 1:
+        return None
+    x_tr_s, x_va_s = minmax_scale_train_val(x_train, x_val)
+    mr: dict = {
+        "random_state": random_state,
+        "n_jobs": n_jobs,
+        "n_samples_fit": len(y_train),
+    }
+    mr.update(model_overrides)
+    model = make_regressor(model_type, **mr)
+    fit_regressor(model, x_tr_s, y_train)
+    try:
+        y_pred = model.predict(x_va_s)
+        return _sfs_metric(y_val, y_pred, scoring)
+    except Exception:
+        return None
+
+
 def sequential_forward_selector(
     split_train_df,
     target_col: str,
@@ -748,50 +886,39 @@ def sequential_forward_selector(
     knn_p: int | None = None,
     knn_metric: str | None = None,
     knn_metric_params: dict | None = None,
+    cv_folds: list | None = None,
 ):
+    """Sequential forward selection with fold-local scaling.
+
+    ``cv_folds`` should be predefined/group-aware splits of *this* training
+    frame (e.g. leftover MMseqs2 folds). If omitted, rows are shuffled.
+    Each SFS validation fold is min-max scaled with parameters fit on that
+    fold's training rows only.
+    """
     cv_eff = 5 if cv is None else int(cv)
     scoring_eff = "spearman" if scoring is None else str(scoring)
     min_imp_eff = DEFAULT_SFS_MIN_IMPROVEMENT if min_improvement is None else float(min_improvement)
     n_jobs_eff = -1 if n_jobs is None else int(n_jobs)
 
-    def _build_custom_folds(n_samples, n_splits, seed):
-        if n_splits < 2 or n_splits > n_samples:
-            return []
-
-        base_size = n_samples // n_splits
-        remainder = n_samples % n_splits
-        segment_sizes = [base_size + (1 if i < remainder else 0) for i in range(n_splits)]
-        boundaries = np.cumsum([0] + segment_sizes)
-
-        rng = np.random.default_rng(seed)
-        idx = np.arange(n_samples)
-        rng.shuffle(idx)
-
-        folds = []
-        for i in range(n_splits):
-            val_start, val_end = boundaries[i], boundaries[i + 1]
-            val_idx = idx[val_start:val_end]
-            train_idx = np.concatenate([idx[:val_start], idx[val_end:]])
-            if len(train_idx) == 0 or len(val_idx) == 0:
-                continue
-            folds.append((train_idx, val_idx))
-        return folds
-
-    def _score(y_true, y_pred, metric):
-        if metric == "neg_mean_squared_error":
-            return -mean_squared_error(y_true, y_pred)
-        if metric == "r2":
-            return r2_score(y_true, y_pred)
-        if metric == "spearman":
-            corr, _ = spearmanr(y_true, y_pred)
-            return float(corr) if not np.isnan(corr) else -np.inf
-        raise ValueError(
-            "Unsupported scoring for manual forward selection. "
-            "Use 'neg_mean_squared_error', 'r2', or 'spearman'."
-        )
-
     model_type_norm = _validate_model_type(
         model_type, param_name="model_type", allowed=_ALLOWED_SFS_MODELS
+    )
+    overrides = _sfs_model_overrides(
+        enet_alpha=enet_alpha,
+        enet_l1_ratio=enet_l1_ratio,
+        svm_C=svm_C,
+        svm_epsilon=svm_epsilon,
+        rf_n_estimators=rf_n_estimators,
+        rf_max_depth=rf_max_depth,
+        rf_min_samples_leaf=rf_min_samples_leaf,
+        rf_max_features=rf_max_features,
+        knn_n_neighbors=knn_n_neighbors,
+        knn_weights=knn_weights,
+        knn_algorithm=knn_algorithm,
+        knn_leaf_size=knn_leaf_size,
+        knn_p=knn_p,
+        knn_metric=knn_metric,
+        knn_metric_params=knn_metric_params,
     )
 
     if candidate_features is None:
@@ -800,7 +927,7 @@ def sequential_forward_selector(
         )
     candidate_features_t = list(dict.fromkeys(list(candidate_features)))
     cols = candidate_features_t + [target_col]
-    work = split_train_df.loc[:, cols].astype(np.float64, copy=True)
+    work = split_train_df.loc[:, cols].astype(np.float64).reset_index(drop=True)
 
     if len(work) < 3 or len(candidate_features_t) == 0:
         return []
@@ -812,11 +939,12 @@ def sequential_forward_selector(
     n_select = int(n_features_to_select)
     n_select = max(1, min(n_select, n_avail))
 
-    effective_cv = min(cv_eff, len(work))
-    if effective_cv < 2:
-        return list(X.columns[:n_select])
-
-    folds = _build_custom_folds(len(work), effective_cv, random_state)
+    folds = resolve_sfs_cv_folds(
+        len(work),
+        cv=cv_eff,
+        random_state=random_state,
+        cv_folds=cv_folds,
+    )
     if len(folds) == 0:
         return list(X.columns[:n_select])
 
@@ -833,56 +961,19 @@ def sequential_forward_selector(
             fold_scores = []
 
             for train_idx, val_idx in folds:
-                X_tr = X.iloc[train_idx][candidate_set]
-                y_tr = y.iloc[train_idx]
-                X_val = X.iloc[val_idx][candidate_set]
-                y_val = y.iloc[val_idx]
-
-                if len(X_tr) < 2 or len(X_val) < 1:
-                    continue
-
-                mr: dict = {
-                    "random_state": random_state,
-                    "n_jobs": n_jobs_eff,
-                    "n_samples_fit": len(X_tr),
-                }
-                if enet_alpha is not None:
-                    mr["enet_alpha"] = enet_alpha
-                if enet_l1_ratio is not None:
-                    mr["enet_l1_ratio"] = enet_l1_ratio
-                if rf_n_estimators is not None:
-                    mr["rf_n_estimators"] = rf_n_estimators
-                if rf_max_depth is not None:
-                    mr["rf_max_depth"] = rf_max_depth
-                if rf_min_samples_leaf is not None:
-                    mr["rf_min_samples_leaf"] = rf_min_samples_leaf
-                if rf_max_features is not None:
-                    mr["rf_max_features"] = rf_max_features
-                if svm_C is not None:
-                    mr["svm_C"] = svm_C
-                if svm_epsilon is not None:
-                    mr["svm_epsilon"] = svm_epsilon
-                if knn_n_neighbors is not None:
-                    mr["knn_n_neighbors"] = knn_n_neighbors
-                if knn_weights is not None:
-                    mr["knn_weights"] = knn_weights
-                if knn_algorithm is not None:
-                    mr["knn_algorithm"] = knn_algorithm
-                if knn_leaf_size is not None:
-                    mr["knn_leaf_size"] = knn_leaf_size
-                if knn_p is not None:
-                    mr["knn_p"] = knn_p
-                if knn_metric is not None:
-                    mr["knn_metric"] = knn_metric
-                if knn_metric_params is not None:
-                    mr["knn_metric_params"] = knn_metric_params
-                model = make_regressor(model_type_norm, **mr)
-                fit_regressor(model, X_tr, y_tr)
-                try:
-                    y_pred = model.predict(X_val)
-                    fold_scores.append(_score(y_val, y_pred, scoring_eff))
-                except Exception:
-                    continue
+                score = _score_sfs_fold(
+                    X.iloc[train_idx][candidate_set],
+                    y.iloc[train_idx],
+                    X.iloc[val_idx][candidate_set],
+                    y.iloc[val_idx],
+                    model_type=model_type_norm,
+                    random_state=random_state,
+                    n_jobs=n_jobs_eff,
+                    scoring=scoring_eff,
+                    model_overrides=overrides,
+                )
+                if score is not None:
+                    fold_scores.append(score)
 
             if len(fold_scores) == 0:
                 continue
@@ -941,50 +1032,32 @@ def select_features_floating_sfs(
     knn_p: int | None = None,
     knn_metric: str | None = None,
     knn_metric_params: dict | None = None,
+    cv_folds: list | None = None,
 ):
     cv_eff = 5 if cv is None else int(cv)
     scoring_eff = "spearman" if scoring is None else str(scoring)
     min_imp_eff = DEFAULT_SFS_MIN_IMPROVEMENT if min_improvement is None else float(min_improvement)
     n_jobs_eff = -1 if n_jobs is None else int(n_jobs)
 
-    def _build_custom_folds(n_samples, n_splits, seed):
-        if n_splits < 2 or n_splits > n_samples:
-            return []
-
-        base_size = n_samples // n_splits
-        remainder = n_samples % n_splits
-        segment_sizes = [base_size + (1 if i < remainder else 0) for i in range(n_splits)]
-        boundaries = np.cumsum([0] + segment_sizes)
-
-        rng = np.random.default_rng(seed)
-        idx = np.arange(n_samples)
-        rng.shuffle(idx)
-
-        folds = []
-        for i in range(n_splits):
-            val_start, val_end = boundaries[i], boundaries[i + 1]
-            val_idx = idx[val_start:val_end]
-            train_idx = np.concatenate([idx[:val_start], idx[val_end:]])
-            if len(train_idx) == 0 or len(val_idx) == 0:
-                continue
-            folds.append((train_idx, val_idx))
-        return folds
-
-    def _score(y_true, y_pred, metric):
-        if metric == "neg_mean_squared_error":
-            return -mean_squared_error(y_true, y_pred)
-        if metric == "r2":
-            return r2_score(y_true, y_pred)
-        if metric == "spearman":
-            corr, _ = spearmanr(y_true, y_pred)
-            return float(corr) if not np.isnan(corr) else -np.inf
-        raise ValueError(
-            "Unsupported scoring for floating selection. "
-            "Use 'neg_mean_squared_error', 'r2', or 'spearman'."
-        )
-
     model_type_norm = _validate_model_type(
         model_type, param_name="model_type", allowed=_ALLOWED_SFS_MODELS
+    )
+    overrides = _sfs_model_overrides(
+        enet_alpha=enet_alpha,
+        enet_l1_ratio=enet_l1_ratio,
+        svm_C=svm_C,
+        svm_epsilon=svm_epsilon,
+        rf_n_estimators=rf_n_estimators,
+        rf_max_depth=rf_max_depth,
+        rf_min_samples_leaf=rf_min_samples_leaf,
+        rf_max_features=rf_max_features,
+        knn_n_neighbors=knn_n_neighbors,
+        knn_weights=knn_weights,
+        knn_algorithm=knn_algorithm,
+        knn_leaf_size=knn_leaf_size,
+        knn_p=knn_p,
+        knn_metric=knn_metric,
+        knn_metric_params=knn_metric_params,
     )
 
     if candidate_features is None:
@@ -993,7 +1066,7 @@ def select_features_floating_sfs(
         )
     candidate_features_t = list(dict.fromkeys(list(candidate_features)))
     cols = candidate_features_t + [target_col]
-    work = split_train_df.loc[:, cols].astype(np.float64, copy=True)
+    work = split_train_df.loc[:, cols].astype(np.float64).reset_index(drop=True)
 
     if len(work) < 3 or len(candidate_features_t) == 0:
         return []
@@ -1005,11 +1078,12 @@ def select_features_floating_sfs(
     n_select = int(n_features_to_select)
     n_select = max(1, min(n_select, n_avail))
 
-    effective_cv = min(cv_eff, len(work))
-    if effective_cv < 2:
-        return list(X.columns[:n_select])
-
-    folds = _build_custom_folds(len(work), effective_cv, random_state)
+    folds = resolve_sfs_cv_folds(
+        len(work),
+        cv=cv_eff,
+        random_state=random_state,
+        cv_folds=cv_folds,
+    )
     if len(folds) == 0:
         return list(X.columns[:n_select])
 
@@ -1020,56 +1094,19 @@ def select_features_floating_sfs(
         fold_scores = []
         X_use = X[feature_set]
         for train_idx, val_idx in folds:
-            X_tr = X_use.iloc[train_idx]
-            y_tr = y.iloc[train_idx]
-            X_val = X_use.iloc[val_idx]
-            y_val = y.iloc[val_idx]
-
-            if len(X_tr) < 2 or len(X_val) < 1:
-                continue
-
-            mr: dict = {
-                "random_state": random_state,
-                "n_jobs": n_jobs_eff,
-                "n_samples_fit": len(X_tr),
-            }
-            if enet_alpha is not None:
-                mr["enet_alpha"] = enet_alpha
-            if enet_l1_ratio is not None:
-                mr["enet_l1_ratio"] = enet_l1_ratio
-            if rf_n_estimators is not None:
-                mr["rf_n_estimators"] = rf_n_estimators
-            if rf_max_depth is not None:
-                mr["rf_max_depth"] = rf_max_depth
-            if rf_min_samples_leaf is not None:
-                mr["rf_min_samples_leaf"] = rf_min_samples_leaf
-            if rf_max_features is not None:
-                mr["rf_max_features"] = rf_max_features
-            if svm_C is not None:
-                mr["svm_C"] = svm_C
-            if svm_epsilon is not None:
-                mr["svm_epsilon"] = svm_epsilon
-            if knn_n_neighbors is not None:
-                mr["knn_n_neighbors"] = knn_n_neighbors
-            if knn_weights is not None:
-                mr["knn_weights"] = knn_weights
-            if knn_algorithm is not None:
-                mr["knn_algorithm"] = knn_algorithm
-            if knn_leaf_size is not None:
-                mr["knn_leaf_size"] = knn_leaf_size
-            if knn_p is not None:
-                mr["knn_p"] = knn_p
-            if knn_metric is not None:
-                mr["knn_metric"] = knn_metric
-            if knn_metric_params is not None:
-                mr["knn_metric_params"] = knn_metric_params
-            model = make_regressor(model_type_norm, **mr)
-            fit_regressor(model, X_tr, y_tr)
-            try:
-                y_pred = model.predict(X_val)
-                fold_scores.append(_score(y_val, y_pred, scoring_eff))
-            except Exception:
-                continue
+            score = _score_sfs_fold(
+                X_use.iloc[train_idx],
+                y.iloc[train_idx],
+                X_use.iloc[val_idx],
+                y.iloc[val_idx],
+                model_type=model_type_norm,
+                random_state=random_state,
+                n_jobs=n_jobs_eff,
+                scoring=scoring_eff,
+                model_overrides=overrides,
+            )
+            if score is not None:
+                fold_scores.append(score)
 
         if len(fold_scores) == 0:
             return -np.inf
@@ -1432,6 +1469,7 @@ def run_feature_selection_on_one_fold(
     sfs_rf_min_samples_leaf: int | None = None,
     sfs_rf_max_features: str | float | int | None = None,
     sfs_knn_n_neighbors: int | None = None,
+    sfs_cv_folds: list | None = None,
     rfe_enet_alpha: float | None = None,
     rfe_enet_l1_ratio: float | None = None,
     rfe_rf_n_estimators: int | None = None,
@@ -1492,6 +1530,11 @@ def run_feature_selection_on_one_fold(
         cand = list(dict.fromkeys(candidate_features))
         if len(cand) == 0:
             raise ValueError("candidate_features must be non-empty when provided")
+
+    train_df_k, test_df_k, cand = encode_categoricals_train_only(
+        train_df_k, test_df_k, cand
+    )
+    train_raw_k = train_df_k.copy()
 
     train_df_k, test_df_k = apply_minmax_to_train_test_features(
         train_df_k, test_df_k, cand
@@ -2026,8 +2069,10 @@ def run_feature_selection_on_one_fold(
                     sfs_call["rf_max_features"] = sfs_rf_max_features
                 if sfs_knn_n_neighbors is not None:
                     sfs_call["knn_n_neighbors"] = sfs_knn_n_neighbors
+                if sfs_cv_folds is not None:
+                    sfs_call["cv_folds"] = sfs_cv_folds
                 sel = sequential_forward_selector(
-                    train_df_k,
+                    train_raw_k,
                     tcol,
                     current_features,
                     **sfs_call,
@@ -2153,6 +2198,8 @@ __all__ = [
     "stability_reduction_n_subsamples_fold_train_log500",
     "sequential_forward_selector",
     "select_features_floating_sfs",
+    "minmax_scale_train_val",
+    "resolve_sfs_cv_folds",
     "recursive_elimination_selector",
     "cv_shuffled_fold_ilocs",
     "run_feature_selection_on_one_fold",

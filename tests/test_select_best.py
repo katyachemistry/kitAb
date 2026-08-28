@@ -158,3 +158,24 @@ def test_pipeline_settings_reject_outer_technique_selection():
 
 def test_missing_inner_error_mentions_flat_cv():
     assert "Flat CV" in MISSING_INNER_ERROR
+
+
+def test_technique_selection_ignores_outer_test_scores():
+    results = _two_fold_results()
+    baseline = resolve_target_selection(
+        results, technique_order=["elasticnet", "sfs_svm"]
+    )
+    for row in results:
+        row["spearman"] = 0.99 if row["technique"] == "sfs_svm" else -0.99
+        for oof in row["oof_rows"]:
+            oof["yhat"] = -oof["y"] if row["technique"] == "elasticnet" else oof["y"]
+    mutated = resolve_target_selection(
+        results, technique_order=["elasticnet", "sfs_svm"]
+    )
+    assert [row["technique"] for row in mutated.fold_winners] == [
+        row["technique"] for row in baseline.fold_winners
+    ]
+    assert mutated.deployed.technique == baseline.deployed.technique
+    assert pick_fold_winner(
+        [r for r in results if r["outer_fold"] == 0]
+    )["technique"] == "sfs_svm"

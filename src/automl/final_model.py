@@ -21,14 +21,14 @@ from automl.cv_engine import (
     TechniqueRunError,
     choose_elasticnet_grid_point_over_folds,
     choose_eval_model_over_folds,
+    encoded_train_test_xy,
     eval_hyperparameters_by_model,
     extract_attributions,
     make_elasticnet_pipeline,
     make_selector_pipeline,
     select_features,
-    xy,
 )
-from automl.folds import full_dataset_frame
+from automl.folds import encode_categoricals_train_only, full_dataset_frame
 from automl.model_io import save_model
 from automl.select_best import TechniqueScore
 from automl.techniques import PipelineSettings, Technique
@@ -100,7 +100,12 @@ def fit_final_model(
             alpha = float(alpha)
             l1_ratio = float(l1_ratio)
             selection_spearman = hp.get("selection_spearman")
-        x_all, y_all, _ = xy(full, target_col, features)
+        x_all, y_all, _, _, _, feats = encoded_train_test_xy(
+            full,
+            full,
+            target_col=target_col,
+            features=features,
+        )
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", ConvergenceWarning)
             estimator = make_elasticnet_pipeline(
@@ -110,7 +115,7 @@ def fit_final_model(
         attributions = extract_attributions(
             estimator.named_steps["elasticnet"],
             model_type="elasticnet",
-            feature_names=list(features),
+            feature_names=list(feats),
             scaling_method="standardize",
             scaler_stats=None,
             pipeline_model=estimator,
@@ -119,7 +124,7 @@ def fit_final_model(
             estimator=estimator,
             technique=technique,
             target_col=target_col,
-            feature_cols=list(features),
+            feature_cols=list(feats),
             eval_model="elasticnet",
             alpha=float(alpha),
             l1_ratio=float(l1_ratio),
@@ -156,17 +161,28 @@ def fit_final_model(
             candidate_features=features,
             technique=technique,
             settings=settings,
+            fold_dir=fold_dir,
         )
-    selected = [c for c in selection["selected_features"] if c in full.columns]
+    selected = list(selection["selected_features"])
     if not selected:
         raise TechniqueRunError(
             f"Final refit for {target_col} selected no features "
             f"(technique={technique.key})"
         )
 
-    y_all = pd.to_numeric(full[target_col], errors="coerce")
+    full_enc, _, _encoded_feats = encode_categoricals_train_only(
+        full, full, list(features)
+    )
+    selected = [c for c in selected if c in full_enc.columns]
+    if not selected:
+        raise TechniqueRunError(
+            f"Final refit for {target_col} selected no features "
+            f"(technique={technique.key})"
+        )
+
+    y_all = pd.to_numeric(full_enc[target_col], errors="coerce")
     labelled = y_all.notna()
-    x_all = full.loc[labelled, selected].apply(pd.to_numeric, errors="coerce")
+    x_all = full_enc.loc[labelled, selected].apply(pd.to_numeric, errors="coerce")
     y_all = y_all.loc[labelled]
     estimator = make_selector_pipeline(
         eval_model,

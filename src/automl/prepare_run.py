@@ -22,6 +22,7 @@ from automl.dataset_validation import (
     require_no_nans_in_dataframe,
     validate_experimental_dataset,
 )
+from automl.folds import non_numeric_feature_columns
 from automl.feature_selectors import (
     _sorted_split_labels,
     cv_shuffled_fold_ilocs,
@@ -182,6 +183,11 @@ def developability_source_kind(source: Path) -> str:
 def one_hot_listed_non_numeric_features(
     df: pd.DataFrame, feature_cols: list[str]
 ) -> tuple[pd.DataFrame, list[str]]:
+    """Expand non-numeric features on a single table (not used by nested CV).
+
+    Nested CV uses :func:`automl.folds.encode_categoricals_train_only` so dummy
+    columns are determined from the training split only.
+    """
     out = df.copy()
     new_order: list[str] = []
     for col in [str(c) for c in feature_cols]:
@@ -717,9 +723,9 @@ def load_merge_and_expand(
             "After merge, expected feature column(s) are missing (possible key/column "
             f"name clash): {missing_feat!r}"
         )
-    merged, expanded_feature_cols = one_hot_listed_non_numeric_features(
-        merged, combined_feats
-    )
+    # Leave categoricals as-is. Dummy encoding is fit on each CV train split
+    # (see encode_categoricals_train_only) so test-only levels cannot leak.
+    expanded_feature_cols = list(dict.fromkeys(combined_feats))
     merged_tail = list(dict.fromkeys([name_col, *targets, *expanded_feature_cols]))
     if split_col:
         sc = str(split_col)
@@ -740,7 +746,7 @@ def load_merge_and_expand(
     )
     require_no_nans_except_columns(
         merged,
-        skip_columns=set(targets),
+        skip_columns=set(targets) | set(non_numeric_feature_columns(merged, expanded_feature_cols)),
         context="After merge (experimental + developability); target columns may be NaN",
     )
     return merged, expanded_feature_cols
@@ -774,9 +780,10 @@ def write_folds_for_target(
         if sc0 in merged.columns:
             labels_before = _sorted_split_labels(merged[sc0])
     other_targets = {str(t) for t in all_target_cols if str(t) != user_target_col}
+    cat_cols = non_numeric_feature_columns(m, expanded_feature_cols)
     require_no_nans_except_columns(
         m,
-        skip_columns=other_targets,
+        skip_columns=other_targets | set(cat_cols),
         context=f"After dropping NaNs for target {user_target_col!r}",
     )
     if split_col:
@@ -867,6 +874,7 @@ def write_folds_for_target(
         "sfs_row_count_basis": sfs_row_basis,
         "split_scheme": split_scheme,
         "split_col": str(split_col) if split_col else None,
+        "categorical_feature_cols": non_numeric_feature_columns(pipe_df, pipe_feats),
     }
     meta_path = fold_root / "meta.json"
     with open(meta_path, "w") as f:

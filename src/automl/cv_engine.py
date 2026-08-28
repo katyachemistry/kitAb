@@ -30,7 +30,11 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
 from automl.feature_selectors import sequential_forward_selector
-from automl.folds import write_inner_fold_dir
+from automl.folds import (
+    encode_categoricals_train_only,
+    fold_index_pairs_for_frame,
+    write_inner_fold_dir,
+)
 from automl.techniques import PipelineSettings, Technique
 from automl.utils import (
     fit_regressor,
@@ -136,13 +140,29 @@ def select_features(
     candidate_features: list[str],
     technique: Technique,
     settings: PipelineSettings,
+    fold_dir: Path | None = None,
+    exclude_names: set[str] | frozenset[str] | None = None,
 ) -> dict[str, Any]:
     """Low-variance filter, optional intercorrelation prune, optional SFS.
 
-    Returns min-max scaled copies of both frames plus the surviving feature
-    lists at each stage.
+    Categorical columns are dummy-encoded from train levels only. Min-max
+    scaling for low-variance / intercorr / the eval frames is fit on this
+    train split. SFS itself receives *unscaled* train rows and scales each
+    of its CV folds with a scaler fit on that fold's training rows only.
+    Predefined group folds (``fold_dir``) are used for SFS when available.
+    Outer-test names in ``exclude_names`` must not appear in ``train_df``.
     """
     cand = list(dict.fromkeys(candidate_features))
+    held_out = {str(n) for n in (exclude_names or [])}
+    if held_out and NAME_COL in train_df.columns:
+        leaked = set(train_df[NAME_COL].astype(str)) & held_out
+        if leaked:
+            raise TechniqueRunError(
+                f"outer-test names leaked into feature-selection train: "
+                f"{sorted(leaked)[:12]}"
+            )
+    train_df, test_df, cand = encode_categoricals_train_only(train_df, test_df, cand)
+    train_raw = train_df.copy()
     train_k, test_k, scaler = _fit_minmax(train_df, test_df, cand)
     kept, _removed, _rel = remove_low_variance_features(
         X=train_k,
@@ -173,9 +193,16 @@ def select_features(
         n_select = selection_max_features(
             len(train_k), float(technique.features_frac)
         )
+        sfs_folds = None
+        if fold_dir is not None:
+            sfs_folds = fold_index_pairs_for_frame(
+                Path(fold_dir),
+                train_raw.reset_index(drop=True),
+                exclude_names=held_out,
+            )
         try:
             selected = sequential_forward_selector(
-                train_k,
+                train_raw.reset_index(drop=True),
                 target_col,
                 after_intercorr,
                 n_features_to_select=n_select,
@@ -185,6 +212,7 @@ def select_features(
                 min_improvement=settings.sfs.min_improvement,
                 n_jobs=1,
                 model_type=str(technique.selector_model),
+                cv_folds=sfs_folds,
             )
         except Exception as exc:
             raise TechniqueRunError(
@@ -321,6 +349,20 @@ def xy(
         else pd.Series([str(i) for i in range(int(mask.sum()))], index=y.loc[mask].index)
     )
     return x, y.loc[mask], names
+
+
+def encoded_train_test_xy(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    *,
+    target_col: str,
+    features: list[str],
+) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, pd.Series, list[str]]:
+    """Train-only dummy encoding, then numeric X/y for one train/test pair."""
+    train_e, test_e, feats = encode_categoricals_train_only(train_df, test_df, features)
+    x_train, y_train, _ = xy(train_e, target_col, feats)
+    x_test, y_test, names = xy(test_e, target_col, feats)
+    return x_train, y_train, x_test, y_test, names, feats
 
 
 def extract_attributions(
@@ -624,6 +666,7 @@ def choose_eval_model_over_folds(
     technique: Technique,
     settings: PipelineSettings,
     eval_hp_by_model: dict[str, dict],
+    exclude_names: set[str] | frozenset[str] | None = None,
 ) -> tuple[str, float | None, list[dict[str, Any]], list[dict[str, Any]]]:
     """Score every candidate eval model over a set of folds; return the best.
 
@@ -651,6 +694,8 @@ def choose_eval_model_over_folds(
                 candidate_features=candidate_features,
                 technique=technique,
                 settings=settings,
+                fold_dir=inner_dir,
+                exclude_names=exclude_names,
             )
             for feature in selection["selected_features"]:
                 inner_feature_rows.append(
@@ -714,6 +759,7 @@ def _run_outer_selector(
 ) -> dict[str, Any]:
     outer_train = pd.read_parquet(fold_dir / f"fold_{outer_k}_train.parquet")
     outer_test = pd.read_parquet(fold_dir / f"fold_{outer_k}_test.parquet")
+    outer_names = set(outer_test[NAME_COL].astype(str))
     inner_dir = work_root / target_col / f"outer_{outer_k}" / "inner_folds"
     write_inner_fold_dir(fold_dir, outer_k=outer_k, dest=inner_dir)
     best_eval, best_inner, inner_scores, inner_feature_rows = choose_eval_model_over_folds(
@@ -723,6 +769,7 @@ def _run_outer_selector(
         technique=technique,
         settings=settings,
         eval_hp_by_model=eval_hp_by_model,
+        exclude_names=outer_names,
     )
     n_inner = int(json.loads((inner_dir / "meta.json").read_text())["n_splits"])
 
@@ -735,6 +782,8 @@ def _run_outer_selector(
             candidate_features=features,
             technique=technique,
             settings=settings,
+            fold_dir=inner_dir,
+            exclude_names=outer_names,
         )
         fit = _fit_predict_selector(
             selection["train_df"],
@@ -778,6 +827,7 @@ def _run_outer_selector_flat(
     """Single-level CV: select on outer-train only; no inner eval-model search."""
     outer_train = pd.read_parquet(fold_dir / f"fold_{outer_k}_train.parquet")
     outer_test = pd.read_parquet(fold_dir / f"fold_{outer_k}_test.parquet")
+    outer_names = set(outer_test[NAME_COL].astype(str))
     eval_model = technique.selector_model or technique.eval_models[0]
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ConstantInputWarning)
@@ -788,6 +838,8 @@ def _run_outer_selector_flat(
             candidate_features=features,
             technique=technique,
             settings=settings,
+            fold_dir=fold_dir,
+            exclude_names=outer_names,
         )
         fit = _fit_predict_selector(
             selection["train_df"],
@@ -916,8 +968,12 @@ def choose_elasticnet_grid_point_over_folds(
                 fold_scores: list[float | None] = []
                 fold_r2: list[float | None] = []
                 for train, val in inner_frames:
-                    x_train, y_train, _ = xy(train, target_col, features)
-                    x_val, y_val, _ = xy(val, target_col, features)
+                    x_train, y_train, x_val, y_val, _, _ = encoded_train_test_xy(
+                        train,
+                        val,
+                        target_col=target_col,
+                        features=features,
+                    )
                     model = make_elasticnet_pipeline(
                         alpha, l1_ratio, random_state=settings.random_state
                     )
@@ -980,8 +1036,12 @@ def _run_outer_elasticnet(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ConvergenceWarning)
         warnings.simplefilter("ignore", ConstantInputWarning)
-        x_train, y_train, _ = xy(outer_train, target_col, features)
-        x_test, y_test, names = xy(outer_test, target_col, features)
+        x_train, y_train, x_test, y_test, names, feats = encoded_train_test_xy(
+            outer_train,
+            outer_test,
+            target_col=target_col,
+            features=features,
+        )
         model = make_elasticnet_pipeline(
             best["alpha"], best["l1_ratio"], random_state=settings.random_state
         )
@@ -1008,7 +1068,7 @@ def _run_outer_elasticnet(
         technique=technique,
         target_col=target_col,
         outer_k=outer_k,
-        features=features,
+        features=feats,
         model=model,
         x_test=x_test,
         y_test=y_test,
@@ -1039,8 +1099,12 @@ def _run_outer_elasticnet_flat(
     """Single-level CV: ElasticNetCV on outer-train only (no leftover inner folds)."""
     outer_train = pd.read_parquet(fold_dir / f"fold_{outer_k}_train.parquet")
     outer_test = pd.read_parquet(fold_dir / f"fold_{outer_k}_test.parquet")
-    x_train, y_train, _ = xy(outer_train, target_col, features)
-    x_test, y_test, names = xy(outer_test, target_col, features)
+    x_train, y_train, x_test, y_test, names, feats = encoded_train_test_xy(
+        outer_train,
+        outer_test,
+        target_col=target_col,
+        features=features,
+    )
     n_train = int(len(y_train))
     cv = min(5, max(2, n_train // 2)) if n_train >= 4 else 2
     with warnings.catch_warnings():
@@ -1059,7 +1123,7 @@ def _run_outer_elasticnet_flat(
         technique=technique,
         target_col=target_col,
         outer_k=outer_k,
-        features=features,
+        features=feats,
         model=model,
         x_test=x_test,
         y_test=y_test,
