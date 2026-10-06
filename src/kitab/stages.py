@@ -737,8 +737,16 @@ def run_descriptors(manifest: Manifest, logger: RunLogger, run_config: Path) -> 
         )
         # get_descriptors.sh historically exits 0 even on partial failures; we inspect TSV later.
         try:
-            _run(cmd, cwd=manifest.repo_root, check=False)
-            logger.event(stage="descriptors", status="ok", dataset=key)
+            proc = _run(cmd, cwd=manifest.repo_root, check=False)
+            if proc.returncode != 0:
+                logger.failure(
+                    stage="descriptors",
+                    dataset=key,
+                    item=str(work),
+                    reason=f"get_descriptors.sh exited with code {proc.returncode}",
+                )
+            else:
+                logger.event(stage="descriptors", status="ok", dataset=key)
         except Exception as exc:  # noqa: BLE001
             logger.failure(
                 stage="descriptors", dataset=key, item=str(work), reason=str(exc)
