@@ -30,13 +30,13 @@ descriptors:
   - neg_planarity_cdr
   - pos_planarity_cdr
   - aro_planarity_cdr
-  - nonpolar_planarity_cdr
+  - hyd_planarity_cdr
   - pos_patch
   - neg_patch
-  - nonpolar_patch
+  - hyd_patch
   - pos_patch_cdr
   - neg_patch_cdr
-  - nonpolar_patch_cdr
+  - hyd_patch_cdr
   - aro_exposed_sasa
   - aro_all_sasa
   - neg_exposed_sasa
@@ -49,7 +49,7 @@ descriptors:
   - neg_sasa_cdr
   - pos_sasa_cdr
   - aro_exposure_cdr
-  - nonpolar_exposure_cdr
+  - hyd_exposure_cdr
   - neg_exposure_cdr
   - pos_exposure_cdr
   - exposure_weighted_hyd_score_cdr

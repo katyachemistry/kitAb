@@ -17,6 +17,9 @@ def _flatten_dict(obj, parent_key: str = "", sep: str = "_"):
     else:
         prefix = ""
     for k, v in obj.items():
+        # Older descriptor JSONs used nonpolar_* for the hyd_* descriptors.
+        if k.startswith("nonpolar_"):
+            k = "hyd_" + k[len("nonpolar_"):]
         new_key = f"{prefix}{k}"
         if v is None or isinstance(v, (int, float, bool, str)):
             items.append((new_key, v))

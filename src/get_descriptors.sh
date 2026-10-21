@@ -566,10 +566,16 @@ fi
 export ALLOWED_NAMES
 if [[ ${#ALLOWED_NAMES[@]} -gt 0 ]]; then
     ALLOWED_NAMES_CSV="$(printf '%s,' "${ALLOWED_NAMES[@]}")"
+    # Children read names from ALLOWED_NAMES_FILE: thousands of names in the
+    # environment exceed ARG_MAX and every exec fails ("Argument list too long").
+    _CSV_NAMES_FILE=$(mktemp)
+    trap 'rm -f "$_CSV_NAMES_FILE"' EXIT
+    printf '%s\n' "${ALLOWED_NAMES[@]}" > "$_CSV_NAMES_FILE"
+    export ALLOWED_NAMES_FILE="$_CSV_NAMES_FILE"
 else
     ALLOWED_NAMES_CSV=""
 fi
-export ALLOWED_NAMES_CSV
+export -n ALLOWED_NAMES_CSV
 
 _is_pipeline_pdb_stem() {
     local stem="$1"
@@ -1443,7 +1449,10 @@ DEV_PY
                 [[ "$_sp_skipped_invalid" -gt 0 ]] && echo "  invalid-input: $_sp_skipped_invalid invalid PDB file(s) skipped (see ${PIPELINE_LOG})"
                 ALLOWED_NAMES=("${_sp_filtered[@]}")
                 ALLOWED_NAMES_CSV="$(printf '%s,' "${ALLOWED_NAMES[@]}")"
-                export ALLOWED_NAMES_CSV
+                export -n ALLOWED_NAMES_CSV
+                _SP_NAMES_FILE=$(mktemp)
+                printf '%s\n' "${ALLOWED_NAMES[@]}" > "$_SP_NAMES_FILE"
+                export ALLOWED_NAMES_FILE="$_SP_NAMES_FILE"
             else
                 # No pre-set names: scan PDB files, exclude done and/or previously failed.
                 _SP_NAMES_FILE=$(mktemp)
